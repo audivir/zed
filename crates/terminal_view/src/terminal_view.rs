@@ -4,6 +4,7 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use collections::HashMap;
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
@@ -11,8 +12,8 @@ use editor::{
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
-    WeakEntity, actions, anchored, deferred, div,
+    Pixels, Point as GpuiPoint, Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task,
+    TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -24,6 +25,7 @@ use settings::{
 };
 use std::{
     any::Any,
+    cell::RefCell,
     cmp,
     ops::Range as StdRange,
     path::{Path, PathBuf},
@@ -155,6 +157,25 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    /// Caches Kitty graphics protocol images converted to GPUI's
+    /// `RenderImage`, keyed by image id, so `TerminalElement::paint`
+    /// (re-created every frame) only rebuilds an entry when its
+    /// `ImagePlacement::generation` changes. `RefCell` rather than routing
+    /// through `Context` since this is pure paint-time caching that never
+    /// needs to trigger a re-render.
+    ///
+    /// TODO: entries are only ever inserted, never evicted. When a Kitty
+    /// delete command (`\x1b_Ga=d,d=A\x1b\\` clear all, `a=d` clear visible,
+    /// `a=d,d=i,i=<ID>` delete by ID) removes an image, its placement stops
+    /// appearing in `last_content.images` (so this cache stops being
+    /// consulted for it), but the stale `(generation, RenderImage)` entry
+    /// itself is never removed. A session that creates and deletes many
+    /// distinct image IDs (e.g. a script cycling through images with fresh
+    /// random IDs each time) grows this cache without bound. Low priority
+    /// (bounded by however many distinct image IDs a session ever uses, not
+    /// by time), but worth pruning entries whose `image_id` hasn't appeared
+    /// in `last_content.images` for some number of frames/some time window.
+    pub(crate) image_cache: RefCell<HashMap<u32, (u64, Arc<RenderImage>)>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -302,6 +323,7 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            image_cache: RefCell::new(HashMap::default()),
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -605,6 +627,13 @@ impl TerminalView {
                 term.set_cursor_shape(self.cursor_shape);
             });
         }
+
+        // A theme switch is itself a settings change, so this also keeps
+        // Ghostty's default OSC 4/10/11/12 colors current with the active
+        // theme (see `Terminal::sync_ghostty_theme_colors`).
+        self.terminal.update(cx, |term, cx| {
+            term.sync_ghostty_theme_colors(cx);
+        });
 
         self.blink_manager.update(
             cx,
@@ -2112,7 +2141,7 @@ impl SearchableItem for TerminalView {
 /// Falls back to home directory when no project directory is available.
 ///
 /// For remote projects, local-only resolution (home dir fallback, shell expansion,
-/// local `is_dir` checks) is skipped -- returning `None` lets the remote shell
+/// local `is_dir` checks) is skipped. Returning `None` lets the remote shell
 /// open in the remote user's home directory by default.
 pub fn default_working_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     let is_remote = workspace.project().read(cx).is_remote();

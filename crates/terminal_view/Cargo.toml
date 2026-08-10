@@ -25,6 +25,7 @@ dirs.workspace = true
 editor.workspace = true
 futures.workspace = true
 gpui.workspace = true
+image.workspace = true
 itertools.workspace = true
 language.workspace = true
 log.workspace = true
@@ -33,8 +34,8 @@ pretty_assertions.workspace = true
 project.workspace = true
 regex.workspace = true
 schemars.workspace = true
+smallvec.workspace = true
 task.workspace = true
-
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true

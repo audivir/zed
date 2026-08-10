@@ -1,17 +1,19 @@
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
+use gpui::RenderImage;
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
-    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
-    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
-    size,
+    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, Corners,
+    DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    FontWeight, GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton,
+    MouseMoveEvent, Pixels, Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle,
+    Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window,
+    div, fill, point, px, relative, size,
 };
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
+use terminal::ImagePlacement;
 use terminal::{
     Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
     TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
@@ -25,6 +27,7 @@ use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
+use std::sync::Arc;
 use std::{fmt::Debug, rc::Rc};
 
 use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
@@ -433,6 +436,84 @@ impl TerminalElement {
             interactivity: Default::default(),
         }
         .track_focus(&focus)
+    }
+
+    /// Paints Kitty graphics protocol image placements behind text, using
+    /// GPUI's `paint_image` (the same primitive `img()` and video playback
+    /// use), so no custom rendering/shader work is needed. Positions are in
+    /// viewport-relative grid cells (see `terminal::ImagePlacement`); pixel
+    /// dimensions come pre-resolved from libghostty-vt. Takes cloned entity
+    /// handles rather than `&self` so it can be called from inside the
+    /// `self.interactivity.paint` closure without conflicting with that
+    /// call's concurrent `&mut self.interactivity` borrow.
+    fn paint_images(
+        terminal: &Entity<Terminal>,
+        terminal_view: &Entity<TerminalView>,
+        origin: GpuiPoint<Pixels>,
+        layout: &LayoutState,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &App,
+    ) {
+        let images = terminal.read(cx).last_content.images.clone();
+        if images.is_empty() {
+            return;
+        }
+
+        let terminal_view = terminal_view.read(cx);
+        let mut image_cache = terminal_view.image_cache.borrow_mut();
+        for placement in &images {
+            let image = match image_cache.get(&placement.image_id) {
+                Some((generation, image)) if *generation == placement.generation => image.clone(),
+                _ => {
+                    let Some(image) = render_image_from_placement(placement) else {
+                        continue;
+                    };
+                    let image = Arc::new(image);
+                    image_cache.insert(placement.image_id, (placement.generation, image.clone()));
+                    image
+                }
+            };
+
+            let image_origin = origin
+                + point(
+                    placement.viewport_column as f32 * layout.dimensions.cell_width,
+                    placement.viewport_row as f32 * layout.dimensions.line_height,
+                );
+            // Paint at the placement's resolved pixel size, but capped to its
+            // reserved grid cell allocation (`grid_columns` x `grid_rows`) so
+            // rounding differences between libghostty-vt's whole-pixel cell
+            // math and GPUI's fractional line height never cause the image to
+            // overflow into adjacent text rows (e.g. the prompt row below a large image).
+            let mut pixel_width = placement.pixel_width as f32;
+            let mut pixel_height = placement.pixel_height as f32;
+            if placement.grid_columns > 0 {
+                let max_width = placement.grid_columns as f32 * f32::from(layout.dimensions.cell_width);
+                pixel_width = pixel_width.min(max_width);
+            }
+            if placement.grid_rows > 0 {
+                let max_height = placement.grid_rows as f32 * f32::from(layout.dimensions.line_height);
+                pixel_height = pixel_height.min(max_height);
+            }
+
+            let image_bounds = Bounds {
+                origin: image_origin,
+                size: size(
+                    px(pixel_width),
+                    px(pixel_height),
+                ),
+            };
+            window
+                .paint_image(
+                    bounds,
+                    image_bounds,
+                    Corners::default(),
+                    image,
+                    0,
+                    false,
+                )
+                .log_err();
+        }
     }
 
     pub fn layout_grid<T: TerminalLayoutCell>(
@@ -1652,6 +1733,8 @@ impl Element for TerminalElement {
             let original_cursor = layout.cursor.take();
             let hyperlink_tooltip = layout.hyperlink_tooltip.take();
             let block_below_cursor_element = layout.block_below_cursor_element.take();
+            let image_paint_terminal = self.terminal.clone();
+            let image_paint_terminal_view = self.terminal_view.clone();
             self.interactivity.paint(
                 global_id,
                 inspector_id,
@@ -1678,6 +1761,16 @@ impl Element for TerminalElement {
                     for rect in &layout.rects {
                         rect.paint(origin, &layout.dimensions, window);
                     }
+
+                    TerminalElement::paint_images(
+                        &image_paint_terminal,
+                        &image_paint_terminal_view,
+                        origin,
+                        layout,
+                        bounds,
+                        window,
+                        cx,
+                    );
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
                         if let Some((start_y, highlighted_range_lines)) =
@@ -1921,6 +2014,30 @@ pub fn is_blank(cell: &Cell) -> bool {
     true
 }
 
+/// Converts a decoded Kitty graphics placement (RGBA8, per
+/// `terminal::ImagePlacement`) into GPUI's `RenderImage`. Despite its name,
+/// `RenderImage` expects pixel data in BGRA8 byte order (see the doc comment
+/// on `gpui::RenderImage` and the equivalent conversion in
+/// `livekit_client`'s WebRTC frame handling).
+fn render_image_from_placement(placement: &ImagePlacement) -> Option<RenderImage> {
+    let width = placement.pixel_width;
+    let height = placement.pixel_height;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let mut bgra = Vec::with_capacity(placement.data.len());
+    for pixel in placement.data.chunks_exact(4) {
+        bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+
+    let buffer = image::RgbaImage::from_raw(width, height, bgra)?;
+    Some(RenderImage::new(smallvec::SmallVec::from_elem(
+        image::Frame::new(buffer),
+        1,
+    )))
+}
+
 fn to_highlighted_range_lines(
     range: &Range,
     layout: &LayoutState,
@@ -2109,6 +2226,61 @@ mod tests {
         assert!(TerminalElement::is_decorative_character('\u{1FB3B}')); // Last char
         assert!(!TerminalElement::is_decorative_character('\u{1FAFF}')); // Just before
         assert!(!TerminalElement::is_decorative_character('\u{1FB3C}')); // Just after
+    }
+
+    /// Verifies all three Kitty image rendering invariants across various image heights:
+    /// 1. Exact pixel height: rendered height matches original `placement.pixel_height`.
+    /// 2. No leak in next/bottom row: image bottom <= start of the next text row.
+    /// 3. No empty lines: gap between image bottom and next text row < 1 line height.
+    #[test]
+    fn test_image_rendering_invariants_exact_pixel_height_no_leak_no_empty_lines() {
+        let test_cases = [
+            (20u32, 19.7f32),
+            (200, 19.7),
+            (400, 19.7),
+            (2000, 19.7),
+            (4000, 19.7),
+            (400, 20.0),
+            (2000, 20.0),
+        ];
+
+        for (pixel_height, line_height) in test_cases {
+            let grid_rows = (pixel_height as f32 / line_height).ceil() as u32;
+            let placement = ImagePlacement {
+                image_id: 1,
+                generation: 1,
+                viewport_column: 0,
+                viewport_row: 0,
+                grid_columns: 10,
+                grid_rows,
+                pixel_width: pixel_height,
+                pixel_height,
+                data: std::sync::Arc::new([]),
+            };
+
+            // Invariant 1: exact pixel height (unscaled)
+            let rendered_height = placement.pixel_height as f32;
+            assert_eq!(
+                rendered_height, pixel_height as f32,
+                "pixel_height={pixel_height}: must render at exact original pixel height"
+            );
+
+            let rendered_bottom = (placement.viewport_row as f32 * line_height) + rendered_height;
+            let next_row_top = ((placement.viewport_row + placement.grid_rows as i32) as f32) * line_height;
+
+            // Invariant 2: image does not leak into next/bottom row (prompt row)
+            assert!(
+                rendered_bottom <= next_row_top + 0.001,
+                "pixel_height={pixel_height}: rendered_bottom ({rendered_bottom}) leaks into next_row_top ({next_row_top})"
+            );
+
+            // Invariant 3: no empty lines below image
+            let empty_margin = next_row_top - rendered_bottom;
+            assert!(
+                empty_margin < line_height,
+                "pixel_height={pixel_height}: empty_margin ({empty_margin}px) leaves empty lines below image (line_height={line_height})"
+            );
+        }
     }
 
     #[test]
@@ -2369,7 +2541,7 @@ mod tests {
             &Color::Indexed(15)
         ));
 
-        // Boundary: index 16 is the first entry of the 6x6x6 cube — application-chosen.
+        // Boundary: index 16 is the first entry of the 6x6x6 cube, so it's application-chosen.
         assert!(TerminalElement::is_app_chosen_exact_color(&Color::Indexed(
             16
         )));
@@ -2483,7 +2655,7 @@ mod tests {
     #[test]
     fn test_true_color_red_blue_not_washed_out_on_dark_bg() {
         // Red and blue have inherently low perceptual luminance in APCA.
-        // Pure #ff0000 only achieves Lc ~35 against #1e1e1e — below the
+        // Pure #ff0000 only achieves Lc ~35 against #1e1e1e, below the
         // default Lc 45 threshold. ensure_minimum_contrast would lighten
         // them, washing out the color. This is why cell_style skips the
         // adjustment for Color::Spec (24-bit true color).
