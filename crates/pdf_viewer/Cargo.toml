@@ -1,0 +1,48 @@
+[package]
+name = "pdf_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/pdf_viewer.rs"
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+db.workspace = true
+editor.workspace = true
+futures.workspace = true
+gpui.workspace = true
+image.workspace = true
+language.workspace = true
+log.workspace = true
+menu.workspace = true
+parking_lot.workspace = true
+project.workspace = true
+postage.workspace = true
+rpc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+util.workspace = true
+ui.workspace = true
+workspace.workspace = true
+worktree.workspace = true
+zed_actions.workspace = true
+
+pdfium-render = { version = "0.9", features = ["thread_safe"] }
+once_cell = "1.21"
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+editor = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+theme_settings = { workspace = true, features = ["test-support"] }
+
+[features]
+test-support = ["gpui/test-support", "editor/test-support"]

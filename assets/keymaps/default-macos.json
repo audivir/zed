@@ -1591,6 +1591,14 @@
     },
   },
   {
+    "context": "PdfViewer",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-c": "pdf_viewer::Copy",
+      "cmd-a": "pdf_viewer::SelectAll",
+    },
+  },
+  {
     "context": "ImageViewer",
     "use_key_equivalents": true,
     "bindings": {

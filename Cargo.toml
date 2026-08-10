@@ -423,6 +423,7 @@ outline_panel = { path = "crates/outline_panel" }
 panel = { path = "crates/panel" }
 paths = { path = "crates/paths" }
 path = { path = "crates/path" }
+pdf_viewer = { path = "crates/pdf_viewer" }
 perf = { path = "tooling/perf" }
 picker = { path = "crates/picker" }
 picker_preview = { path = "crates/picker_preview" }

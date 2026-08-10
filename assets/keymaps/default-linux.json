@@ -1543,6 +1543,13 @@
     },
   },
   {
+    "context": "PdfViewer",
+    "bindings": {
+      "ctrl-c": "pdf_viewer::Copy",
+      "ctrl-a": "pdf_viewer::SelectAll",
+    },
+  },
+  {
     "context": "ImageViewer",
     "bindings": {
       "ctrl-=": "image_viewer::ZoomIn",
