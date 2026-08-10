@@ -1,0 +1,37 @@
+[package]
+name = "typst_preview"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/typst_preview.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+editor.workspace = true
+gpui.workspace = true
+language.workspace = true
+text.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+project.workspace = true
+settings.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+pdf_viewer.workspace = true
+toml.workspace = true
+zed_actions.workspace = true
+fontdb = "*"
+typst = "0.14" # Use the latest stable version
+typst-assets = { version= "0.14", features = ["fonts"] } # Provides standard fonts (LinLibertine, NewCMMath, etc.)
+typst-ide = "0.14"
+typst-pdf = "0.14"

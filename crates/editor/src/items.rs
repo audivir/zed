@@ -61,6 +61,7 @@ use workspace::{
 };
 use zed_actions::preview::{
     markdown::OpenPreview as OpenMarkdownPreview, svg::OpenPreview as OpenSvgPreview,
+    typst::OpenPreview as OpenTypstPreview,
 };
 
 pub const MAX_TAB_TITLE_LEN: usize = 24;
@@ -1209,6 +1210,13 @@ impl Item for Editor {
             .and_then(|buffer| buffer.read(cx).language())
             .is_some_and(|language| language.name().as_ref() == "Markdown");
 
+        let is_typst = self
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).language())
+            .is_some_and(|language| language.name().as_ref() == "Typst");
+
         let is_svg = self
             .buffer()
             .read(cx)
@@ -1224,6 +1232,13 @@ impl Item for Editor {
             actions.push((
                 "Open Markdown Preview".into(),
                 Box::new(OpenMarkdownPreview) as Box<dyn gpui::Action>,
+            ));
+        }
+
+        if is_typst {
+            actions.push((
+                "Open Typst Preview".into(),
+                Box::new(OpenTypstPreview) as Box<dyn gpui::Action>,
             ));
         }
 
