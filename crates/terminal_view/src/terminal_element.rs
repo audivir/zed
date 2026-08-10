@@ -5,9 +5,9 @@ use gpui::{
     DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
     FontWeight, GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton,
-    MouseMoveEvent, Pixels, Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle,
-    Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window,
-    div, fill, point, px, relative, size,
+    MouseMoveEvent, PaintQuad, Pixels, Point as GpuiPoint, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity,
+    WhiteSpace, Window, div, fill, point, px, relative, size, vertical_split_background,
 };
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
@@ -37,6 +37,7 @@ pub struct LayoutState {
     hitbox: Hitbox,
     batched_text_runs: Vec<BatchedTextRun>,
     block_element_rects: Vec<BlockElementLayoutRect>,
+    split_rects: Vec<SplitBackgroundRect>,
     rects: Vec<LayoutRect>,
     relative_highlighted_ranges: Vec<(Range, Hsla)>,
     cursor: Option<CursorLayout>,
@@ -211,6 +212,10 @@ impl BlockElementLayoutRect {
         dimensions: &TerminalBounds,
         window: &mut Window,
     ) {
+        window.paint_quad(self.paint_quad(origin, dimensions));
+    }
+
+    pub fn paint_quad(&self, origin: GpuiPoint<Pixels>, dimensions: &TerminalBounds) -> PaintQuad {
         let subcell_width = dimensions.cell_width / BLOCK_SUBCELL_COLUMNS as f32;
         let subcell_height = dimensions.line_height / BLOCK_SUBCELL_LINES as f32;
         let position = point(
@@ -222,11 +227,71 @@ impl BlockElementLayoutRect {
             subcell_height * self.num_of_lines as f32,
         );
 
-        window.paint_quad(fill(Bounds::new(position, size), self.color));
+        fill(Bounds::new(position, size), self.color)
     }
 
     pub fn line(&self) -> i32 {
         (self.point.line + self.num_of_lines as i32 - 1) / BLOCK_SUBCELL_LINES
+    }
+}
+
+/// A cell-space rect painted as a single vertically-split quad instead of the usual pair of
+/// overlapping quads (a full-cell background rect plus a half-cell foreground block-element
+/// rect). Only ever produced for the plain upper/lower half-block characters (`▀`/`▄`) with a
+/// non-default background, since that's the one case where the pair-of-quads path is
+/// redundant: a genuine background/foreground split, not an approximation of one.
+#[derive(Clone, Debug)]
+pub struct SplitBackgroundRect {
+    point: LayoutPoint,
+    num_of_cells: usize,
+    split_y: f32,
+    top_color: Hsla,
+    bottom_color: Hsla,
+}
+
+impl SplitBackgroundRect {
+    fn new(point: LayoutPoint, split_y: f32, top_color: Hsla, bottom_color: Hsla) -> Self {
+        Self {
+            point,
+            num_of_cells: 1,
+            split_y,
+            top_color,
+            bottom_color,
+        }
+    }
+
+    fn can_append(
+        &self,
+        point: LayoutPoint,
+        split_y: f32,
+        top_color: Hsla,
+        bottom_color: Hsla,
+    ) -> bool {
+        self.split_y == split_y
+            && self.top_color == top_color
+            && self.bottom_color == bottom_color
+            && self.point.line == point.line
+            && self.point.column + self.num_of_cells as i32 == point.column
+    }
+
+    fn append_cell(&mut self) {
+        self.num_of_cells += 1;
+    }
+
+    pub fn paint_quad(&self, origin: GpuiPoint<Pixels>, dimensions: &TerminalBounds) -> PaintQuad {
+        let position = point(
+            (origin.x + self.point.column as f32 * dimensions.cell_width).floor(),
+            origin.y + self.point.line as f32 * dimensions.line_height,
+        );
+        let size = size(
+            (dimensions.cell_width * self.num_of_cells as f32).ceil(),
+            dimensions.line_height,
+        );
+
+        fill(
+            Bounds::new(position, size),
+            vertical_split_background(self.top_color, self.bottom_color, self.split_y),
+        )
     }
 }
 
@@ -252,6 +317,10 @@ impl LayoutRect {
         dimensions: &TerminalBounds,
         window: &mut Window,
     ) {
+        window.paint_quad(self.paint_quad(origin, dimensions));
+    }
+
+    pub fn paint_quad(&self, origin: GpuiPoint<Pixels>, dimensions: &TerminalBounds) -> PaintQuad {
         let position = {
             let layout_point = self.point;
             point(
@@ -265,7 +334,7 @@ impl LayoutRect {
         )
         .into();
 
-        window.paint_quad(fill(Bounds::new(position, size), self.color));
+        fill(Bounds::new(position, size), self.color)
     }
 }
 
@@ -307,6 +376,7 @@ impl BackgroundRegion {
     }
 
     /// Check if this region can be merged with another region
+    #[cfg(test)]
     fn can_merge_with(&self, other: &BackgroundRegion) -> bool {
         if self.color != other.color {
             return false;
@@ -326,6 +396,7 @@ impl BackgroundRegion {
     }
 
     /// Merge this region with another region
+    #[cfg(test)]
     fn merge_with(&mut self, other: &BackgroundRegion) {
         self.start_line = self.start_line.min(other.start_line);
         self.start_col = self.start_col.min(other.start_col);
@@ -360,31 +431,74 @@ impl TerminalLayoutCell for &IndexedCell {
 }
 
 /// Merge grid regions to minimize the number of rectangles.
+///
+/// Regions are sorted, coalesced horizontally when adjacent or overlapping on the same line,
+/// then merged vertically when a region's column span exactly matches the region directly
+/// above it. This is linear-ish (a sort plus one pass with a small per-line lookback) rather
+/// than the pairwise O(n^2) merge it replaces, which matters for workloads dominated by
+/// colored background cells (ANSI animation, benchmark output, etc).
 fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundRegion> {
     if regions.is_empty() {
         return regions;
     }
 
-    let mut merged = regions;
-    let mut changed = true;
+    let mut regions = regions;
+    regions.sort_by_key(|region| {
+        (
+            region.start_line,
+            region.start_col,
+            region.end_line,
+            region.end_col,
+        )
+    });
 
-    // Keep merging until no more merges are possible
-    while changed {
-        changed = false;
-        let mut i = 0;
+    let mut horizontal: Vec<BackgroundRegion> = Vec::with_capacity(regions.len());
+    for region in regions {
+        if let Some(last_region) = horizontal.last_mut()
+            && last_region.color == region.color
+            && last_region.start_line == region.start_line
+            && last_region.end_line == region.end_line
+            && last_region.end_col + 1 >= region.start_col
+        {
+            last_region.end_col = last_region.end_col.max(region.end_col);
+        } else {
+            horizontal.push(region);
+        }
+    }
 
-        while i < merged.len() {
-            let mut j = i + 1;
-            while j < merged.len() {
-                if merged[i].can_merge_with(&merged[j]) {
-                    let other = merged.remove(j);
-                    merged[i].merge_with(&other);
-                    changed = true;
-                } else {
-                    j += 1;
-                }
+    let mut merged: Vec<BackgroundRegion> = Vec::with_capacity(horizontal.len());
+    let mut previous_line_regions: Vec<usize> = Vec::new();
+    let mut current_line_regions: Vec<usize> = Vec::new();
+    let mut current_line = None;
+
+    for region in horizontal {
+        if current_line != Some(region.start_line) {
+            if let Some(line) = current_line
+                && region.start_line != line + 1
+            {
+                previous_line_regions.clear();
             }
-            i += 1;
+
+            std::mem::swap(&mut previous_line_regions, &mut current_line_regions);
+            current_line_regions.clear();
+            current_line = Some(region.start_line);
+        }
+
+        let matching_previous_region = previous_line_regions.iter().copied().find(|&index| {
+            let previous_region = &merged[index];
+            previous_region.color == region.color
+                && previous_region.start_col == region.start_col
+                && previous_region.end_col == region.end_col
+                && previous_region.end_line + 1 == region.start_line
+        });
+
+        if let Some(index) = matching_previous_region {
+            merged[index].end_line = region.end_line;
+            current_line_regions.push(index);
+        } else {
+            let index = merged.len();
+            merged.push(region);
+            current_line_regions.push(index);
         }
     }
 
@@ -488,30 +602,22 @@ impl TerminalElement {
             let mut pixel_width = placement.pixel_width as f32;
             let mut pixel_height = placement.pixel_height as f32;
             if placement.grid_columns > 0 {
-                let max_width = placement.grid_columns as f32 * f32::from(layout.dimensions.cell_width);
+                let max_width =
+                    placement.grid_columns as f32 * f32::from(layout.dimensions.cell_width);
                 pixel_width = pixel_width.min(max_width);
             }
             if placement.grid_rows > 0 {
-                let max_height = placement.grid_rows as f32 * f32::from(layout.dimensions.line_height);
+                let max_height =
+                    placement.grid_rows as f32 * f32::from(layout.dimensions.line_height);
                 pixel_height = pixel_height.min(max_height);
             }
 
             let image_bounds = Bounds {
                 origin: image_origin,
-                size: size(
-                    px(pixel_width),
-                    px(pixel_height),
-                ),
+                size: size(px(pixel_width), px(pixel_height)),
             };
             window
-                .paint_image(
-                    bounds,
-                    image_bounds,
-                    Corners::default(),
-                    image,
-                    0,
-                    false,
-                )
+                .paint_image(bounds, image_bounds, Corners::default(), image, 0, false)
                 .log_err();
         }
     }
@@ -527,9 +633,11 @@ impl TerminalElement {
         Vec<LayoutRect>,
         Vec<BatchedTextRun>,
         Vec<BlockElementLayoutRect>,
+        Vec<SplitBackgroundRect>,
     ) {
         let start_time = Instant::now();
         let theme = cx.theme();
+        let mut indexed_color_cache = [None; INDEXED_COLOR_CACHE_LEN];
 
         // Pre-allocate with estimated capacity to reduce reallocations
         let estimated_cells = grid.size_hint().0;
@@ -538,6 +646,7 @@ impl TerminalElement {
 
         let mut batched_runs = Vec::with_capacity(estimated_runs);
         let mut block_element_regions = Vec::new();
+        let mut split_rects: Vec<SplitBackgroundRect> = Vec::new();
         let mut cell_count = 0;
 
         // Collect background regions for efficient merging
@@ -565,9 +674,56 @@ impl TerminalElement {
                     mem::swap(&mut fg, &mut bg);
                 }
 
+                // Fuse a plain upper/lower half-block character with a non-default
+                // background into a single vertical-split quad instead of the usual pair:
+                // a full-cell background rect plus a half-cell foreground block-element
+                // rect covering the same area. Only these two characters get this
+                // treatment, see `SplitBackgroundRect`'s doc comment for why.
+                let half_block_fg_on_top = match cell.character() {
+                    '▀' => Some(true),
+                    '▄' => Some(false),
+                    _ => None,
+                };
+                if let Some(fg_on_top) = half_block_fg_on_top
+                    && !is_default_background_color(bg)
+                    && !cell.is_wide_char_spacer()
+                    && !matches!(cell.zerowidth(), Some(chars) if !chars.is_empty())
+                {
+                    let mut foreground = convert_color_cached(&fg, theme, &mut indexed_color_cache);
+                    if cell.is_dim() {
+                        foreground.a *= 0.7;
+                    }
+                    let background = convert_color_cached(&bg, theme, &mut indexed_color_cache);
+                    let (top_color, bottom_color) = if fg_on_top {
+                        (foreground, background)
+                    } else {
+                        (background, foreground)
+                    };
+
+                    let cell_point = LayoutPoint::new(display_line, point.column as i32);
+                    if let Some(last_rect) = split_rects.last_mut()
+                        && last_rect.can_append(cell_point, 0.5, top_color, bottom_color)
+                    {
+                        last_rect.append_cell();
+                    } else {
+                        split_rects.push(SplitBackgroundRect::new(
+                            cell_point,
+                            0.5,
+                            top_color,
+                            bottom_color,
+                        ));
+                    }
+
+                    cell_count += 1;
+                    previous_cell_had_extras = false;
+                    continue;
+                }
+
                 // Collect background regions (skip default background)
-                if !is_default_background_color(bg) {
-                    let color = convert_color(&bg, theme);
+                let bg_color = if is_default_background_color(bg) {
+                    None
+                } else {
+                    let color = convert_color_cached(&bg, theme, &mut indexed_color_cache);
                     let col = point.column as i32;
 
                     // Try to extend the last region if it's on the same line with the same color
@@ -581,7 +737,8 @@ impl TerminalElement {
                     } else {
                         background_regions.push(BackgroundRegion::new(display_line, col, color));
                     }
-                }
+                    Some(color)
+                };
                 // Skip wide character spacers - they're just placeholders for the second cell of wide characters
                 if cell.is_wide_char_spacer() {
                     continue;
@@ -600,12 +757,17 @@ impl TerminalElement {
                 {
                     if !is_blank(cell) {
                         cell_count += 1;
+                        let skip_contrast = Self::is_app_chosen_exact_color(&fg);
+                        let fg_color = convert_color_cached(&fg, theme, &mut indexed_color_cache);
+                        let bg_color = bg_color.unwrap_or_else(|| {
+                            convert_color_cached(&bg, theme, &mut indexed_color_cache)
+                        });
                         let cell_style = TerminalElement::cell_style(
                             point,
                             cell,
-                            fg,
-                            bg,
-                            theme,
+                            fg_color,
+                            bg_color,
+                            skip_contrast,
                             text_style,
                             hyperlink,
                             minimum_contrast,
@@ -698,18 +860,20 @@ impl TerminalElement {
 
         log::debug!(
             "Terminal layout_grid: {} cells processed, \
-            {} batched runs created, {} block element rects (from {} regions), {} rects (from {} merged regions), \
+            {} batched runs created, {} block element rects (from {} regions), \
+            {} split rects, {} rects (from {} merged regions), \
             layout took {:?}",
             cell_count,
             batched_runs.len(),
             block_element_rects.len(),
             block_element_region_count,
+            split_rects.len(),
             rects.len(),
             region_count,
             layout_time
         );
 
-        (rects, batched_runs, block_element_rects)
+        (rects, batched_runs, block_element_rects, split_rects)
     }
 
     /// Computes the cursor position based on the cursor point and terminal dimensions.
@@ -949,17 +1113,13 @@ impl TerminalElement {
     fn cell_style(
         point: Point,
         cell: &Cell,
-        fg: Color,
-        bg: Color,
-        colors: &Theme,
+        mut fg: Hsla,
+        bg: Hsla,
+        skip_contrast: bool,
         text_style: &TextStyle,
         hyperlink: Option<(HighlightStyle, &Range)>,
         minimum_contrast: f32,
     ) -> TextRun {
-        let skip_contrast = Self::is_app_chosen_exact_color(&fg);
-        let mut fg = convert_color(&fg, colors);
-        let bg = convert_color(&bg, colors);
-
         if !skip_contrast && !Self::is_decorative_character(cell.character()) {
             fg = ensure_minimum_contrast(fg, bg, minimum_contrast);
         }
@@ -1517,56 +1677,56 @@ impl Element for TerminalElement {
                 // This handles the case where the terminal has been scrolled past (above or
                 // below the viewport), similar to the editor fix in PR #45077 where start_row
                 // could exceed max_row when the editor was positioned above the viewport.
-                let (rects, batched_text_runs, block_element_rects) = if intersection.size.height
-                    <= px(0.)
-                    || intersection.size.width <= px(0.)
-                {
-                    (Vec::new(), Vec::new(), Vec::new())
-                } else if intersection == content_bounds {
-                    // Fast path: terminal fully visible, no clipping needed.
-                    // Avoid grouping/allocation overhead by streaming cells directly.
-                    TerminalElement::layout_grid(
-                        cells.iter(),
-                        0,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
-                } else {
-                    // Calculate which screen rows are visible based on pixel positions.
-                    // This works for both Scrollable and Inline modes because we filter
-                    // by screen position (enumerated line group index), not by the cell's
-                    // internal line number (which can be negative in Scrollable mode for
-                    // scrollback history).
-                    let rows_above_viewport = f32::from(
-                        (intersection.top() - content_bounds.top()).max(px(0.)) / line_height_px,
-                    ) as usize;
-                    let visible_row_count =
-                        f32::from((intersection.size.height / line_height_px).ceil()) as usize + 1;
+                let (rects, batched_text_runs, block_element_rects, split_rects) =
+                    if intersection.size.height <= px(0.) || intersection.size.width <= px(0.) {
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    } else if intersection == content_bounds {
+                        // Fast path: terminal fully visible, no clipping needed.
+                        // Avoid grouping/allocation overhead by streaming cells directly.
+                        TerminalElement::layout_grid(
+                            cells.iter(),
+                            0,
+                            &text_style,
+                            last_hovered_word.as_ref().map(|last_hovered_word| {
+                                (link_style, &last_hovered_word.word_match)
+                            }),
+                            minimum_contrast,
+                            cx,
+                        )
+                    } else {
+                        // Calculate which screen rows are visible based on pixel positions.
+                        // This works for both Scrollable and Inline modes because we filter
+                        // by screen position (enumerated line group index), not by the cell's
+                        // internal line number (which can be negative in Scrollable mode for
+                        // scrollback history).
+                        let rows_above_viewport = f32::from(
+                            (intersection.top() - content_bounds.top()).max(px(0.))
+                                / line_height_px,
+                        ) as usize;
+                        let visible_row_count =
+                            f32::from((intersection.size.height / line_height_px).ceil()) as usize
+                                + 1;
 
-                    TerminalElement::layout_grid(
-                        // Group cells by line and filter to only the visible screen rows.
-                        // skip() and take() work on enumerated line groups (screen position),
-                        // making this work regardless of the actual cell.point.line values.
-                        cells
-                            .iter()
-                            .chunk_by(|c| c.point.line)
-                            .into_iter()
-                            .skip(rows_above_viewport)
-                            .take(visible_row_count)
-                            .flat_map(|(_, line_cells)| line_cells),
-                        rows_above_viewport as i32,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
-                };
+                        TerminalElement::layout_grid(
+                            // Group cells by line and filter to only the visible screen rows.
+                            // skip() and take() work on enumerated line groups (screen position),
+                            // making this work regardless of the actual cell.point.line values.
+                            cells
+                                .iter()
+                                .chunk_by(|c| c.point.line)
+                                .into_iter()
+                                .skip(rows_above_viewport)
+                                .take(visible_row_count)
+                                .flat_map(|(_, line_cells)| line_cells),
+                            rows_above_viewport as i32,
+                            &text_style,
+                            last_hovered_word.as_ref().map(|last_hovered_word| {
+                                (link_style, &last_hovered_word.word_match)
+                            }),
+                            minimum_contrast,
+                            cx,
+                        )
+                    };
 
                 // Layout cursor. Rectangle is used for IME, so we should lay it out even
                 // if we don't end up showing it.
@@ -1665,6 +1825,7 @@ impl Element for TerminalElement {
                     hitbox,
                     batched_text_runs,
                     block_element_rects,
+                    split_rects,
                     cursor,
                     ime_cursor_bounds,
                     background_color,
@@ -1758,9 +1919,12 @@ impl Element for TerminalElement {
                         }
                     });
 
-                    for rect in &layout.rects {
-                        rect.paint(origin, &layout.dimensions, window);
-                    }
+                    window.paint_quads(
+                        layout
+                            .rects
+                            .iter()
+                            .map(|rect| rect.paint_quad(origin, &layout.dimensions)),
+                    );
 
                     TerminalElement::paint_images(
                         &image_paint_terminal,
@@ -1798,9 +1962,18 @@ impl Element for TerminalElement {
                     for batch in &layout.batched_text_runs {
                         batch.paint(origin, &layout.dimensions, window, cx);
                     }
-                    for block_element_rect in &layout.block_element_rects {
-                        block_element_rect.paint(origin, &layout.dimensions, window);
-                    }
+                    window.paint_quads(
+                        layout
+                            .block_element_rects
+                            .iter()
+                            .map(|rect| rect.paint_quad(origin, &layout.dimensions))
+                            .chain(
+                                layout
+                                    .split_rects
+                                    .iter()
+                                    .map(|rect| rect.paint_quad(origin, &layout.dimensions)),
+                            ),
+                    );
                     let text_paint_time = text_paint_start.elapsed();
 
                     if let Some(text_to_mark) = &marked_text_cloned
@@ -1994,12 +2167,12 @@ impl InputHandler for TerminalInputHandler {
     }
 }
 
+/// Whether `cell` needs its own text run painted. A plain space never does: its background
+/// (if any) is already covered by the separate background-region pass, so painting a space
+/// glyph on top of it would be pure overhead. Spaces with a hyperlink or a visible style
+/// modifier (underline, strikeout, inverse) still need a run so those decorations render.
 pub fn is_blank(cell: &Cell) -> bool {
     if cell.character() != ' ' {
-        return false;
-    }
-
-    if !is_default_background_color(cell.background()) {
         return false;
     }
 
@@ -2145,6 +2318,32 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
     }
 }
 
+/// Number of possible `Color::Indexed` values (a `u8`), sized to cover the full palette.
+const INDEXED_COLOR_CACHE_LEN: usize = 256;
+
+/// Same as `convert_color`, but memoizes `Color::Indexed` lookups in `cache`. Indexed colors
+/// repeat heavily within a single layout pass (e.g. a themed prompt or progress bar reusing
+/// the same palette entry across many cells), and `get_color_at_index` redoes the 6x6x6
+/// cube/grayscale-ramp math on every call otherwise.
+fn convert_color_cached(
+    color: &Color,
+    theme: &Theme,
+    cache: &mut [Option<Hsla>; INDEXED_COLOR_CACHE_LEN],
+) -> Hsla {
+    let Color::Indexed(index) = color else {
+        return convert_color(color, theme);
+    };
+
+    let index = *index as usize;
+    if let Some(cached_color) = cache[index] {
+        return cached_color;
+    }
+
+    let resolved_color = convert_color(color, theme);
+    cache[index] = Some(resolved_color);
+    resolved_color
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2266,7 +2465,8 @@ mod tests {
             );
 
             let rendered_bottom = (placement.viewport_row as f32 * line_height) + rendered_height;
-            let next_row_top = ((placement.viewport_row + placement.grid_rows as i32) as f32) * line_height;
+            let next_row_top =
+                ((placement.viewport_row + placement.grid_rows as i32) as f32) * line_height;
 
             // Invariant 2: image does not leak into next/bottom row (prompt row)
             assert!(
@@ -2343,6 +2543,28 @@ mod tests {
         assert_eq!(rects[0].num_of_columns, 16);
         assert_eq!(rects[0].num_of_lines, 24);
         assert_eq!(rects[0].line(), 0);
+    }
+
+    #[test]
+    fn test_split_background_rect_merges_adjacent_cells_only() {
+        let top = Hsla::red();
+        let bottom = Hsla::blue();
+        let mut rect = SplitBackgroundRect::new(LayoutPoint::new(0, 0), 0.5, top, bottom);
+
+        assert!(rect.can_append(LayoutPoint::new(0, 1), 0.5, top, bottom));
+        rect.append_cell();
+        assert_eq!(rect.num_of_cells, 2);
+
+        // Same colors and split, but not adjacent (gap at column 2): can't merge.
+        assert!(!rect.can_append(LayoutPoint::new(0, 3), 0.5, top, bottom));
+        // Different line: can't merge.
+        assert!(!rect.can_append(LayoutPoint::new(1, 2), 0.5, top, bottom));
+        // Different split fraction: can't merge (would visually misalign).
+        assert!(!rect.can_append(LayoutPoint::new(0, 2), 0.25, top, bottom));
+        // Swapped colors: can't merge (different appearance).
+        assert!(!rect.can_append(LayoutPoint::new(0, 2), 0.5, bottom, top));
+        // Adjacent, same split and colors: can merge.
+        assert!(rect.can_append(LayoutPoint::new(0, 2), 0.5, top, bottom));
     }
 
     #[test]

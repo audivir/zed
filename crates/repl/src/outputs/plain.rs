@@ -362,7 +362,7 @@ impl Render for TerminalOutput {
 
         let text_style = text_style(window, cx);
         let minimum_contrast = TerminalSettings::get_global(cx).minimum_contrast;
-        let (rects, batched_text_runs, block_element_rects) =
+        let (rects, batched_text_runs, block_element_rects, split_rects) =
             terminal.read(cx).with_renderable_cells(|cells| {
                 TerminalElement::layout_grid(cells, 0, &text_style, None, minimum_contrast, cx)
             });
@@ -392,42 +392,32 @@ impl Render for TerminalOutput {
             move |_bounds, _, _| {},
             // paint
             move |bounds, _, window, cx| {
-                for rect in rects {
-                    rect.paint(
-                        bounds.origin,
-                        &terminal::TerminalBounds {
-                            cell_width,
-                            line_height: text_line_height,
-                            bounds,
-                        },
-                        window,
-                    );
-                }
+                let dimensions = terminal::TerminalBounds {
+                    cell_width,
+                    line_height: text_line_height,
+                    bounds,
+                };
+
+                window.paint_quads(
+                    rects
+                        .iter()
+                        .map(|rect| rect.paint_quad(bounds.origin, &dimensions)),
+                );
 
                 for batch in batched_text_runs {
-                    batch.paint(
-                        bounds.origin,
-                        &terminal::TerminalBounds {
-                            cell_width,
-                            line_height: text_line_height,
-                            bounds,
-                        },
-                        window,
-                        cx,
-                    );
+                    batch.paint(bounds.origin, &dimensions, window, cx);
                 }
 
-                for block_element_rect in block_element_rects {
-                    block_element_rect.paint(
-                        bounds.origin,
-                        &terminal::TerminalBounds {
-                            cell_width,
-                            line_height: text_line_height,
-                            bounds,
-                        },
-                        window,
-                    );
-                }
+                window.paint_quads(
+                    block_element_rects
+                        .iter()
+                        .map(|rect| rect.paint_quad(bounds.origin, &dimensions))
+                        .chain(
+                            split_rects
+                                .iter()
+                                .map(|rect| rect.paint_quad(bounds.origin, &dimensions)),
+                        ),
+                );
             },
         )
         // We must set the height explicitly for the editor block to size itself correctly
