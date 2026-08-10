@@ -4135,6 +4135,38 @@ impl Window {
         }
     }
 
+    /// Paint a batch of quads into the scene for the next frame at a single, shared paint
+    /// order, rather than computing one individually per quad as `paint_quad` does. Intended
+    /// for callers that paint many quads at once (e.g. per-cell terminal backgrounds) where
+    /// the individual paint order of each quad relative to the others doesn't matter.
+    ///
+    /// Unlike `paint_quad`, this doesn't split border-only quads around their transparent
+    /// interior. Only use it for quads you know are opaque fills.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_quads(&mut self, quads: impl IntoIterator<Item = PaintQuad>) {
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        let content_mask = self.snapped_content_mask();
+        let scale_factor = self.scale_factor();
+        let quads = quads
+            .into_iter()
+            .map(|quad| Quad {
+                order: 0,
+                bounds: self.snap_bounds(quad.bounds),
+                content_mask,
+                background: quad.background.opacity(opacity),
+                border_color: quad.border_color.opacity(opacity),
+                corner_radii: quad.corner_radii.scale(scale_factor),
+                border_widths: self.snap_border_widths(quad.border_widths),
+                border_style: quad.border_style,
+            })
+            .collect();
+
+        self.next_frame.scene.insert_quads(quads);
+    }
+
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

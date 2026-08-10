@@ -747,6 +747,7 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    VerticalSplit = 4,
 }
 
 /// A color space for color interpolation.
@@ -804,6 +805,11 @@ impl std::fmt::Debug for Background {
                 f,
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
+            ),
+            BackgroundTag::VerticalSplit => write!(
+                f,
+                "VerticalSplit({}, {:?}, {:?})",
+                self.gradient_angle_or_pattern_height, self.colors[0], self.colors[1]
             ),
         }
     }
@@ -871,6 +877,23 @@ pub fn linear_gradient(
         tag: BackgroundTag::LinearGradient,
         gradient_angle_or_pattern_height: angle,
         colors: [from.into(), to.into()],
+        ..Default::default()
+    }
+}
+
+/// Creates a background vertically split between a top and bottom color.
+///
+/// `split_y` is the fraction (0.0 to 1.0) of the element's height where the split occurs -
+/// everything above it is painted `top`, everything below `bottom`.
+pub fn vertical_split_background(
+    top: impl Into<Hsla>,
+    bottom: impl Into<Hsla>,
+    split_y: f32,
+) -> Background {
+    Background {
+        tag: BackgroundTag::VerticalSplit,
+        gradient_angle_or_pattern_height: split_y.clamp(0.0, 1.0),
+        colors: [linear_color_stop(top, 0.0), linear_color_stop(bottom, 1.0)],
         ..Default::default()
     }
 }
@@ -943,6 +966,7 @@ impl Background {
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
+            BackgroundTag::VerticalSplit => self.colors.iter().all(|c| c.color.is_transparent()),
         }
     }
 }
@@ -1039,6 +1063,19 @@ mod tests {
 
         assert_eq!(background.opacity(0.5).colors[0], from.opacity(0.5));
         assert_eq!(background.opacity(0.5).colors[1], to.opacity(0.5));
+        assert!(!background.is_transparent());
+        assert!(background.opacity(0.0).is_transparent());
+    }
+
+    #[test]
+    fn test_background_vertical_split() {
+        let top = Hsla::from(rgba(0xff0099ff));
+        let bottom = Hsla::from(rgba(0x00ff99ff));
+        let background = vertical_split_background(top, bottom, 0.5);
+        assert_eq!(background.tag, BackgroundTag::VerticalSplit);
+        assert_eq!(background.gradient_angle_or_pattern_height, 0.5);
+        assert_eq!(background.colors[0].color, top);
+        assert_eq!(background.colors[1].color, bottom);
         assert!(!background.is_transparent());
         assert!(background.opacity(0.0).is_transparent());
     }

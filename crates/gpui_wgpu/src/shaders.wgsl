@@ -135,6 +135,7 @@ struct Background {
     // 1u is LinearGradient
     // 2u is PatternSlash
     // 3u is Checkerboard
+    // 4u is VerticalSplit
     tag: u32,
     // 0u is sRGB linear color
     // 1u is Oklab color
@@ -407,18 +408,18 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
 
     if (tag == 0u || tag == 2u || tag == 3u) {
         result.solid = hsla_to_rgba(solid);
-    } else if (tag == 1u) {
+    } else if (tag == 1u || tag == 4u) {
         // The hsla_to_rgba is returns a linear sRGB color
         result.color0 = hsla_to_rgba(colors[0].color);
         result.color1 = hsla_to_rgba(colors[1].color);
 
         // Prepare color space in vertex for avoid conversion
         // in fragment shader for performance reasons
-        if (color_space == 0u) {
+        if (tag == 1u && color_space == 0u) {
             // sRGB
             result.color0 = linear_to_srgba(result.color0);
             result.color1 = linear_to_srgba(result.color1);
-        } else if (color_space == 1u) {
+        } else if (tag == 1u && color_space == 1u) {
             // Oklab
             result.color0 = linear_srgb_to_oklab(result.color0);
             result.color1 = linear_srgb_to_oklab(result.color1);
@@ -508,6 +509,14 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
             background_color = solid_color;
             background_color.a *= saturate(should_be_colored);
+        }
+        case 4u: {
+            let relative_y = (position.y - bounds.origin.y) / bounds.size.y;
+            if (relative_y < background.gradient_angle_or_pattern_height) {
+                background_color = color0;
+            } else {
+                background_color = color1;
+            }
         }
     }
 

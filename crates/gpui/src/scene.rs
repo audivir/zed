@@ -138,10 +138,47 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Inserts a batch of quads that share a single paint order, computed once from their
+    /// combined (clipped) bounds instead of per-quad, so a caller painting many small quads
+    /// at once (e.g. terminal cell backgrounds) does one `primitive_bounds` insertion instead
+    /// of one per quad.
+    pub fn insert_quads(&mut self, mut quads: Vec<Quad>) {
+        let mut combined_bounds: Option<Bounds<ScaledPixels>> = None;
+        quads.retain(|quad| {
+            let clipped_bounds = quad.bounds.intersect(&quad.content_mask.bounds);
+            if clipped_bounds.is_empty() {
+                return false;
+            }
+
+            combined_bounds = Some(match combined_bounds {
+                Some(bounds) => bounds.union(&clipped_bounds),
+                None => clipped_bounds,
+            });
+            true
+        });
+
+        let Some(combined_bounds) = combined_bounds else {
+            return;
+        };
+
+        let order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(combined_bounds));
+        for quad in &mut quads {
+            quad.order = order;
+        }
+
+        self.quads.extend(quads.iter().copied());
+        self.paint_operations.push(PaintOperation::Quads(quads));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Quads(quads) => self.insert_quads(quads.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -213,6 +250,7 @@ pub(crate) enum PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    Quads(Vec<Quad>),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }

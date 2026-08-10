@@ -1155,13 +1155,13 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid,
   GradientColor out;
   if (tag == 0 || tag == 2 || tag == 3) {
     out.solid = hsla_to_rgba(solid);
-  } else if (tag == 1) {
+  } else if (tag == 1 || tag == 4) {
     out.color0 = hsla_to_rgba(color0);
     out.color1 = hsla_to_rgba(color1);
 
     // Prepare color space in vertex for avoid conversion
     // in fragment shader for performance reasons
-    if (color_space == 1) {
+    if (tag == 1 && color_space == 1) {
       // Oklab
       out.color0 = srgb_to_oklab(out.color0);
       out.color1 = srgb_to_oklab(out.color1);
@@ -1242,6 +1242,11 @@ float4 fill_color(Background background,
         color.a   += tri * 3.0 / 255.0;
       }
 
+      break;
+    }
+    case 4: {
+      float relative_y = (position.y - bounds.origin.y) / bounds.size.height;
+      color = relative_y < background.gradient_angle_or_pattern_height ? color0 : color1;
       break;
     }
     case 2: {

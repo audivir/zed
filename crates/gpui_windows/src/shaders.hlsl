@@ -57,6 +57,8 @@ struct Background {
     // 0u is Solid
     // 1u is LinearGradient
     // 2u is PatternSlash
+    // 3u is Checkerboard
+    // 4u is VerticalSplit
     uint tag;
     // 0u is sRGB linear color
     // 1u is Oklab color
@@ -318,13 +320,13 @@ GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, Lin
     GradientColor output;
     if (tag == 0 || tag == 2 || tag == 3) {
         output.solid = hsla_to_rgba(solid);
-    } else if (tag == 1) {
+    } else if (tag == 1 || tag == 4) {
         output.color0 = hsla_to_rgba(colors[0].color);
         output.color1 = hsla_to_rgba(colors[1].color);
 
         // Prepare color space in vertex for avoid conversion
         // in fragment shader for performance reasons
-        if (color_space == 1) {
+        if (tag == 1 && color_space == 1) {
             // Oklab
             output.color0 = srgb_to_oklab(output.color0);
             output.color1 = srgb_to_oklab(output.color1);
@@ -434,6 +436,11 @@ float4 gradient_color(Background background,
 
             color = solid_color;
             color.a *= saturate(should_be_colored);
+            break;
+        }
+        case 4: {
+            float relative_y = (position.y - bounds.origin.y) / bounds.size.y;
+            color = relative_y < background.gradient_angle_or_pattern_height ? color0 : color1;
             break;
         }
     }
