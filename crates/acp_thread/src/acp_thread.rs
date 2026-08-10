@@ -4669,8 +4669,7 @@ impl AcpThread {
                 }
 
                 if let Some(_status) = self.pending_terminal_exit.remove(&terminal_id) {
-                    entity.update(cx, |term, cx| {
-                        term.inner().update(cx, |inner, _| inner.shrink_to_used());
+                    entity.update(cx, |_term, cx| {
                         cx.notify();
                     });
                 }
@@ -4706,8 +4705,7 @@ impl AcpThread {
                 status,
             } => {
                 if let Some(entity) = self.terminals.get(&terminal_id) {
-                    entity.update(cx, |term, cx| {
-                        term.inner().update(cx, |inner, _| inner.shrink_to_used());
+                    entity.update(cx, |_term, cx| {
                         cx.notify();
                     });
                 } else {
