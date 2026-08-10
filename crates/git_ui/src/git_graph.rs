@@ -605,8 +605,10 @@ pub struct OpenAtCommit {
 fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
     static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
     FORMAT.get_or_init(|| {
-        time::format_description::parse("[day] [month repr:short] [year] [hour]:[minute]")
-            .unwrap_or_default()
+        time::format_description::parse_borrowed::<1>(
+            "[day] [month repr:short] [year] [hour]:[minute]",
+        )
+        .unwrap_or_default()
     })
 }
 
@@ -2740,8 +2742,10 @@ impl GitGraph {
             .map(|datetime| {
                 let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
                 let local_datetime = datetime.to_offset(local_offset);
-                let format =
-                    time::format_description::parse("[month repr:short] [day], [year]").ok();
+                let format = time::format_description::parse_borrowed::<1>(
+                    "[month repr:short] [day], [year]",
+                )
+                .ok();
                 format
                     .and_then(|f| local_datetime.format(&f).ok())
                     .unwrap_or_default()
