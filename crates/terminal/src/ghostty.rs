@@ -370,6 +370,10 @@ impl GhosttyTerminal {
         let mut rows = self.rows.update(&snapshot)?;
         let mut cells = Vec::new();
         let mut row_index: i32 = 0;
+        // Reused across cells so the common case (no combining/zero-width marks, well
+        // under this size) never allocates just to read a cell's grapheme cluster; only
+        // clusters longer than this fall back to a per-cell Vec.
+        let mut grapheme_buf = [' '; 32];
 
         while let Some(row) = rows.next() {
             let mut row_cells = self.cells.update(row)?;
@@ -378,12 +382,17 @@ impl GhosttyTerminal {
             while let Some(cell) = row_cells.next() {
                 let style = cell.style()?;
                 let raw_cell = cell.raw_cell()?;
-                let graphemes = cell.graphemes()?;
-                let character = graphemes.first().copied().unwrap_or(' ');
-                let zerowidth = if graphemes.len() > 1 {
-                    graphemes[1..].to_vec()
+                let graphemes_len = cell.graphemes_len()?;
+                let (character, zerowidth) = if graphemes_len == 0 {
+                    (' ', Vec::new())
+                } else if graphemes_len <= grapheme_buf.len() {
+                    let buf = &mut grapheme_buf[..graphemes_len];
+                    cell.graphemes_buf(buf)?;
+                    (buf[0], buf[1..].to_vec())
                 } else {
-                    Vec::new()
+                    let mut graphemes = vec!['\0'; graphemes_len];
+                    cell.graphemes_buf(&mut graphemes)?;
+                    (graphemes[0], graphemes[1..].to_vec())
                 };
 
                 cells.push(crate::IndexedCell {
@@ -3321,6 +3330,54 @@ mod tests {
         assert_eq!(
             cell(10).background(),
             vte::ansi::Color::Named(vte::ansi::NamedColor::Background)
+        );
+    }
+
+    #[test]
+    fn build_content_reports_zero_width_combining_marks() {
+        let mut terminal = GhosttyTerminal::new(10, 2, 100).unwrap();
+        terminal.resize(test_bounds(10, 2)).unwrap();
+
+        // "e" followed by a combining acute accent (U+0301): one grapheme cluster,
+        // two codepoints. Exercises build_content's stack-buffered path (well under
+        // its 32-char inline capacity).
+        terminal.write("e\u{0301}".as_bytes());
+
+        let (cells, _mode, _display_offset) = terminal.build_content().unwrap();
+        let cell = cells
+            .iter()
+            .find(|c| c.point == crate::Point::new(0, 0))
+            .expect("no cell at column 0");
+
+        assert_eq!(cell.character(), 'e');
+        assert_eq!(cell.zerowidth(), Some(&['\u{0301}'][..]));
+    }
+
+    #[test]
+    fn build_content_reports_a_grapheme_cluster_past_the_inline_buffer() {
+        let mut terminal = GhosttyTerminal::new(10, 2, 100).unwrap();
+        terminal.resize(test_bounds(10, 2)).unwrap();
+
+        // A base character followed by 40 combining marks, more than
+        // build_content's 32-char inline stack buffer, forcing its heap
+        // fallback path.
+        let mut cluster = String::from("e");
+        for _ in 0..40 {
+            cluster.push('\u{0301}');
+        }
+        terminal.write(cluster.as_bytes());
+
+        let (cells, _mode, _display_offset) = terminal.build_content().unwrap();
+        let cell = cells
+            .iter()
+            .find(|c| c.point == crate::Point::new(0, 0))
+            .expect("no cell at column 0");
+
+        assert_eq!(cell.character(), 'e');
+        assert_eq!(
+            cell.zerowidth().map(|chars| chars.len()),
+            Some(40),
+            "expected all 40 combining marks to survive the heap fallback path"
         );
     }
 
