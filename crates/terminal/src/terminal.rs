@@ -932,7 +932,6 @@ enum InternalEvent {
 #[derive(Clone)]
 pub(crate) enum TerminalBackendEvent {
     Title(String),
-    Wakeup,
     Bell,
     Exit,
     ChildExit(ExitStatus),
@@ -942,7 +941,6 @@ impl fmt::Debug for TerminalBackendEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Title(title) => write!(f, "Title({title})"),
-            Self::Wakeup => f.write_str("Wakeup"),
             Self::Bell => f.write_str("Bell"),
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
@@ -1858,14 +1856,6 @@ impl Terminal {
                 cx.emit(Event::Bell);
             }
             TerminalBackendEvent::Exit => self.register_task_finished(None, cx),
-            TerminalBackendEvent::Wakeup => {
-                self.detect_init_command_startup_marker();
-                cx.emit(Event::Wakeup);
-
-                if let TerminalType::Pty { info, .. } = &self.terminal_type {
-                    info.emit_title_changed_if_changed(cx);
-                }
-            }
             TerminalBackendEvent::ChildExit(exit_status) => {
                 self.register_task_finished(Some(exit_status), cx);
             }
