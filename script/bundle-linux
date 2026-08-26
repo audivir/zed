@@ -73,6 +73,11 @@ fi
 
 export CC=${CC:-$(which clang)}
 
+# release profile's debug="limited" makes Cargo pass DEBUG=true to build
+# scripts, which libghostty-vt-sys misreads as "build debug" (slow Ghostty
+# integrity checks). Force ReleaseFast explicitly.
+export LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast
+
 # Build binary in release mode
 # We need lld to link libwebrtc.a successfully on aarch64-linux.
 # NOTE: Since RUSTFLAGS env var overrides all .cargo/config.toml rustflags

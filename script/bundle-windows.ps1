@@ -115,6 +115,10 @@ function GenerateLicenses {
 
 function BuildZedAndItsFriends {
     Write-Output "Building Zed and its friends, for channel: $channel"
+    # release profile's debug="limited" makes Cargo pass DEBUG=true to build
+    # scripts, which libghostty-vt-sys misreads as "build debug" (slow
+    # Ghostty integrity checks). Force ReleaseFast explicitly.
+    $env:LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"
     # Build zed.exe, cli.exe and auto_update_helper.exe
     cargo build --release --package zed --package cli --package auto_update_helper --target $target
     Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force

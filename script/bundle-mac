@@ -86,6 +86,13 @@ script/generate-licenses
 
 rustup target add $target_triple
 
+# release profile's debug="limited" makes Cargo pass DEBUG=true to build
+# scripts, which libghostty-vt-sys misreads as "build debug" (slow Ghostty
+# integrity checks). Force ReleaseFast explicitly.
+if [[ "$target_dir" == "release" ]]; then
+    export LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast
+fi
+
 echo "Compiling zed binaries"
 cargo build ${build_flag} --package zed --package cli --target $target_triple
 # Build remote_server in separate invocation to prevent feature unification from other crates

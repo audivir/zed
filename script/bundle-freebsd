@@ -52,6 +52,11 @@ remote_server_triple=${REMOTE_SERVER_TARGET:-"${target_triple}"}
 
 # export CC=$(which clang)
 
+# release profile's debug="limited" makes Cargo pass DEBUG=true to build
+# scripts, which libghostty-vt-sys misreads as "build debug" (slow Ghostty
+# integrity checks). Force ReleaseFast explicitly.
+export LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast
+
 # Build binary in release mode
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib"
 # cargo build --release --target "${target_triple}" --package zed --package cli
