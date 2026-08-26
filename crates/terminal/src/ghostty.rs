@@ -272,7 +272,7 @@ impl GhosttyTerminal {
     /// silently produces `Point`s off by exactly `scrollback_rows` whenever
     /// the viewport isn't at the live bottom, so always convert through
     /// this function rather than reading `scrollbar().offset` directly.
-    fn alacritty_style_display_offset(&self) -> Result<usize> {
+    pub(super) fn alacritty_style_display_offset(&self) -> Result<usize> {
         let scrollbar = self.terminal.scrollbar()?;
         Ok((scrollbar.total.saturating_sub(scrollbar.len))
             .saturating_sub(scrollbar.offset) as usize)
@@ -1579,11 +1579,18 @@ pub(super) fn write_pty_output_to_ghostty(
     terminal: &ParkingMutex<GhosttyTerminal>,
     events_tx: &UnboundedSender<PtyEvent>,
 ) -> bool {
-    let effects = {
-        let mut terminal = terminal.lock();
-        terminal.write(output);
-        terminal.take_effects()
-    };
+    let mut guard = terminal.lock();
+    guard.write(output);
+    let effects = guard.take_effects();
+    // Fair unlock: this runs in the PTY parser thread's tight batch loop, so
+    // under sustained high-throughput output (e.g. a large `ruff` run) it
+    // re-locks `terminal` again almost immediately for the next batch.
+    // parking_lot's default unlock is unfair and lets a thread that's
+    // already running re-acquire the lock ahead of one that's been parked
+    // waiting for it, so without this the UI thread's occasional lock
+    // attempts (e.g. `Terminal::total_lines` during render) can be starved
+    // for seconds at a time instead of just delayed a batch or two.
+    parking_lot::MutexGuard::unlock_fair(guard);
     events_tx
         .unbounded_send(PtyEvent::GhosttyPtyOutput { effects })
         .is_ok()

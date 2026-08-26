@@ -714,6 +714,58 @@ impl Default for Content {
     }
 }
 
+/// A backend-agnostic port of `alacritty::adjusted_last_hovered_word`:
+/// decides whether `previous`'s hovered word can still be trusted against
+/// `new`'s grid shape/scroll position, adjusting its line by the scroll
+/// delta if only the viewport shifted. Takes `Content` snapshots rather
+/// than a `Grid` reference so it works for any backend that populates
+/// `Content::columns`/`screen_lines`/`total_lines`/`display_offset`.
+fn adjusted_last_hovered_word(
+    new: &Content,
+    previous: &Content,
+) -> (Option<HoveredWord>, GridLinesChange) {
+    let grid_size_changed =
+        new.columns != previous.columns || new.screen_lines != previous.screen_lines;
+
+    let total_lines_delta = new.total_lines as i64 - previous.total_lines as i64;
+    let display_offset_delta = new.display_offset as i64 - previous.display_offset as i64;
+    let grid_visible_lines_changed = total_lines_delta != display_offset_delta;
+
+    let grid_lines_change = if grid_size_changed || grid_visible_lines_changed {
+        GridLinesChange::Changed
+    } else {
+        GridLinesChange::Unchanged
+    };
+
+    let hovered_word = if let Some(last_hovered_word) = previous.last_hovered_word.as_ref()
+        && grid_lines_change == GridLinesChange::Unchanged
+    {
+        if total_lines_delta == 0 {
+            // Viewport and content are the same, we can reuse existing match
+            Some(last_hovered_word.clone())
+        } else {
+            // Content is changed, but viewport is shifted the same, reuse
+            // the match, but need to shift the match lines by the same amount.
+            let mut adjusted_hovered_word = last_hovered_word.clone();
+            adjusted_hovered_word.word_match = Range::new(
+                Point::new(
+                    last_hovered_word.word_match.start().line - display_offset_delta as i32,
+                    last_hovered_word.word_match.start().column,
+                ),
+                Point::new(
+                    last_hovered_word.word_match.end().line - display_offset_delta as i32,
+                    last_hovered_word.word_match.end().column,
+                ),
+            );
+            Some(adjusted_hovered_word)
+        }
+    } else {
+        None
+    };
+
+    (hovered_word, grid_lines_change)
+}
+
 #[derive(PartialEq, Eq)]
 enum SelectionPhase {
     Selecting,
@@ -2095,13 +2147,20 @@ impl Terminal {
             InternalEvent::FindHyperlink(position, open) => {
                 trace!("Finding hyperlink at position: position={position:?}, open={open:?}");
 
-                let point = grid_point(
-                    *position,
-                    self.last_content.terminal_bounds,
-                    self.last_content.display_offset,
-                );
-
                 let hyperlink = if let Some(ghostty) = self.ghostty.as_ref() {
+                    // Reads Ghostty's live display offset rather than
+                    // `self.last_content.display_offset`: this event can be
+                    // processed mid-`sync()`, right after a scroll/vi-cursor
+                    // event whose viewport shift `self.last_content` hasn't
+                    // picked up yet (that only happens at the end of `sync`,
+                    // in `refresh_last_content_from_ghostty`). Using the
+                    // stale cached offset would resolve `position` against
+                    // the pre-scroll row instead of the live one.
+                    let display_offset = ghostty
+                        .lock()
+                        .alacritty_style_display_offset()
+                        .unwrap_or(self.last_content.display_offset);
+                    let point = grid_point(*position, self.last_content.terminal_bounds, display_offset);
                     match ghostty.lock().hyperlink_at(
                         point,
                         &GHOSTTY_URL_REGEX,
@@ -2809,11 +2868,17 @@ impl Terminal {
         while let Some(e) = self.events.pop_front() {
             self.process_terminal_event(&e, window, cx)
         }
-        // Ghostty's content path doesn't yet track grid-size/scroll deltas
-        // the way Alacritty's `adjusted_last_hovered_word` does, so
-        // `grid_lines_change` (and the resulting forced `refresh_hovered_word`
-        // upstream added) has no Ghostty-side producer to wire up to yet.
         self.refresh_last_content_from_ghostty(cx);
+        if self.last_content.grid_lines_change == GridLinesChange::Changed {
+            debug_assert!(self.last_content.last_hovered_word.is_none());
+            self.refresh_hovered_word(window, cx);
+
+            // Because refresh_hovered_word() may result
+            // in new events, but will not trigger a repaint
+            if !self.events.is_empty() {
+                cx.emit(Event::Wakeup);
+            }
+        }
     }
 
     /// Rebuilds `self.last_content` from Ghostty's current state. This is
@@ -2833,12 +2898,20 @@ impl Terminal {
 
         let mut content = Content {
             terminal_bounds: self.last_content.terminal_bounds,
-            last_hovered_word: self.last_content.last_hovered_word.clone(),
             images: self.last_content.images.clone(),
             ..Default::default()
         };
+        content.columns = content.terminal_bounds.num_columns();
 
-        match ghostty.lock().build_content() {
+        // Held for the rest of this function instead of re-locking per
+        // field: besides avoiding repeated lock/unlock overhead while the
+        // PTY parser thread is also contending for this same mutex, it
+        // keeps every field below consistent with a single Ghostty state
+        // snapshot rather than one that could shift between separate lock
+        // acquisitions if the parser thread wrote more output in between.
+        let mut ghostty = ghostty.lock();
+
+        match ghostty.build_content() {
             Ok((cells, mode, display_offset)) => {
                 content.cells = cells;
                 content.mode = mode;
@@ -2848,8 +2921,8 @@ impl Terminal {
                 log::error!("failed to build ghostty terminal content: {error}");
             }
         }
-        let vi_cursor = ghostty.lock().vi_cursor();
-        match ghostty.lock().content_metadata(content.display_offset, vi_cursor) {
+        let vi_cursor = ghostty.vi_cursor();
+        match ghostty.content_metadata(content.display_offset, vi_cursor) {
             Ok(metadata) => {
                 content.cursor = metadata.cursor;
                 content.cursor_char = metadata.cursor_char;
@@ -2864,35 +2937,58 @@ impl Terminal {
                 log::error!("failed to render ghostty terminal metadata: {error}");
             }
         }
-        match ghostty.lock().image_placements() {
+        match ghostty.image_placements() {
             Ok(images) => content.images = images,
             Err(error) => {
                 log::error!("failed to read ghostty image placements: {error}");
             }
         }
-        content.selection = ghostty.lock().selection_range();
-        match ghostty.lock().selection_text() {
+        content.selection = ghostty.selection_range();
+        match ghostty.selection_text() {
             Ok(text) => content.selection_text = text,
             Err(error) => {
                 log::error!("failed to read ghostty selection text: {error}");
             }
         }
 
-        match ghostty.lock().rows() {
-            Ok(screen_lines) => {
-                let bottom_line = screen_lines as i32 - 1 - content.display_offset as i32;
-                content.bottom_row_occupied = content.cursor.point.line >= bottom_line
-                    || content
-                        .cells
-                        .iter()
-                        .rev()
-                        .take_while(|cell| cell.point.line >= bottom_line)
-                        .any(|cell| cell.cell.character() != ' ');
-            }
+        match ghostty.rows() {
+            Ok(screen_lines) => content.screen_lines = screen_lines as usize,
             Err(error) => {
                 log::error!("failed to read ghostty row count: {error}");
             }
         }
+        match ghostty.total_lines() {
+            Ok(total_lines) => content.total_lines = total_lines,
+            Err(error) => {
+                log::error!("failed to read ghostty total line count: {error}");
+            }
+        }
+        drop(ghostty);
+
+        // A direct port of `alacritty::make_content`'s own
+        // `bottom_row_occupied` computation, sourced from the
+        // Ghostty-derived `content.cells`/`content.cursor`/
+        // `content.display_offset` set above.
+        let bottom_line = content.screen_lines as i32 - 1 - content.display_offset as i32;
+        content.bottom_row_occupied = content.cursor.point.line >= bottom_line
+            || content
+                .cells
+                .iter()
+                .rev()
+                .take_while(|cell| cell.point.line >= bottom_line)
+                .any(|cell| cell.cell.character() != ' ');
+
+        // A port of `alacritty::adjusted_last_hovered_word`: only carries
+        // the hovered word forward when the grid shape and visible line
+        // count haven't changed, adjusting its line by the scroll delta
+        // when only the viewport shifted. Ghostty has no direct equivalent
+        // of Alacritty's `Grid`, so this compares the previous/new `Content`
+        // snapshots (`self.last_content` before it's overwritten below)
+        // instead of grid state directly.
+        let (last_hovered_word, grid_lines_change) =
+            adjusted_last_hovered_word(&content, &self.last_content);
+        content.last_hovered_word = last_hovered_word;
+        content.grid_lines_change = grid_lines_change;
 
         self.last_content = content;
     }
