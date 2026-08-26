@@ -25,17 +25,17 @@ pub(crate) struct HyperlinkMatch {
 
 impl Default for RegexSearches {
     fn default() -> Self {
-        Self::new(Vec::<String>::new(), 0)
+        Self::new(Vec::<String>::new(), Duration::ZERO)
     }
 }
 impl RegexSearches {
     pub(crate) fn new(
         path_hyperlink_regexes: impl IntoIterator<Item: AsRef<str>>,
-        path_hyperlink_timeout_ms: u64,
+        path_hyperlink_timeout: Duration,
     ) -> Self {
         Self {
             path_hyperlink_regexes: Self::path_hyperlink_regexes(path_hyperlink_regexes),
-            path_hyperlink_timeout: Duration::from_millis(path_hyperlink_timeout_ms),
+            path_hyperlink_timeout,
         }
     }
 

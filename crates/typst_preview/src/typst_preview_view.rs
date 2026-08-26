@@ -150,17 +150,17 @@ fn publish_editor_diagnostics(
         .filter(|d| d.file_path.as_deref() == Some(active_path.as_path()))
         .filter_map(|d| {
             let range = d.range.clone()?;
-            Some(DiagnosticEntry {
-                range: snapshot.offset_to_point_utf16(range.start)
+            Some(DiagnosticEntry::new(
+                snapshot.offset_to_point_utf16(range.start)
                     ..snapshot.offset_to_point_utf16(range.end),
-                diagnostic: Diagnostic {
+                Diagnostic {
                     source: Some("Typst".to_string()),
                     severity: d.severity,
                     message: d.message.clone(),
                     is_primary: true,
                     ..Default::default()
                 },
-            })
+            ))
         })
         .enumerate()
         .map(|(index, mut entry)| {

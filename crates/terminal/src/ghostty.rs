@@ -3811,7 +3811,8 @@ mod tests {
                 "    (:+[0-9]+(:[0-9]+)?|:?\\([0-9]+([,:]?[0-9]+)?\\))?\n",
                 ")",
             );
-            const PATH_HYPERLINK_TIMEOUT_MS: u64 = 1000;
+            const PATH_HYPERLINK_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_millis(1000);
 
             let regex_searches = RegexSearches::new(
                 [
@@ -3822,7 +3823,7 @@ mod tests {
                     PYTHON_DIAGNOSTIC_REGEX,
                     DEFAULT_PATH_REGEX,
                 ],
-                PATH_HYPERLINK_TIMEOUT_MS,
+                PATH_HYPERLINK_TIMEOUT,
             );
 
             let rows = total_cells / columns + 2;
