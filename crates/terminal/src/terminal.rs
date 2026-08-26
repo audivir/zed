@@ -9,10 +9,7 @@ use anyhow::{Result, bail};
 use futures_lite::future::yield_now;
 use log::trace;
 
-use futures::{
-    FutureExt,
-    channel::mpsc::{UnboundedReceiver, unbounded},
-};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
 use itertools::Itertools as _;
 use mappings::mouse::{
@@ -1583,59 +1580,18 @@ impl TerminalBuilder {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
-                terminal.update(cx, |terminal, cx| {
-                    //Process the first event immediately for lowered latency
-                    terminal.process_pty_event(event, cx);
-                })?;
-
-                'outer: loop {
-                    let mut events = Vec::new();
-
-                    #[cfg(any(test, feature = "test-support"))]
-                    let mut timer = cx.background_executor().simulate_random_delay().fuse();
-                    #[cfg(not(any(test, feature = "test-support")))]
-                    let mut timer = cx
-                        .background_executor()
-                        .timer(std::time::Duration::from_millis(4))
-                        .fuse();
-
-                    let mut wakeup = false;
-                    loop {
-                        futures::select_biased! {
-                            _ = timer => break,
-                            event = self.events_rx.next() => {
-                                if let Some(event) = event {
-                                    if matches!(event, PtyEvent::Event(TerminalBackendEvent::Wakeup))
-                                    {
-                                        wakeup = true;
-                                    } else {
-                                        events.push(event);
-                                    }
-
-                                    if events.len() > 100 {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            },
-                        }
+                let mut events = vec![event];
+                while let Ok(next_event) = self.events_rx.try_recv() {
+                    events.push(next_event);
+                    if events.len() >= 100 {
+                        break;
                     }
-
-                    if events.is_empty() && !wakeup {
-                        yield_now().await;
-                        break 'outer;
-                    }
-
-                    terminal.update(cx, |this, cx| {
-                        if wakeup {
-                            this.process_event(TerminalBackendEvent::Wakeup, cx);
-                        }
-
-                        this.process_events(events, cx);
-                    })?;
-                    yield_now().await;
                 }
+
+                terminal.update(cx, |this, cx| {
+                    this.process_events(events, cx);
+                })?;
+                yield_now().await;
             }
             anyhow::Ok(())
         });
@@ -2944,10 +2900,12 @@ impl Terminal {
             }
         }
         content.selection = ghostty.selection_range();
-        match ghostty.selection_text() {
-            Ok(text) => content.selection_text = text,
-            Err(error) => {
-                log::error!("failed to read ghostty selection text: {error}");
+        if content.selection.is_some() {
+            match ghostty.selection_text() {
+                Ok(text) => content.selection_text = text,
+                Err(error) => {
+                    log::error!("failed to read ghostty selection text: {error}");
+                }
             }
         }
 
@@ -3917,7 +3875,7 @@ fn spawn_task_subprocess(
                                 let converted =
                                     convert_lf_to_crlf(&buffer[..count], &mut previous_byte_was_cr);
                                 if !ghostty::write_pty_output_to_ghostty(
-                                    &converted, &terminal, &events_tx,
+                                    &converted, &terminal, &events_tx, false,
                                 ) {
                                     return;
                                 }

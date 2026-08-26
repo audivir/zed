@@ -34,13 +34,13 @@ use crate::{
 const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 320 * 1024 * 1024;
 
 /// Size of each recycled PTY read buffer.
-const PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
+const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Upper bound on how many bytes the parser thread batches into a single
 /// `libghostty-vt` write before handing effects back to the UI thread.
-const MAX_PTY_PARSE_BATCH_BYTES: usize = 16 * 1024;
+const MAX_PTY_PARSE_BATCH_BYTES: usize = 512 * 1024;
 /// Bound on the reader-to-parser queue, so a slow parser applies backpressure
 /// to PTY reads instead of buffering unboundedly.
-const MAX_QUEUED_PTY_OUTPUT_BUFFERS: usize = 256;
+const MAX_QUEUED_PTY_OUTPUT_BUFFERS: usize = 512;
 /// Bound on the buffer-recycling channel back to the reader thread.
 const MAX_RECYCLED_PTY_BUFFERS: usize = 64;
 
@@ -368,7 +368,9 @@ impl GhosttyTerminal {
     ) -> Result<(Vec<crate::IndexedCell>, crate::Modes, usize)> {
         let snapshot = self.render_state.update(&self.terminal)?;
         let mut rows = self.rows.update(&snapshot)?;
-        let mut cells = Vec::new();
+        let total_cells = usize::from(self.terminal.rows().unwrap_or(24))
+            * usize::from(self.terminal.cols().unwrap_or(80));
+        let mut cells = Vec::with_capacity(total_cells);
         let mut row_index: i32 = 0;
         // Reused across cells so the common case (no combining/zero-width marks, well
         // under this size) never allocates just to read a cell's grapheme cluster; only
@@ -385,6 +387,10 @@ impl GhosttyTerminal {
                 let graphemes_len = cell.graphemes_len()?;
                 let (character, zerowidth) = if graphemes_len == 0 {
                     (' ', Vec::new())
+                } else if graphemes_len == 1 {
+                    let buf = &mut grapheme_buf[..1];
+                    cell.graphemes_buf(buf)?;
+                    (buf[0], Vec::new())
                 } else if graphemes_len <= grapheme_buf.len() {
                     let buf = &mut grapheme_buf[..graphemes_len];
                     cell.graphemes_buf(buf)?;
@@ -1390,6 +1396,7 @@ pub(super) fn spawn_pty(
             }
 
             let mut pending_chunk = None;
+            let mut consecutive_batches = 0;
             while let Some(mut batch) = pending_chunk.take().or_else(|| output_rx.recv().ok()) {
                 while batch.len() < MAX_PTY_PARSE_BATCH_BYTES {
                     match output_rx.try_recv() {
@@ -1407,7 +1414,14 @@ pub(super) fn spawn_pty(
                     }
                 }
 
-                let keep_running = write_pty_output_to_ghostty(&batch, &terminal, &events_tx);
+                consecutive_batches += 1;
+                let yield_fair = consecutive_batches >= 4;
+                if yield_fair {
+                    consecutive_batches = 0;
+                }
+
+                let keep_running =
+                    write_pty_output_to_ghostty(&batch, &terminal, &events_tx, yield_fair);
                 recycle_pty_buffer(batch, &recycle_tx);
                 if !keep_running {
                     break;
@@ -1551,16 +1565,17 @@ pub(super) fn ghostty_scroll(scroll: Scroll, screen_lines: usize) -> ScrollViewp
 fn next_pty_read_buffer(recycle_rx: &Receiver<Vec<u8>>) -> Vec<u8> {
     let mut buffer = recycle_rx
         .try_recv()
-        .unwrap_or_else(|_| Vec::with_capacity(PTY_READ_BUFFER_BYTES));
-    buffer.resize(PTY_READ_BUFFER_BYTES, 0);
+        .unwrap_or_else(|_| vec![0; PTY_READ_BUFFER_BYTES]);
+    if buffer.len() < PTY_READ_BUFFER_BYTES {
+        buffer.resize(PTY_READ_BUFFER_BYTES, 0);
+    }
     buffer
 }
 
 /// Returns a drained buffer to the reader thread for reuse, dropping it
 /// instead if the recycling channel is full/disconnected or the buffer grew
 /// unusually large (e.g. from batching) and isn't worth keeping around.
-fn recycle_pty_buffer(mut buffer: Vec<u8>, recycle_tx: &SyncSender<Vec<u8>>) {
-    buffer.clear();
+fn recycle_pty_buffer(buffer: Vec<u8>, recycle_tx: &SyncSender<Vec<u8>>) {
     if buffer.capacity() > MAX_PTY_PARSE_BATCH_BYTES {
         return;
     }
@@ -1578,19 +1593,16 @@ pub(super) fn write_pty_output_to_ghostty(
     output: &[u8],
     terminal: &ParkingMutex<GhosttyTerminal>,
     events_tx: &UnboundedSender<PtyEvent>,
+    yield_fair: bool,
 ) -> bool {
     let mut guard = terminal.lock();
     guard.write(output);
     let effects = guard.take_effects();
-    // Fair unlock: this runs in the PTY parser thread's tight batch loop, so
-    // under sustained high-throughput output (e.g. a large `ruff` run) it
-    // re-locks `terminal` again almost immediately for the next batch.
-    // parking_lot's default unlock is unfair and lets a thread that's
-    // already running re-acquire the lock ahead of one that's been parked
-    // waiting for it, so without this the UI thread's occasional lock
-    // attempts (e.g. `Terminal::total_lines` during render) can be starved
-    // for seconds at a time instead of just delayed a batch or two.
-    parking_lot::MutexGuard::unlock_fair(guard);
+    if yield_fair {
+        parking_lot::MutexGuard::unlock_fair(guard);
+    } else {
+        drop(guard);
+    }
     events_tx
         .unbounded_send(PtyEvent::GhosttyPtyOutput { effects })
         .is_ok()
