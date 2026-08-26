@@ -1067,6 +1067,7 @@ codegen-units = 1
 
 [profile.release.package]
 zed = { codegen-units = 16 }
+libghostty-vt-sys = { debug = false }
 
 [profile.release-fast]
 inherits = "release"
