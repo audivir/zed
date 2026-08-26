@@ -2994,7 +2994,6 @@ impl Terminal {
     }
 
     /// Exposes the most recently synced content's cells for rendering
-
     /// (e.g. the REPL crate's plain-text terminal output cell, which draws
     /// directly instead of going through `terminal_view`'s live
     /// `TerminalElement`). `IndexedCell`/`&IndexedCell` already implement
