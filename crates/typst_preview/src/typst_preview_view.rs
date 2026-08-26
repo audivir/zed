@@ -26,8 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use typst::layout::{Abs, Frame, FrameItem, Point as TypstPoint};
-use typst::syntax::{LinkedNode, Side, Source, Span, SyntaxKind};
-use typst::{World, layout::PagedDocument};
+use typst::syntax::{LinkedNode, RootedPath, Side, Source, Span, SyntaxKind, VirtualRoot};
+use typst::World;
+use typst_layout::PagedDocument;
 use ui::prelude::*;
 use workspace::item::{Item, ItemBufferKind, ItemHandle};
 use workspace::searchable::{SearchEvent, SearchableItemHandle};
@@ -105,8 +106,7 @@ fn resolve_typst_diagnostics(
             };
             let location = diagnostic.span.id().and_then(|file_id| {
                 let path = world.resolve_path(file_id).ok()?;
-                let source = world.source(file_id).ok()?;
-                let range = source.range(diagnostic.span)?;
+                let range = typst::WorldExt::range(world, diagnostic.span)?;
                 Some((path, range))
             });
             TypstDiagnostic {
@@ -827,15 +827,14 @@ impl TypstPreviewView {
                             typst::layout::Abs::pt(point.y as f64),
                         );
 
-                        if let Some(page) = document_clone.pages.get(page_index) {
+                        if let Some(page_number) = std::num::NonZeroUsize::new(page_index + 1) {
                             let world = world_arc.lock();
+                            let position = typst::introspection::PagedPosition {
+                                page: page_number,
+                                point: typst_point,
+                            };
                             if let Some(typst_ide::Jump::File(file_id, offset)) =
-                                typst_ide::jump_from_click(
-                                    &*world,
-                                    &document_clone,
-                                    &page.frame,
-                                    typst_point,
-                                )
+                                typst_ide::jump_from_click(&*world, &*document_clone, &position)
                                 && let Some(path_buf) = world.resolve_path(file_id).ok()
                             {
                                 let normalized_path = util::normalize_path(&path_buf);
@@ -1119,9 +1118,9 @@ impl TypstPreviewView {
                         let start = Instant::now();
 
                         let mut max_width = 0.0f32;
-                        let mut pages = Vec::with_capacity(document.pages.len());
+                        let mut pages = Vec::with_capacity(document.pages().len());
 
-                        for (i, page) in document.pages.iter().enumerate() {
+                        for (i, page) in document.pages().iter().enumerate() {
                             let w = page.frame.width().to_pt() as f32;
                             let h = page.frame.height().to_pt() as f32;
                             max_width = max_width.max(w);
@@ -1144,7 +1143,7 @@ impl TypstPreviewView {
 
                         log::info!(
                             "Page sizes extracted for {} pages in {:?}",
-                            document.pages.len(),
+                            document.pages().len(),
                             start.elapsed()
                         );
 
@@ -1240,9 +1239,10 @@ impl TypstPreviewView {
                         if !path_str.starts_with('/') {
                             path_str.insert(0, '/');
                         }
-                        let vpath = typst::syntax::VirtualPath::new(path_str);
-                        let file_id = typst::syntax::FileId::new(None, vpath);
-                        world_lock.source(file_id).ok()
+                        let file_id = typst::syntax::VirtualPath::new(path_str).ok().map(|vpath| {
+                            typst::syntax::FileId::new(RootedPath::new(VirtualRoot::Project, vpath))
+                        });
+                        file_id.and_then(|file_id| world_lock.source(file_id).ok())
                     }
                 } else {
                     Some(world_lock.main_source().clone())
@@ -1250,7 +1250,7 @@ impl TypstPreviewView {
 
                 if let Some(source) = source {
                     let safe_index = source_index.min(source.text().len());
-                    let positions = typst_ide::jump_from_cursor(document, &source, safe_index);
+                    let positions = typst_ide::jump_from_cursor(&**document, &source, safe_index);
                     if let Some(position) = positions.last() {
                         let page_index = position.page.get() - 1;
 
@@ -1264,7 +1264,7 @@ impl TypstPreviewView {
                         // block's bottom from every leaf in the whole paragraph instead.
                         let paragraph_hits: Vec<(TypstPoint, Abs)> = paragraph_leaf_spans(&source, safe_index)
                             .and_then(|spans| {
-                                let page = document.pages.get(page_index)?;
+                                let page = document.pages().get(page_index)?;
                                 let mut hits = Vec::new();
                                 for span in spans {
                                     find_all_in_frame(&page.frame, span, &mut hits);
@@ -1679,7 +1679,7 @@ mod tests {
             .expect("cursor sits inside the sentence's plain-text leaf");
         assert_eq!(spans.len(), 1, "one plain sentence with no *bold*/_italic_ splits is one leaf");
 
-        let page = document.pages.first().expect("fixture has one page");
+        let page = document.pages().first().expect("fixture has one page");
         let mut points = Vec::new();
         find_all_in_frame(&page.frame, spans[0], &mut points);
 
@@ -1730,7 +1730,7 @@ mod tests {
         let compiled = typst::compile::<PagedDocument>(&world);
         let document = compiled.output.expect("fixture should compile");
         let typst_source = world.main_source().clone();
-        let page = document.pages.first().expect("fixture has one page");
+        let page = document.pages().first().expect("fixture has one page");
 
         // Two cursors either side of the bold word: different syntax leaves, but visually
         // the same one paragraph.
@@ -1806,7 +1806,7 @@ mod tests {
             let compiled = typst::compile::<PagedDocument>(&world);
             let document = compiled.output.expect("fixture should compile");
             let typst_source = world.main_source().clone();
-            let page = document.pages.first().expect("fixture has one page");
+            let page = document.pages().first().expect("fixture has one page");
 
             let cursor = source
                 .find("plain")

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 use typst::diag::{FileError, FileResult};
-use typst::foundations::Datetime;
-use typst::syntax::{FileId, Source, VirtualPath};
+use typst::foundations::{Datetime, Duration};
+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
@@ -126,7 +126,10 @@ impl TypstSystemWorld {
         project_db.load_fonts_dir(&root);
         collect_fontdb_faces(&project_db, &mut book, &mut fonts);
 
-        let main_id = FileId::new(None, VirtualPath::new("/main.typ"));
+        let main_id = FileId::new(RootedPath::new(
+            VirtualRoot::Project,
+            VirtualPath::new("/main.typ").expect("hardcoded path is always valid"),
+        ));
 
         let world = Self {
             library: LazyHash::new(Library::default()),
@@ -153,8 +156,15 @@ impl TypstSystemWorld {
         if !path_str.starts_with('/') {
             path_str.insert(0, '/');
         }
-        let vpath = typst::syntax::VirtualPath::new(path_str);
-        let new_id = typst::syntax::FileId::new(None, vpath);
+        let new_id = match typst::syntax::VirtualPath::new(&path_str) {
+            Ok(vpath) => typst::syntax::FileId::new(RootedPath::new(VirtualRoot::Project, vpath)),
+            Err(error) => {
+                log::warn!(
+                    "Invalid Typst virtual path {path_str:?}: {error}; keeping previous main file"
+                );
+                self.main_id
+            }
+        };
 
         if self.main_id == new_id {
             self.main_source.replace(text.as_ref());
@@ -170,18 +180,15 @@ impl TypstSystemWorld {
     }
 
     pub fn resolve_path(&self, id: FileId) -> FileResult<PathBuf> {
-        if let Some(package) = id.package() {
-            let package_dir = package_dir(package).ok_or_else(|| {
+        let root = match id.root() {
+            VirtualRoot::Package(package) => package_dir(package).ok_or_else(|| {
                 FileError::Package(typst::diag::PackageError::NotFound(package.clone()))
-            })?;
-            id.vpath()
-                .resolve(&package_dir)
-                .ok_or_else(|| FileError::NotFound(id.vpath().as_rootless_path().into()))
-        } else {
-            id.vpath()
-                .resolve(&self.root)
-                .ok_or_else(|| FileError::NotFound(id.vpath().as_rootless_path().into()))
-        }
+            })?,
+            VirtualRoot::Project => self.root.clone(),
+        };
+        id.vpath()
+            .realize(&root)
+            .map_err(|_| FileError::NotFound(Path::new(id.vpath().get_without_slash()).into()))
     }
 }
 
@@ -240,16 +247,20 @@ impl World for TypstSystemWorld {
         self.fonts.get(index).and_then(|slot| slot.get())
     }
 
-    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
         let now = Local::now();
         let naive = match offset {
             None => now.naive_local(),
-            Some(o) => {
-                // `o` comes from user-controlled Typst source
-                // (`datetime.today(offset: ...)`); use checked arithmetic so an
+            Some(offset) => {
+                // `offset` comes from user-controlled Typst source
+                // (`datetime.today(offset: ...)`); use checked conversion so an
                 // out-of-range offset falls through to `None` instead of
                 // overflowing.
-                let seconds = i32::try_from(o.checked_mul(3600)?).ok()?;
+                let seconds = offset.seconds();
+                if !seconds.is_finite() {
+                    return None;
+                }
+                let seconds = i32::try_from(seconds as i64).ok()?;
                 let tz = chrono::FixedOffset::east_opt(seconds)?;
                 now.with_timezone(&tz).naive_local()
             }

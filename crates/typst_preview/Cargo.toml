@@ -31,7 +31,8 @@ pdf_viewer.workspace = true
 toml.workspace = true
 zed_actions.workspace = true
 fontdb = "*"
-typst = "0.14" # Use the latest stable version
-typst-assets = { version= "0.14", features = ["fonts"] } # Provides standard fonts (LinLibertine, NewCMMath, etc.)
-typst-ide = "0.14"
-typst-pdf = "0.14"
+typst = "0.15" # Use the latest stable version
+typst-assets = { version= "0.15", features = ["fonts"] } # Provides standard fonts (LinLibertine, NewCMMath, etc.)
+typst-ide = "0.15"
+typst-layout = "0.15" # Provides `PagedDocument`, which typst re-exports only in its docs, not its API
+typst-pdf = "0.15"
