@@ -2331,8 +2331,13 @@ impl Terminal {
         if let Some(ghostty) = self.ghostty.clone() {
             let mut ghostty_guard = ghostty.lock();
             ghostty_guard.write(bytes);
-            // drain effects here, since no parser wakeup processes them for this path.
-            let effects = ghostty_guard.take_effects();
+            // drain effects here, since no parser wakeup processes them for this path. Clipboard
+            // writes are dropped, since agent and REPL output must not overwrite the clipboard.
+            let effects = ghostty_guard
+                .take_effects()
+                .into_iter()
+                .filter(|effect| !matches!(effect, ghostty::GhosttyEffect::ClipboardStore(_)))
+                .collect();
             drop(ghostty_guard);
             self.process_ghostty_effects(effects, cx);
         }
@@ -6672,9 +6677,8 @@ mod tests {
         assert_eq!(bytewise.cursor.point, whole_cursor);
     }
 
-    // `b3ZlcndyaXR0ZW4=` decodes to `overwritten`.
     #[gpui::test]
-    async fn test_display_only_write_output_applies_osc52(cx: &mut TestAppContext) {
+    async fn test_display_only_write_output_ignores_osc52(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -6701,7 +6705,7 @@ mod tests {
 
             let clipboard_text =
                 cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
-            assert_eq!(clipboard_text.as_deref(), Some("overwritten"));
+            assert_eq!(clipboard_text.as_deref(), Some("original"));
         }
     }
 
