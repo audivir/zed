@@ -955,10 +955,15 @@ impl TypstPreviewView {
                             }
                             if let Some(editor) = item.act_as::<Editor>(cx) {
                                 let editor_read = editor.read(cx);
-                                if let Some(file) = editor_read.file_at(MultiBufferOffset(0), cx)
+                                let buffer = editor_read.buffer().read(cx);
+                                // saved buffers match the disk, which the world reads and caches
+                                // itself.
+                                if buffer.is_dirty(cx)
+                                    && let Some(file) =
+                                        editor_read.file_at(MultiBufferOffset(0), cx)
                                     && let Some(local) = file.as_local()
                                 {
-                                    let snapshot = editor_read.buffer().read(cx).snapshot(cx);
+                                    let snapshot = buffer.snapshot(cx);
                                     map.insert(local.abs_path(cx).to_path_buf(), snapshot);
                                 }
                             }
