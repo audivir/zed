@@ -1270,6 +1270,7 @@ impl TerminalBuilder {
             init_command_startup_marker: None,
             init_command_startup_tx: None,
             event_loop_task: Task::ready(Ok(())),
+            idle_compression_task: Task::ready(()),
             background_executor: background_executor.clone(),
             path_style,
             cwd_history: Vec::new(),
@@ -1552,6 +1553,7 @@ impl TerminalBuilder {
                 init_command_startup_marker: None,
                 init_command_startup_tx: None,
                 event_loop_task: Task::ready(Ok(())),
+                idle_compression_task: Task::ready(()),
                 background_executor,
                 path_style,
                 cwd_history: if is_remote_terminal {
@@ -1713,6 +1715,8 @@ pub struct Terminal {
     init_command_startup_marker: Option<String>,
     init_command_startup_tx: Option<Sender<()>>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
+    /// Compresses the scrollback once output goes idle; replaced after every output batch.
+    idle_compression_task: Task<()>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
@@ -1848,11 +1852,37 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) {
         self.process_ghostty_effects(effects, cx);
+        self.schedule_idle_compression(cx);
 
         cx.emit(Event::Wakeup);
         if let TerminalType::Pty { info, .. } = &self.terminal_type {
             info.emit_title_changed_if_changed(cx);
         }
+    }
+
+    /// Compresses the scrollback after [`ghostty::IDLE_COMPRESSION_DELAY`] without output.
+    ///
+    /// Large outputs, such as a linter reporting tens of thousands of lines, otherwise keep
+    /// their full uncompressed scrollback in memory for as long as the terminal lives.
+    fn schedule_idle_compression(&mut self, cx: &mut Context<Self>) {
+        let Some(ghostty) = self.ghostty.clone() else {
+            return;
+        };
+        let executor = cx.background_executor().clone();
+        self.idle_compression_task = cx.background_spawn(async move {
+            executor.timer(ghostty::IDLE_COMPRESSION_DELAY).await;
+            // steps release the lock in between, so output and rendering never wait long.
+            loop {
+                match ghostty.lock().compress_idle_step() {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        log::debug!("failed to compress ghostty scrollback: {error}");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     fn process_ghostty_effects(
@@ -2351,6 +2381,7 @@ impl Terminal {
                 .collect();
             drop(ghostty_guard);
             self.process_ghostty_effects(effects, cx);
+            self.schedule_idle_compression(cx);
         }
 
         self.detect_init_command_startup_marker();
@@ -6826,6 +6857,46 @@ mod tests {
             .advance_clock(ghostty::SYNCHRONIZED_OUTPUT_TIMEOUT);
         cx.run_until_parked();
         assert!(rendered_text(cx).contains("second"));
+    }
+
+    #[gpui::test]
+    async fn test_scrollback_is_compressed_once_output_goes_idle(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(10_000),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let compression_steps = |cx: &mut TestAppContext| {
+            terminal.read_with(cx, |terminal, _| {
+                terminal
+                    .ghostty
+                    .as_ref()
+                    .map_or(0, |ghostty| ghostty.lock().idle_compression_steps)
+            })
+        };
+
+        for batch in 0..2 {
+            let output = (0..2_000)
+                .map(|line| format!("batch {batch} line {line}\n"))
+                .collect::<String>();
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_output(output.as_bytes(), cx)
+            });
+            cx.executor()
+                .advance_clock(ghostty::IDLE_COMPRESSION_DELAY / 2);
+            cx.run_until_parked();
+            assert_eq!(compression_steps(cx), 0, "output was still arriving");
+        }
+
+        cx.executor().advance_clock(ghostty::IDLE_COMPRESSION_DELAY);
+        cx.run_until_parked();
+        assert!(compression_steps(cx) > 0);
     }
 
     // clipboard writes must also work through the PTY parser thread.

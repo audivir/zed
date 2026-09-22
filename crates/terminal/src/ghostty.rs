@@ -37,6 +37,9 @@ const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 320 * 1024 * 1024;
 /// Guards against programs that enable the mode and then stall or exit without resetting it.
 pub(super) const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long a terminal must go without output before its scrollback is compressed.
+pub(super) const IDLE_COMPRESSION_DELAY: Duration = Duration::from_secs(5);
+
 /// Size of each recycled PTY read buffer.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Maximum bytes the parser thread batches into one write before returning effects.
@@ -155,6 +158,8 @@ pub(super) struct GhosttyTerminal {
     selection_text: Option<Option<String>>,
     /// Decoded RGBA pixels keyed by image ID, with the image generation they were decoded from.
     decoded_images: collections::HashMap<u32, (u64, Arc<[u8]>)>,
+    #[cfg(test)]
+    pub(super) idle_compression_steps: usize,
 }
 
 // SAFETY: libghostty-vt objects are `!Send` only because they hold raw pointers and callback
@@ -260,6 +265,8 @@ impl GhosttyTerminal {
             search_text: None,
             selection_text: None,
             decoded_images: collections::HashMap::default(),
+            #[cfg(test)]
+            idle_compression_steps: 0,
         })
     }
 
@@ -294,6 +301,22 @@ impl GhosttyTerminal {
             cell_height,
         )?;
         Ok(())
+    }
+
+    /// Runs one bounded step of scrollback compression, returning whether more work remains.
+    ///
+    /// Compressed pages are restored transparently when read. The first step also drops the
+    /// search cache, which holds a copy of the whole buffer.
+    pub(super) fn compress_idle_step(&mut self) -> Result<bool> {
+        self.search_text = None;
+        #[cfg(test)]
+        {
+            self.idle_compression_steps += 1;
+        }
+        let result = self
+            .terminal
+            .compress(libghostty_vt::terminal::CompressionMode::Incremental)?;
+        Ok(result == libghostty_vt::terminal::CompressionResult::Pending)
     }
 
     /// Encodes a key press with the Kitty keyboard protocol, once a program enabled it.
@@ -3642,6 +3665,26 @@ mod tests {
 
         terminal.write(b"\x1b[<u");
         assert_eq!(encode(&mut terminal, "ctrl-c"), None);
+    }
+
+    #[test]
+    fn idle_compression_keeps_the_buffer_text() {
+        let mut terminal = GhosttyTerminal::new(80, 24, 10_000).unwrap();
+        let mut output = String::new();
+        for line in 0..5_000 {
+            output.push_str(&format!(
+                "\x1b[31merror\x1b[0m line {line}: some diagnostic text\r\n"
+            ));
+        }
+        terminal.write(output.as_bytes());
+        let text = terminal.buffer_text().unwrap();
+
+        let mut steps = 0;
+        while terminal.compress_idle_step().unwrap() {
+            steps += 1;
+            assert!(steps < 10_000, "compression never finished");
+        }
+        assert_eq!(terminal.buffer_text().unwrap(), text);
     }
 
     #[test]
