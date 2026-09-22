@@ -955,7 +955,9 @@ enum PtyEvent {
     /// dedicated parser thread (see `ghostty::spawn_pty`), drained via
     /// `GhosttyTerminal::take_effects` and applied by
     /// `Terminal::process_ghostty_effects`.
-    GhosttyPtyOutput { effects: Vec<ghostty::GhosttyEffect> },
+    GhosttyPtyOutput {
+        effects: Vec<ghostty::GhosttyEffect>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1125,6 +1127,52 @@ fn init_command_startup_marker_command(shell_kind: ShellKind, marker_id: u64) ->
     }
 }
 
+/// Configures whether a terminal runs an interactive shell or a tracked task.
+///
+/// Task modes must be created with [`TerminalMode::task`] so their completion
+/// sender and receiver remain paired.
+pub struct TerminalMode(TerminalModeKind);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseInputMode {
+    ReportToTerminal,
+    LocalSelection,
+}
+
+enum TerminalModeKind {
+    Interactive,
+    InteractiveWithCompletion(Sender<Option<ExitStatus>>),
+    Task {
+        state: TaskState,
+        completion_tx: Sender<Option<ExitStatus>>,
+    },
+}
+
+impl TerminalMode {
+    /// Creates a terminal for an interactive shell.
+    pub fn interactive() -> Self {
+        Self(TerminalModeKind::Interactive)
+    }
+
+    /// Creates an interactive terminal that reports when its shell exits.
+    pub fn interactive_with_completion(completion_tx: Sender<Option<ExitStatus>>) -> Self {
+        Self(TerminalModeKind::InteractiveWithCompletion(completion_tx))
+    }
+
+    /// Creates a running task terminal with an internally paired completion channel.
+    pub fn task(spawned_task: SpawnInTerminal) -> Self {
+        let (completion_tx, completion_rx) = async_channel::bounded(1);
+        Self(TerminalModeKind::Task {
+            state: TaskState {
+                status: TaskStatus::Running,
+                completion_rx,
+                spawned_task,
+            },
+            completion_tx,
+        })
+    }
+}
+
 pub struct TerminalBuilder {
     terminal: Terminal,
     events_rx: UnboundedReceiver<PtyEvent>,
@@ -1264,7 +1312,7 @@ impl TerminalBuilder {
 
     pub fn new(
         working_directory: Option<PathBuf>,
-        task: Option<TaskState>,
+        mode: TerminalMode,
         shell: Shell,
         mut env: HashMap<String, String>,
         cursor_shape: SettingsCursorShape,
@@ -1274,7 +1322,6 @@ impl TerminalBuilder {
         path_hyperlink_timeout: Duration,
         is_remote_terminal: bool,
         window_id: u64,
-        completion_tx: Option<Sender<Option<ExitStatus>>>,
         cx: &App,
         activation_script: Vec<String>,
         path_style: PathStyle,
@@ -1286,6 +1333,17 @@ impl TerminalBuilder {
         // When set, run the command as a plain subprocess instead.
         let no_pty = HeadlessTerminal::is_enabled(cx);
         let fut = async move {
+            let (task, completion_tx) = match mode.0 {
+                TerminalModeKind::Interactive => (None, None),
+                TerminalModeKind::InteractiveWithCompletion(completion_tx) => {
+                    (None, Some(completion_tx))
+                }
+                TerminalModeKind::Task {
+                    state,
+                    completion_tx,
+                } => (Some(state), Some(completion_tx)),
+            };
+
             // Remove SHLVL so the spawned shell initializes it to 1, matching
             // the behavior of standalone terminal emulators like iTerm2/Kitty/Alacritty.
             env.remove("SHLVL");
@@ -1461,7 +1519,7 @@ impl TerminalBuilder {
                 };
 
                 let terminal_type = TerminalType::Pty {
-                    pty_tx,
+                    resources: PtyResources::Active(pty_tx),
                     info: pty_info,
                 };
 
@@ -1615,9 +1673,16 @@ impl TerminalBuilder {
     }
 }
 
+/// Separates retained PTY process metadata from resources needed only while
+/// the terminal is live.
+enum PtyResources {
+    Active(PtySender),
+    Released,
+}
+
 enum TerminalType {
     Pty {
-        pty_tx: PtySender,
+        resources: PtyResources,
         info: Arc<PtyProcessInfo>,
     },
     DisplayOnly,
@@ -1719,10 +1784,13 @@ struct CopyTemplate {
     window_id: u64,
 }
 
+/// Runtime state for a task-backed terminal.
 #[derive(Debug)]
 pub struct TaskState {
     pub status: TaskStatus,
-    pub completion_rx: Receiver<Option<ExitStatus>>,
+    /// Kept private so it can only be paired by [`TerminalMode::task`] with the
+    /// sender that reports this task's completion.
+    completion_rx: Receiver<Option<ExitStatus>>,
     pub spawned_task: SpawnInTerminal,
 }
 
@@ -1776,7 +1844,11 @@ impl Terminal {
     /// parser-thread batch individually, before falling through to
     /// `process_event` for interleaved non-Ghostty events. Ordering between
     /// the two is preserved.
-    fn process_events(&mut self, events: impl IntoIterator<Item = PtyEvent>, cx: &mut Context<Self>) {
+    fn process_events(
+        &mut self,
+        events: impl IntoIterator<Item = PtyEvent>,
+        cx: &mut Context<Self>,
+    ) {
         let mut pending_ghostty_output = None;
 
         for event in events {
@@ -1810,7 +1882,11 @@ impl Terminal {
     /// Dispatches Ghostty effects (PTY writes, bell, title changes)
     /// accumulated by the PTY parser thread. The raw bytes that produced
     /// them were already fed into the Ghostty terminal on that thread.
-    fn process_ghostty_pty_output(&mut self, effects: Vec<ghostty::GhosttyEffect>, cx: &mut Context<Self>) {
+    fn process_ghostty_pty_output(
+        &mut self,
+        effects: Vec<ghostty::GhosttyEffect>,
+        cx: &mut Context<Self>,
+    ) {
         self.process_ghostty_effects(effects, cx);
 
         cx.emit(Event::Wakeup);
@@ -1819,7 +1895,11 @@ impl Terminal {
         }
     }
 
-    fn process_ghostty_effects(&mut self, effects: Vec<ghostty::GhosttyEffect>, cx: &mut Context<Self>) {
+    fn process_ghostty_effects(
+        &mut self,
+        effects: Vec<ghostty::GhosttyEffect>,
+        cx: &mut Context<Self>,
+    ) {
         for effect in effects {
             match effect {
                 ghostty::GhosttyEffect::PtyWrite(bytes) => self.write_to_pty(bytes),
@@ -1881,7 +1961,11 @@ impl Terminal {
                     self.last_content.terminal_bounds.num_columns() != new_bounds.num_columns();
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
+                if let TerminalType::Pty {
+                    resources: PtyResources::Active(pty_tx),
+                    ..
+                } = &self.terminal_type
+                {
                     pty_tx.resize(new_bounds);
                 }
 
@@ -1942,7 +2026,9 @@ impl Terminal {
                             }
                             Ok(false) => {}
                             Err(error) => {
-                                log::error!("failed to extend ghostty selection to vi cursor: {error}");
+                                log::error!(
+                                    "failed to extend ghostty selection to vi cursor: {error}"
+                                );
                             }
                         },
                         Ok(None) => {}
@@ -2106,16 +2192,21 @@ impl Terminal {
                         .lock()
                         .alacritty_style_display_offset()
                         .unwrap_or(self.last_content.display_offset);
-                    let point = grid_point(*position, self.last_content.terminal_bounds, display_offset);
+                    let point =
+                        grid_point(*position, self.last_content.terminal_bounds, display_offset);
                     match ghostty.lock().hyperlink_at(
                         point,
                         &GHOSTTY_URL_REGEX,
-                        self.hyperlink_regex_searches.compiled_path_hyperlink_regexes(),
+                        self.hyperlink_regex_searches
+                            .compiled_path_hyperlink_regexes(),
                         self.hyperlink_regex_searches.path_hyperlink_timeout(),
                     ) {
-                        Ok(Some((text, is_url, range))) => {
-                            Some(normalize_hyperlink_match(text, is_url, range, self.path_style))
-                        }
+                        Ok(Some((text, is_url, range))) => Some(normalize_hyperlink_match(
+                            text,
+                            is_url,
+                            range,
+                            self.path_style,
+                        )),
                         Ok(None) => None,
                         Err(error) => {
                             log::error!("failed to find ghostty hyperlink: {error}");
@@ -2189,12 +2280,16 @@ impl Terminal {
         match ghostty.lock().hyperlink_at(
             point,
             &GHOSTTY_URL_REGEX,
-            self.hyperlink_regex_searches.compiled_path_hyperlink_regexes(),
+            self.hyperlink_regex_searches
+                .compiled_path_hyperlink_regexes(),
             self.hyperlink_regex_searches.path_hyperlink_timeout(),
         ) {
-            Ok(Some((text, is_url, range))) => {
-                Some(normalize_hyperlink_match(text, is_url, range, self.path_style))
-            }
+            Ok(Some((text, is_url, range))) => Some(normalize_hyperlink_match(
+                text,
+                is_url,
+                range,
+                self.path_style,
+            )),
             Ok(None) => None,
             Err(error) => {
                 log::error!("failed to find ghostty hyperlink: {error}");
@@ -2274,27 +2369,29 @@ impl Terminal {
         for (index, color) in palette.iter_mut().enumerate() {
             *color = to_vte_rgb(get_color_at_index(index, theme));
         }
-        if let Err(error) =
-            ghostty
-                .lock()
-                .set_default_theme_colors(foreground, background, cursor, palette)
+        if let Err(error) = ghostty
+            .lock()
+            .set_default_theme_colors(foreground, background, cursor, palette)
         {
             log::error!("failed to sync ghostty default theme colors: {error}");
         }
     }
 
+    /// Normalizes line endings so text captured outside a PTY starts each line at column zero.
     pub fn write_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        // Inject bytes directly into the terminal emulator and refresh the UI.
-        // This bypasses the PTY/event loop for display-only terminals.
         let mut previous_byte_was_cr = false;
         let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
+        self.write_raw_output(&converted, cx);
+    }
 
+    /// Terminal byte streams already contain their control sequences and must not be normalized.
+    fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // No PTY thread drives this path (see
         // `TerminalBuilder::new_display_only_with_bounds`), so bytes are
         // injected directly here, synchronously.
         if let Some(ghostty) = self.ghostty.clone() {
             let mut ghostty_guard = ghostty.lock();
-            ghostty_guard.write(&converted);
+            ghostty_guard.write(bytes);
             // Nothing drives `sync()`'s usual PTY-parser-thread wakeup for
             // this path, so a queued effect like ClipboardStore or a title
             // change needs to be drained and processed here directly
@@ -2401,16 +2498,17 @@ impl Terminal {
         // handler's existing `selection_anchor`/`selection_head`
         // bookkeeping and primary-clipboard write rather than duplicating
         // it here.
-        let range = self.ghostty.as_ref().and_then(|ghostty| {
-            match ghostty.lock().select_all() {
+        let range = self
+            .ghostty
+            .as_ref()
+            .and_then(|ghostty| match ghostty.lock().select_all() {
                 Ok(Some(range)) => Some(range.point_range()),
                 Ok(None) => None,
                 Err(error) => {
                     log::error!("failed to select all in ghostty: {error}");
                     None
                 }
-            }
-        });
+            });
         if let Some(range) = range {
             self.set_selection(Some(Selection::simple_range(range)));
         }
@@ -2504,7 +2602,11 @@ impl Terminal {
         let input = input.into();
         #[cfg(any(test, feature = "test-support"))]
         self.pty_write_log.borrow_mut().push(input.to_vec());
-        if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
+        if let TerminalType::Pty {
+            resources: PtyResources::Active(pty_tx),
+            ..
+        } = &self.terminal_type
+        {
             if log::log_enabled!(log::Level::Debug) {
                 if let Ok(str) = str::from_utf8(&input) {
                     log::debug!("Writing to PTY: {:?}", str);
@@ -2749,6 +2851,14 @@ impl Terminal {
             "v" => {
                 let point = self.last_content.cursor.point;
                 let selection_type = SelectionType::Simple;
+                let selection = Selection::new(selection_type, point);
+                self.events
+                    .push_back(InternalEvent::SetSelection(Some(selection)));
+            }
+
+            "V" => {
+                let point = self.last_content.cursor.point;
+                let selection_type = SelectionType::Lines;
                 let selection = Selection::new(selection_type, point);
                 self.events
                     .push_back(InternalEvent::SetSelection(Some(selection)));
@@ -3009,13 +3119,15 @@ impl Terminal {
         }
     }
 
-    pub fn mouse_mode(&self, shift: bool) -> bool {
-        self.last_content.mode.intersects(Modes::MOUSE_MODE) && !shift
+    pub fn mouse_mode(&self, shift: bool, mode: MouseInputMode) -> bool {
+        mode == MouseInputMode::ReportToTerminal
+            && self.last_content.mode.intersects(Modes::MOUSE_MODE)
+            && !shift
     }
 
-    pub fn mouse_move(&mut self, e: &MouseMoveEvent, cx: &mut Context<Self>) {
+    pub fn mouse_move(&mut self, e: &MouseMoveEvent, mode: MouseInputMode, cx: &mut Context<Self>) {
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
-        if self.mouse_mode(e.modifiers.shift) {
+        if self.mouse_mode(e.modifiers.shift, mode) {
             // A ctrl/cmd press on a link suppressed its button-press report in
             // `mouse_down`. Since the app never saw the press, we must swallow
             // the whole gesture rather than forward later motion/release
@@ -3113,10 +3225,11 @@ impl Terminal {
         &mut self,
         e: &MouseMoveEvent,
         region: Bounds<Pixels>,
+        mode: MouseInputMode,
         cx: &mut Context<Self>,
     ) {
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
-        if !self.mouse_mode(e.modifiers.shift) {
+        if !self.mouse_mode(e.modifiers.shift, mode) {
             if let Some(hyperlink) = &self.mouse_down_hyperlink {
                 let point = grid_point(
                     position,
@@ -3179,7 +3292,7 @@ impl Terminal {
         Some(scroll_lines.clamp(-3, 3))
     }
 
-    pub fn mouse_down(&mut self, e: &MouseDownEvent, cx: &mut Context<Self>) {
+    pub fn mouse_down(&mut self, e: &MouseDownEvent, mode: MouseInputMode, cx: &mut Context<Self>) {
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
         let point = grid_point(
             position,
@@ -3190,7 +3303,7 @@ impl Terminal {
         if e.button == MouseButton::Left
             && e.modifiers.secondary()
             && (TerminalSettings::get_global(cx).open_links_in_mouse_mode
-                || !self.mouse_mode(e.modifiers.shift))
+                || !self.mouse_mode(e.modifiers.shift, mode))
         {
             self.mouse_down_hyperlink = self.find_hyperlink_at_point(point);
 
@@ -3199,7 +3312,7 @@ impl Terminal {
             }
         }
 
-        if self.mouse_mode(e.modifiers.shift) {
+        if self.mouse_mode(e.modifiers.shift, mode) {
             let bytes =
                 mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode);
 
@@ -3240,8 +3353,8 @@ impl Terminal {
                         return;
                     }
 
-                    let selection = selection_type
-                        .map(|selection_type| Selection::new(selection_type, point));
+                    let selection =
+                        selection_type.map(|selection_type| Selection::new(selection_type, point));
 
                     if let Some(selection) = selection {
                         self.events
@@ -3250,7 +3363,9 @@ impl Terminal {
                 }
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                 MouseButton::Middle => {
-                    if let Some(item) = cx.read_from_primary() {
+                    if mode == MouseInputMode::ReportToTerminal
+                        && let Some(item) = cx.read_from_primary()
+                    {
                         let text = item.text().unwrap_or_default();
                         self.paste(&text);
                     }
@@ -3260,7 +3375,7 @@ impl Terminal {
         }
     }
 
-    pub fn mouse_up(&mut self, e: &MouseUpEvent, cx: &Context<Self>) {
+    pub fn mouse_up(&mut self, e: &MouseUpEvent, mode: MouseInputMode, cx: &Context<Self>) {
         let setting = TerminalSettings::get_global(cx);
 
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
@@ -3283,7 +3398,7 @@ impl Terminal {
                 return;
             }
 
-            if self.mouse_mode(e.modifiers.shift) {
+            if self.mouse_mode(e.modifiers.shift, mode) {
                 self.selection_phase = SelectionPhase::Ended;
                 self.last_mouse = None;
                 self.mouse_down_position = None;
@@ -3291,7 +3406,7 @@ impl Terminal {
             }
         }
 
-        if self.mouse_mode(e.modifiers.shift) {
+        if self.mouse_mode(e.modifiers.shift, mode) {
             let point = grid_point(
                 position,
                 self.last_content.terminal_bounds,
@@ -3333,8 +3448,13 @@ impl Terminal {
     }
 
     ///Scroll the terminal
-    pub fn scroll_wheel(&mut self, e: &ScrollWheelEvent, scroll_multiplier: f32) {
-        let mouse_mode = self.mouse_mode(e.shift);
+    pub fn scroll_wheel(
+        &mut self,
+        e: &ScrollWheelEvent,
+        scroll_multiplier: f32,
+        mode: MouseInputMode,
+    ) {
+        let mouse_mode = self.mouse_mode(e.shift, mode);
         let scroll_multiplier = if mouse_mode { 1. } else { scroll_multiplier };
 
         if let Some(scroll_lines) = self.determine_scroll_lines(e, scroll_multiplier)
@@ -3353,10 +3473,11 @@ impl Terminal {
                         self.write_to_pty(scroll);
                     }
                 };
-            } else if self
-                .last_content
-                .mode
-                .contains(Modes::ALT_SCREEN | Modes::ALTERNATE_SCROLL)
+            } else if mode == MouseInputMode::ReportToTerminal
+                && self
+                    .last_content
+                    .mode
+                    .contains(Modes::ALT_SCREEN | Modes::ALTERNATE_SCROLL)
                 && !e.shift
             {
                 self.write_to_pty(alt_scroll(scroll_lines));
@@ -3596,6 +3717,42 @@ impl Terminal {
         }
     }
 
+    /// Returns whether this terminal still owns its live PTY sender.
+    pub fn has_active_pty_resources(&self) -> bool {
+        matches!(
+            self.terminal_type,
+            TerminalType::Pty {
+                resources: PtyResources::Active(_),
+                ..
+            }
+        )
+    }
+
+    /// Releases live PTY resources while retaining process metadata and buffered output.
+    ///
+    /// Calling this method after the resources have already been released is a no-op.
+    pub fn release_pty_resources(&mut self) {
+        let TerminalType::Pty { resources, info } = &mut self.terminal_type else {
+            return;
+        };
+        let PtyResources::Active(pty_tx) = std::mem::replace(resources, PtyResources::Released)
+        else {
+            return;
+        };
+        let info = info.clone();
+
+        pty_tx.shutdown();
+        info.terminate_child_process();
+
+        let timer = self.background_executor.timer(Duration::from_millis(100));
+        self.background_executor
+            .spawn(async move {
+                timer.await;
+                info.kill_child_process();
+            })
+            .detach();
+    }
+
     pub fn pid(&self) -> Option<sysinfo::Pid> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info.pid(),
@@ -3719,7 +3876,7 @@ impl Terminal {
         let working_directory = self.working_directory().or_else(|| cwd);
         TerminalBuilder::new(
             working_directory,
-            None,
+            TerminalMode::interactive(),
             self.template.shell.clone(),
             self.template.env.clone(),
             self.template.cursor_shape,
@@ -3729,7 +3886,6 @@ impl Terminal {
             self.template.path_hyperlink_timeout,
             self.is_remote_terminal,
             self.template.window_id,
-            None,
             cx,
             self.activation_script.clone(),
             self.path_style,
@@ -3916,20 +4072,7 @@ impl Drop for Terminal {
         if let Some(subprocess) = self.subprocess.take() {
             subprocess.kill();
         }
-        if let TerminalType::Pty { pty_tx, info } =
-            std::mem::replace(&mut self.terminal_type, TerminalType::DisplayOnly)
-        {
-            pty_tx.shutdown();
-            info.terminate_child_process();
-
-            let timer = self.background_executor.timer(Duration::from_millis(100));
-            self.background_executor
-                .spawn(async move {
-                    timer.await;
-                    info.kill_child_process();
-                })
-                .detach();
-        }
+        self.release_pty_resources();
     }
 }
 
@@ -4113,11 +4256,10 @@ mod tests {
         Cell, Content, IndexedCell, TerminalBounds, TerminalBuilder, content_index_for_mouse,
         rgb_for_index,
     };
-    use async_channel::Receiver;
     use collections::HashMap;
     use gpui::{
         ClipboardItem, Entity, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels,
-        TestAppContext, VisualContext, VisualTestContext, bounds, point, size,
+        ScrollDelta, TestAppContext, VisualContext, VisualTestContext, bounds, point, size,
     };
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
@@ -4241,12 +4383,11 @@ mod tests {
     }
 
     /// Helper to build a test terminal running a shell command.
-    /// Returns the terminal entity and a receiver for the completion signal.
     async fn build_test_terminal(
         cx: &mut TestAppContext,
         command: &str,
         args: &[&str],
-    ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
+    ) -> Entity<Terminal> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (program, args) =
             ShellBuilder::new(&Shell::System, false).build(Some(command.to_owned()), &args);
@@ -4257,13 +4398,17 @@ mod tests {
         cx: &mut TestAppContext,
         program: String,
         args: Vec<String>,
-    ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
-        let (completion_tx, completion_rx) = async_channel::unbounded();
+    ) -> Entity<Terminal> {
+        let mode = TerminalMode::task(SpawnInTerminal {
+            command: Some(program.clone()),
+            args: args.clone(),
+            ..Default::default()
+        });
         let builder = cx
             .update(|cx| {
                 TerminalBuilder::new(
                     None,
-                    None,
+                    mode,
                     task::Shell::WithArguments {
                         program,
                         args,
@@ -4277,7 +4422,6 @@ mod tests {
                     Duration::ZERO,
                     false,
                     0,
-                    Some(completion_tx),
                     cx,
                     vec![],
                     PathStyle::local(),
@@ -4285,8 +4429,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let terminal = cx.new(|cx| builder.subscribe(cx));
-        (terminal, completion_rx)
+        cx.new(|cx| builder.subscribe(cx))
     }
 
     /// `Terminal::register_task_finished`'s task-summary text
@@ -4302,22 +4445,17 @@ mod tests {
     async fn test_task_summary_is_visible_after_real_process_exits(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let (completion_tx, completion_rx) = async_channel::unbounded();
-        let task_state = TaskState {
-            status: TaskStatus::Running,
-            completion_rx: completion_rx.clone(),
-            spawned_task: SpawnInTerminal {
-                full_label: "my task".to_string(),
-                show_summary: true,
-                hide: HideStrategy::Never,
-                ..Default::default()
-            },
-        };
+        let mode = TerminalMode::task(SpawnInTerminal {
+            full_label: "my task".to_string(),
+            show_summary: true,
+            hide: HideStrategy::Never,
+            ..Default::default()
+        });
         let builder = cx
             .update(|cx| {
                 TerminalBuilder::new(
                     None,
-                    Some(task_state),
+                    mode,
                     task::Shell::WithArguments {
                         program: "true".to_string(),
                         args: vec![],
@@ -4331,7 +4469,6 @@ mod tests {
                     Duration::ZERO,
                     false,
                     0,
-                    Some(completion_tx),
                     cx,
                     vec![],
                     PathStyle::local(),
@@ -4367,23 +4504,18 @@ mod tests {
         cx: &mut TestAppContext,
         program: String,
         args: Vec<String>,
-    ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
-        let (completion_tx, completion_rx) = async_channel::unbounded();
-        let task_state = TaskState {
-            status: TaskStatus::Running,
-            completion_rx: completion_rx.clone(),
-            spawned_task: SpawnInTerminal {
-                command: Some(program.clone()),
-                args: args.clone(),
-                ..Default::default()
-            },
-        };
+    ) -> Entity<Terminal> {
+        let mode = TerminalMode::task(SpawnInTerminal {
+            command: Some(program.clone()),
+            args: args.clone(),
+            ..Default::default()
+        });
         let builder = cx
             .update(|cx| {
                 cx.set_global(HeadlessTerminal(true));
                 TerminalBuilder::new(
                     None,
-                    Some(task_state),
+                    mode,
                     task::Shell::WithArguments {
                         program,
                         args,
@@ -4397,7 +4529,6 @@ mod tests {
                     Duration::ZERO,
                     false,
                     0,
-                    Some(completion_tx),
                     cx,
                     vec![],
                     PathStyle::local(),
@@ -4405,8 +4536,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let terminal = cx.new(|cx| builder.subscribe(cx));
-        (terminal, completion_rx)
+        cx.new(|cx| builder.subscribe(cx))
     }
 
     #[test]
@@ -4442,16 +4572,15 @@ mod tests {
         let (program, args) = ShellBuilder::new(&Shell::System, false)
             .non_interactive()
             .build(Some("echo hello-from-subprocess".to_owned()), &[]);
-        let (terminal, completion_rx) = build_test_subprocess_terminal(cx, program, args).await;
+        let terminal = build_test_subprocess_terminal(cx, program, args).await;
 
         assert!(
             !terminal.update(cx, |term, _| term.is_pty()),
             "no_pty terminal should not be PTY-backed"
         );
-        assert_eq!(
-            completion_rx.recv().await.unwrap(),
-            Some(ExitStatus::default())
-        );
+        let exit_status =
+            terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
+        assert_eq!(exit_status.await, Some(ExitStatus::default()));
         assert_content_eventually(&terminal, "hello-from-subprocess", cx).await;
     }
 
@@ -4538,7 +4667,7 @@ mod tests {
             click_count: 1,
             first_mouse: true,
         };
-        terminal.mouse_down(&mouse_down, cx);
+        terminal.mouse_down(&mouse_down, MouseInputMode::ReportToTerminal, cx);
     }
 
     fn left_mouse_up_at(
@@ -4552,7 +4681,7 @@ mod tests {
             modifiers: Modifiers::none(),
             click_count: 1,
         };
-        terminal.mouse_up(&mouse_up, cx);
+        terminal.mouse_up(&mouse_up, MouseInputMode::ReportToTerminal, cx);
     }
 
     fn left_mouse_drag_to(
@@ -4566,7 +4695,7 @@ mod tests {
             pressed_button: Some(MouseButton::Left),
             modifiers: Modifiers::none(),
         };
-        terminal.mouse_drag(&drag_event, region, cx);
+        terminal.mouse_drag(&drag_event, region, MouseInputMode::ReportToTerminal, cx);
     }
 
     /// A left click that jitters by a pixel or two (e.g. the window-focusing
@@ -4617,6 +4746,92 @@ mod tests {
         });
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[gpui::test]
+    async fn test_local_selection_does_not_paste_primary_selection(cx: &mut TestAppContext) {
+        let terminal = init_terminal_test(cx, b"hello world\r\n");
+        terminal.update(cx, |terminal, cx| {
+            cx.write_to_primary(ClipboardItem::new_string("primary selection".into()));
+            let event = MouseDownEvent {
+                button: MouseButton::Middle,
+                position: point(px(50.), px(10.)),
+                modifiers: Modifiers::none(),
+                click_count: 1,
+                first_mouse: true,
+            };
+            terminal.mouse_down(&event, MouseInputMode::LocalSelection, cx);
+            assert!(terminal.take_input_log().is_empty());
+            assert!(terminal.take_pty_write_log().is_empty());
+
+            terminal.mouse_down(&event, MouseInputMode::ReportToTerminal, cx);
+            assert_eq!(
+                terminal.take_input_log(),
+                vec![b"primary selection".to_vec()]
+            );
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"primary selection".to_vec()]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_local_selection_scrolls_without_terminal_reports(cx: &mut TestAppContext) {
+        let mut output = Vec::new();
+        output.extend_from_slice(b"\x1b[?1002h\x1b[?1006h");
+        for line in 0..80 {
+            output.extend_from_slice(format!("scrollback line {line}\r\n").as_bytes());
+        }
+        let (terminal, cx) = init_terminal_test_with_window(cx, &output);
+        cx.run_until_parked();
+
+        cx.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.sync(window, cx);
+            assert!(terminal.last_content.mode.intersects(Modes::MOUSE_MODE));
+            assert_eq!(terminal.last_content.display_offset, 0);
+
+            let scroll_event = ScrollWheelEvent {
+                position: point(px(50.0), px(10.0)),
+                delta: ScrollDelta::Lines(point(0.0, 1.0)),
+                ..Default::default()
+            };
+
+            terminal.scroll_wheel(&scroll_event, 1.0, MouseInputMode::LocalSelection);
+            terminal.sync(window, cx);
+            assert!(terminal.last_content.display_offset > 0);
+            assert!(terminal.take_input_log().is_empty());
+            assert!(terminal.take_pty_write_log().is_empty());
+
+            terminal.scroll_wheel(&scroll_event, 1.0, MouseInputMode::ReportToTerminal);
+            assert!(!terminal.take_pty_write_log().is_empty());
+
+            terminal.write_output(b"\x1b[?1049h\x1b[?1007h", cx);
+        });
+        cx.run_until_parked();
+
+        cx.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.sync(window, cx);
+            assert!(
+                terminal
+                    .last_content
+                    .mode
+                    .contains(Modes::ALT_SCREEN | Modes::ALTERNATE_SCROLL)
+            );
+            assert_eq!(terminal.last_content.display_offset, 0);
+
+            let scroll_event = ScrollWheelEvent {
+                position: point(px(50.0), px(10.0)),
+                delta: ScrollDelta::Lines(point(0.0, 1.0)),
+                ..Default::default()
+            };
+            terminal.scroll_wheel(&scroll_event, 1.0, MouseInputMode::LocalSelection);
+            terminal.sync(window, cx);
+            assert_eq!(terminal.last_content.display_offset, 0);
+            assert!(terminal.take_input_log().is_empty());
+            assert!(terminal.take_pty_write_log().is_empty());
+        });
+    }
+
     /// With mouse tracking active (e.g. htop), Shift is the escape hatch to
     /// select terminal text. Shift+drag must start a selection rather than being
     /// swallowed as a "extend existing selection" no-op. Regression test for #60254.
@@ -4643,6 +4858,7 @@ mod tests {
                     click_count: 1,
                     first_mouse: true,
                 },
+                MouseInputMode::ReportToTerminal,
                 cx,
             );
 
@@ -4665,6 +4881,7 @@ mod tests {
                     modifiers: shift,
                 },
                 region,
+                MouseInputMode::ReportToTerminal,
                 cx,
             );
 
@@ -4705,6 +4922,7 @@ mod tests {
                     click_count: 1,
                     first_mouse: true,
                 },
+                MouseInputMode::ReportToTerminal,
                 cx,
             );
 
@@ -4729,11 +4947,10 @@ mod tests {
     async fn test_basic_terminal(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let (terminal, completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
-        assert_eq!(
-            completion_rx.recv().await.unwrap(),
-            Some(ExitStatus::default())
-        );
+        let terminal = build_test_terminal(cx, "echo", &["hello"]).await;
+        let exit_status =
+            terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
+        assert_eq!(exit_status.await, Some(ExitStatus::default()));
         assert_content_eventually(&terminal, "hello", cx).await;
 
         // Inject additional output directly into the emulator (display-only path)
@@ -4767,8 +4984,7 @@ mod tests {
         let path = std::env::temp_dir().join("zed_kitty_test_payload.bin");
         std::fs::write(&path, escape).unwrap();
 
-        let (terminal, _completion_rx) =
-            build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
+        let terminal = build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
 
         // A real terminal panel resizes as soon as it lays out, before any
         // output arrives; this headless test never lays out a window, so
@@ -4816,8 +5032,7 @@ mod tests {
         let path = std::env::temp_dir().join("zed_kitty_cursor_debug_payload.bin");
         std::fs::write(&path, escape).unwrap();
 
-        let (terminal, _completion_rx) =
-            build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
+        let terminal = build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
 
         terminal
             .update(cx, |term, _| {
@@ -4889,8 +5104,7 @@ mod tests {
         let path = std::env::temp_dir().join("zed_scroll_test.sh");
         std::fs::write(&path, script).unwrap();
 
-        let (terminal, _completion_rx) =
-            build_test_terminal(cx, "bash", &[path.to_str().unwrap()]).await;
+        let terminal = build_test_terminal(cx, "bash", &[path.to_str().unwrap()]).await;
 
         let bounds = TerminalBounds::new(
             px(20.),
@@ -4977,8 +5191,7 @@ mod tests {
         let path = std::env::temp_dir().join("zed_kitty_repeated_cursor_payload.bin");
         std::fs::write(&path, &payload).unwrap();
 
-        let (terminal, _completion_rx) =
-            build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
+        let terminal = build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
 
         terminal
             .update(cx, |term, _| {
@@ -5043,16 +5256,16 @@ mod tests {
         window: &mut VisualTestContext,
         command: &str,
         args: &[&str],
-    ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
+    ) -> Entity<Terminal> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (program, args) =
             ShellBuilder::new(&Shell::System, false).build(Some(command.to_owned()), &args);
-        let (completion_tx, completion_rx) = async_channel::unbounded();
+        let (completion_tx, _completion_rx) = async_channel::unbounded();
         let builder = window
             .update(|_, cx| {
                 TerminalBuilder::new(
                     None,
-                    None,
+                    TerminalMode::interactive_with_completion(completion_tx),
                     task::Shell::WithArguments {
                         program,
                         args,
@@ -5066,7 +5279,6 @@ mod tests {
                     Duration::ZERO,
                     false,
                     0,
-                    Some(completion_tx),
                     cx,
                     vec![],
                     PathStyle::local(),
@@ -5074,8 +5286,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let terminal = window.new_window_entity(|_, cx| builder.subscribe(cx));
-        (terminal, completion_rx)
+        window.new_window_entity(|_, cx| builder.subscribe(cx))
     }
 
     // The drawn cursor (`last_content.cursor`, used for the caret and for
@@ -5100,7 +5311,7 @@ mod tests {
         std::fs::write(&path, &payload).unwrap();
 
         let window = cx.add_empty_window();
-        let (terminal, _completion_rx) =
+        let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
         // Narrow enough that the image's right edge (c=10) sits close to the
@@ -5112,13 +5323,15 @@ mod tests {
             gpui::Bounds {
                 origin: gpui::Point::default(),
                 size: gpui::Size {
-                    width: px(120.), // 12 columns
+                    width: px(120.),  // 12 columns
                     height: px(600.), // 30 rows
                 },
             },
         );
         window.update_window_entity(&terminal, |term, _, _| {
-            term.ghostty.as_ref().map(|ghostty| ghostty.lock().resize(bounds))
+            term.ghostty
+                .as_ref()
+                .map(|ghostty| ghostty.lock().resize(bounds))
         });
 
         let mut placements = Vec::new();
@@ -5179,7 +5392,7 @@ mod tests {
         std::fs::write(&path, &payload).unwrap();
 
         let window = cx.add_empty_window();
-        let (terminal, _completion_rx) =
+        let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
         // Small viewport: tall enough to see the whole image at first, short
@@ -5196,7 +5409,9 @@ mod tests {
             },
         );
         window.update_window_entity(&terminal, |term, _, _| {
-            term.ghostty.as_ref().map(|ghostty| ghostty.lock().resize(bounds))
+            term.ghostty
+                .as_ref()
+                .map(|ghostty| ghostty.lock().resize(bounds))
         });
 
         // `cat` dumps the whole payload near-instantly, so by the time any
@@ -5304,6 +5519,7 @@ mod tests {
                 click_count,
                 first_mouse: true,
             },
+            MouseInputMode::ReportToTerminal,
             cx,
         );
     }
@@ -5317,8 +5533,7 @@ mod tests {
     async fn test_ghostty_backed_simple_click_drag_selects_text(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let window = cx.add_empty_window();
-        let terminal =
-            build_selection_test_terminal(window, b"hello world", "hello world");
+        let terminal = build_selection_test_terminal(window, b"hello world", "hello world");
 
         window.update_window_entity(&terminal, |term, _, cx| {
             // Click inside column 0 ("h"), drag to column 4 ("o"): should
@@ -5330,7 +5545,8 @@ mod tests {
             term.sync(window, cx);
         });
 
-        let selection_text = terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
+        let selection_text =
+            terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
         assert_eq!(selection_text.as_deref(), Some("hello"));
     }
 
@@ -5341,8 +5557,7 @@ mod tests {
     async fn test_ghostty_backed_double_click_selects_word(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let window = cx.add_empty_window();
-        let terminal =
-            build_selection_test_terminal(window, b"hello world", "hello world");
+        let terminal = build_selection_test_terminal(window, b"hello world", "hello world");
 
         window.update_window_entity(&terminal, |term, _, cx| {
             // Column 8 ("r" of "world").
@@ -5352,7 +5567,8 @@ mod tests {
             term.sync(window, cx);
         });
 
-        let selection_text = terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
+        let selection_text =
+            terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
         assert_eq!(selection_text.as_deref(), Some("world"));
     }
 
@@ -5366,8 +5582,7 @@ mod tests {
     async fn test_ghostty_backed_double_click_drag_extends_word_selection(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let window = cx.add_empty_window();
-        let terminal =
-            build_selection_test_terminal(window, b"hello world", "hello world");
+        let terminal = build_selection_test_terminal(window, b"hello world", "hello world");
 
         window.update_window_entity(&terminal, |term, _, cx| {
             // Double-click "hello" (column 2), drag onto "world" (column 8).
@@ -5378,7 +5593,8 @@ mod tests {
             term.sync(window, cx);
         });
 
-        let selection_text = terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
+        let selection_text =
+            terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
         assert_eq!(selection_text.as_deref(), Some("hello world"));
     }
 
@@ -5406,7 +5622,8 @@ mod tests {
             term.sync(window, cx);
         });
 
-        let selection_text = terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
+        let selection_text =
+            terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
         let selection_text = selection_text.expect("expected a line-range selection");
         assert!(selection_text.contains("second line"));
         assert!(selection_text.contains("third line"));
@@ -5434,7 +5651,8 @@ mod tests {
             term.sync(window, cx);
         });
 
-        let selection_text = terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
+        let selection_text =
+            terminal.read_with(window, |term, _| term.last_content.selection_text.clone());
         let selection_text = selection_text.expect("expected select_all to produce a selection");
         assert!(selection_text.contains("first line"));
         assert!(selection_text.contains("second line"));
@@ -5470,7 +5688,11 @@ mod tests {
             })
             .await;
 
-        assert_eq!(matches.len(), 2, "expected both NEEDLE occurrences to be found");
+        assert_eq!(
+            matches.len(),
+            2,
+            "expected both NEEDLE occurrences to be found"
+        );
         let mut sorted = matches;
         sorted.sort_by_key(|range| range.start());
         assert!(
@@ -5491,8 +5713,7 @@ mod tests {
     async fn test_ghostty_backed_vi_mode_motion_moves_rendered_cursor(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let window = cx.add_empty_window();
-        let terminal =
-            build_selection_test_terminal(window, b"hello world", "hello world");
+        let terminal = build_selection_test_terminal(window, b"hello world", "hello world");
 
         let initial_cursor = terminal.read_with(window, |term, _| term.last_content.cursor.point);
 
@@ -5604,8 +5825,7 @@ mod tests {
     async fn test_ghostty_backed_osc8_hyperlink_is_found_at_point(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let window = cx.add_empty_window();
-        let payload =
-            b"click \x1b]8;;https://example.com\x1b\\here\x1b]8;;\x1b\\ end".to_vec();
+        let payload = b"click \x1b]8;;https://example.com\x1b\\here\x1b]8;;\x1b\\ end".to_vec();
         let terminal = build_selection_test_terminal(window, &payload, "click here end");
 
         let hyperlink = window.update_window_entity(&terminal, |term, _, _| {
@@ -5622,7 +5842,10 @@ mod tests {
         let miss = window.update_window_entity(&terminal, |term, _, _| {
             term.find_hyperlink_at_point(Point::new(0, 0))
         });
-        assert!(miss.is_none(), "clicking plain text should not find a hyperlink");
+        assert!(
+            miss.is_none(),
+            "clicking plain text should not find a hyperlink"
+        );
     }
 
     // Activating a search match that's scrolled out of view must actually
@@ -5641,7 +5864,7 @@ mod tests {
         std::fs::write(&path, &payload).unwrap();
 
         let window = cx.add_empty_window();
-        let (terminal, _completion_rx) =
+        let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
         let mut settled = false;
@@ -5769,7 +5992,7 @@ mod tests {
         std::fs::write(&path, &payload).unwrap();
 
         let window = cx.add_empty_window();
-        let (terminal, _completion_rx) =
+        let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
         // Small viewport: forces plenty of scrollback (~53 rows of content
@@ -5786,7 +6009,9 @@ mod tests {
             },
         );
         window.update_window_entity(&terminal, |term, _, _| {
-            term.ghostty.as_ref().map(|ghostty| ghostty.lock().resize(bounds))
+            term.ghostty
+                .as_ref()
+                .map(|ghostty| ghostty.lock().resize(bounds))
         });
 
         let mut settled = false;
@@ -5816,7 +6041,8 @@ mod tests {
         // included) one row further down the (now virtually taller)
         // viewport-relative coordinate space.
         let mut baseline: collections::HashMap<u32, i32> = collections::HashMap::default();
-        let mut steps_since_baseline: collections::HashMap<u32, i32> = collections::HashMap::default();
+        let mut steps_since_baseline: collections::HashMap<u32, i32> =
+            collections::HashMap::default();
 
         for step in 1..=45 {
             window.update_window_entity(&terminal, |term, window, cx| {
@@ -5866,7 +6092,7 @@ mod tests {
         std::fs::write(&path, &payload).unwrap();
 
         let window = cx.add_empty_window();
-        let (terminal, _completion_rx) =
+        let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
         // Roomy enough that the image and its trailing text both fit with no
@@ -5963,14 +6189,16 @@ mod tests {
     async fn test_foreground_process_command_tracks_path_command(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let (terminal, completion_rx) =
+        let terminal =
             build_test_terminal_with_arguments(cx, "sleep".to_string(), vec!["1".to_string()])
                 .await;
 
         assert_foreground_process_command_eventually(&terminal, "sleep", cx).await;
 
+        let exit_status =
+            terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
         assert!(
-            completion_rx.recv().await.is_ok(),
+            exit_status.await.is_some(),
             "expected terminal completion after sleep exits"
         );
     }
@@ -5988,7 +6216,7 @@ mod tests {
             .update(|cx| {
                 TerminalBuilder::new(
                     None,
-                    None,
+                    TerminalMode::interactive_with_completion(completion_tx),
                     task::Shell::System,
                     HashMap::default(),
                     SettingsCursorShape::default(),
@@ -5998,7 +6226,6 @@ mod tests {
                     Duration::ZERO,
                     false,
                     0,
-                    Some(completion_tx),
                     cx,
                     Vec::new(),
                     PathStyle::local(),
@@ -6056,7 +6283,7 @@ mod tests {
             .update(|cx| {
                 TerminalBuilder::new(
                     None,
-                    None,
+                    TerminalMode::interactive(),
                     task::Shell::System,
                     HashMap::default(),
                     SettingsCursorShape::default(),
@@ -6066,7 +6293,6 @@ mod tests {
                     Duration::ZERO,
                     false,
                     0,
-                    None,
                     cx,
                     Vec::new(),
                     PathStyle::local(),
@@ -6118,7 +6344,7 @@ mod tests {
             .update(|cx| {
                 TerminalBuilder::new(
                     None,
-                    None,
+                    TerminalMode::interactive_with_completion(completion_tx),
                     task::Shell::WithArguments {
                         program,
                         args,
@@ -6132,7 +6358,6 @@ mod tests {
                     Duration::ZERO,
                     false,
                     0,
-                    Some(completion_tx),
                     cx,
                     Vec::new(),
                     PathStyle::local(),
@@ -6584,6 +6809,126 @@ mod tests {
         );
     }
 
+    fn display_only_terminal(cx: &mut TestAppContext) -> Entity<Terminal> {
+        cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        })
+    }
+
+    fn terminal_content(terminal: &Entity<Terminal>, cx: &mut TestAppContext) -> Content {
+        terminal.update(cx, |terminal, cx| {
+            terminal.refresh_last_content_from_ghostty(cx);
+            terminal.last_content.clone()
+        })
+    }
+
+    fn raw_content(chunks: &[&[u8]], cx: &mut TestAppContext) -> Content {
+        let terminal = display_only_terminal(cx);
+        for chunk in chunks {
+            terminal.update(cx, |terminal, cx| terminal.write_raw_output(chunk, cx));
+        }
+        terminal_content(&terminal, cx)
+    }
+
+    #[gpui::test]
+    async fn test_write_raw_output_preserves_line_control_semantics(cx: &mut TestAppContext) {
+        let bytes = b"a\nb\rc\r\nd";
+        let raw = raw_content(&[bytes], cx);
+
+        let normalized_terminal = display_only_terminal(cx);
+        normalized_terminal.update(cx, |terminal, cx| terminal.write_output(bytes, cx));
+        let normalized = terminal_content(&normalized_terminal, cx);
+
+        let raw_cells = raw
+            .cells
+            .iter()
+            .map(|cell| (cell.point.line, cell.point.column, cell.character()))
+            .collect::<Vec<_>>();
+        let normalized_cells = normalized
+            .cells
+            .iter()
+            .map(|cell| (cell.point.line, cell.point.column, cell.character()))
+            .collect::<Vec<_>>();
+
+        assert!(raw_cells.contains(&(0, 0, 'a')));
+        assert!(raw_cells.contains(&(1, 0, 'c')));
+        assert!(raw_cells.contains(&(1, 1, 'b')));
+        assert!(raw_cells.contains(&(2, 0, 'd')));
+        assert!(!normalized_cells.contains(&(1, 1, 'b')));
+        assert!(normalized_cells.contains(&(1, 0, 'c')));
+        assert!(normalized_cells.contains(&(2, 0, 'd')));
+        assert_eq!(raw.cursor.point, Point::new(2, 1));
+        assert_eq!(normalized.cursor.point, Point::new(2, 1));
+    }
+
+    #[gpui::test]
+    async fn test_write_raw_output_is_independent_of_chunk_boundaries(cx: &mut TestAppContext) {
+        let bytes = b"A\nB\rC\r\n\x1b[31mR\xc3\xa9\x1b[0m\x1b[2;6HX";
+        let whole = raw_content(&[bytes], cx);
+        let cells = |content: &Content| {
+            content
+                .cells
+                .iter()
+                .map(|cell| (cell.point, cell.cell.clone()))
+                .collect::<Vec<_>>()
+        };
+        let whole_cells = cells(&whole);
+        let whole_cursor = whole.cursor.point;
+
+        let red_r = whole
+            .cells
+            .iter()
+            .find(|cell| cell.character() == 'R')
+            .expect("raw output should contain the styled R");
+        assert_eq!(red_r.point, Point::new(2, 0));
+        let accented = whole
+            .cells
+            .iter()
+            .find(|cell| cell.character() == '\u{e9}')
+            .expect("raw output should contain the complete UTF-8 character");
+        assert_eq!(accented.point, Point::new(2, 1));
+        assert_eq!(accented.foreground(), red_r.foreground());
+        let positioned = whole
+            .cells
+            .iter()
+            .find(|cell| cell.point == Point::new(1, 5))
+            .expect("cursor movement should position X");
+        assert_eq!(positioned.character(), 'X');
+        assert_ne!(positioned.foreground(), red_r.foreground());
+        assert_eq!(whole_cursor, Point::new(1, 6));
+
+        for split in 0..=bytes.len() {
+            let (first, second) = bytes.split_at(split);
+            let split_content = raw_content(&[b"", first, b"", second, b""], cx);
+            assert_eq!(
+                cells(&split_content),
+                whole_cells,
+                "two-part split at byte {split}"
+            );
+            assert_eq!(
+                split_content.cursor.point, whole_cursor,
+                "two-part cursor at byte {split}"
+            );
+        }
+
+        let byte_chunks = bytes
+            .iter()
+            .map(std::slice::from_ref)
+            .chain(std::iter::once(&[][..]))
+            .collect::<Vec<_>>();
+        let bytewise = raw_content(&byte_chunks, cx);
+        assert_eq!(cells(&bytewise), whole_cells);
+        assert_eq!(bytewise.cursor.point, whole_cursor);
+    }
+
     /// `write_output`'s Ghostty backend processes its own queued effects,
     /// so an OSC 52 SET injected into a display-only terminal applies to
     /// the clipboard. `b3ZlcndyaXR0ZW4=` base64-decodes to "overwritten".
@@ -6607,13 +6952,16 @@ mod tests {
             .subscribe(cx)
         });
 
-        terminal.update(cx, |terminal, cx| {
-            terminal.write_output(b"\x1b]52;c;b3ZlcndyaXR0ZW4=\x07", cx);
-        });
-        cx.run_until_parked();
+        for write_output in [Terminal::write_output, Terminal::write_raw_output] {
+            terminal.update(cx, |terminal, cx| {
+                write_output(terminal, b"\x1b]52;c;b3ZlcndyaXR0ZW4=\x07", cx);
+            });
+            cx.run_until_parked();
 
-        let clipboard_text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
-        assert_eq!(clipboard_text.as_deref(), Some("overwritten"));
+            let clipboard_text =
+                cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+            assert_eq!(clipboard_text.as_deref(), Some("overwritten"));
+        }
     }
 
     /// Drives a real spawned process's PTY output through
@@ -6635,8 +6983,7 @@ mod tests {
         let path = std::env::temp_dir().join("zed_osc52_test_payload.bin");
         std::fs::write(&path, escape).unwrap();
 
-        let (_terminal, _completion_rx) =
-            build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
+        let _terminal = build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
 
         let mut clipboard_text = None;
         for _ in 0..300 {
@@ -6825,7 +7172,7 @@ mod tests {
                 click_count: 1,
                 first_mouse: true,
             };
-            terminal.mouse_down(&mouse_down, cx);
+            terminal.mouse_down(&mouse_down, MouseInputMode::ReportToTerminal, cx);
         }
 
         fn ctrl_mouse_drag_to(
@@ -6839,7 +7186,12 @@ mod tests {
                 pressed_button: Some(MouseButton::Left),
                 modifiers: Modifiers::secondary_key(),
             };
-            terminal.mouse_drag(&drag_event, terminal_bounds, cx);
+            terminal.mouse_drag(
+                &drag_event,
+                terminal_bounds,
+                MouseInputMode::ReportToTerminal,
+                cx,
+            );
         }
 
         fn ctrl_mouse_up_at(
@@ -6853,7 +7205,7 @@ mod tests {
                 modifiers: Modifiers::secondary_key(),
                 click_count: 1,
             };
-            terminal.mouse_up(&mouse_up, cx);
+            terminal.mouse_up(&mouse_up, MouseInputMode::ReportToTerminal, cx);
         }
 
         macro_rules! any_event_matches {
@@ -6901,6 +7253,38 @@ mod tests {
         }
 
         #[gpui::test]
+        async fn test_local_selection_activates_hyperlink_in_mouse_mode(cx: &mut TestAppContext) {
+            let terminal = init_terminal_test(cx, b"Visit https://zed.dev/ for more\r\n");
+
+            terminal.update(cx, |terminal, cx| {
+                terminal.last_content.mode = Modes::MOUSE_MODE;
+                let position = point(px(80.0), px(10.0));
+                let mouse_down = MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Modifiers::secondary_key(),
+                    click_count: 1,
+                    first_mouse: true,
+                };
+                let mouse_up = MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Modifiers::secondary_key(),
+                    click_count: 1,
+                };
+
+                terminal.mouse_down(&mouse_down, MouseInputMode::LocalSelection, cx);
+                terminal.mouse_up(&mouse_up, MouseInputMode::LocalSelection, cx);
+
+                assert!(any_event_matches!(
+                    terminal,
+                    InternalEvent::ProcessHyperlink(_, true)
+                ));
+                assert!(terminal.take_pty_write_log().is_empty());
+            });
+        }
+
+        #[gpui::test]
         async fn test_hyperlink_ctrl_click_mismatch_in_mouse_mode_consumes_gesture(
             cx: &mut TestAppContext,
         ) {
@@ -6923,6 +7307,7 @@ mod tests {
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Modifiers::secondary_key(),
                 },
+                MouseInputMode::ReportToTerminal,
                 cx,
             );
             ctrl_mouse_up_at(terminal, up_position, cx);
@@ -7208,7 +7593,8 @@ mod tests {
                 };
                 self.window.simulate_mouse_move(position, self.cx);
                 self.unthrottle();
-                self.terminal.mouse_move(&move_event, self.cx);
+                self.terminal
+                    .mouse_move(&move_event, MouseInputMode::ReportToTerminal, self.cx);
             }
 
             fn try_modifiers_change(&mut self, modifiers: Modifiers) {
@@ -7633,25 +8019,21 @@ mod tests {
 
         // Run a command that prints output then sleeps for a long time
         // The echo ensures we have output to capture before killing
-        let (terminal, completion_rx) =
+        let terminal =
             build_test_terminal(cx, "echo", &["test_output_before_kill; sleep 60"]).await;
 
         assert_content_eventually(&terminal, "test_output_before_kill", cx).await;
+
+        let wait_for_completion =
+            terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
 
         // Kill the active task
         terminal.update(cx, |term, _cx| {
             term.kill_active_task();
         });
 
-        // wait_for_completed_task should complete within a reasonable time (not hang)
-        let completion_result = completion_rx.recv().await;
-        assert!(
-            completion_result.is_ok(),
-            "wait_for_completed_task should complete after kill_active_task, but it timed out"
-        );
-
         // The exit status should indicate the process was killed (not a clean exit)
-        let exit_status = completion_result.unwrap();
+        let exit_status = wait_for_completion.await;
         assert!(
             exit_status.is_some(),
             "Should have received an exit status after killing"
@@ -7671,14 +8053,12 @@ mod tests {
         cx.executor().allow_parking();
 
         // Run a command that exits immediately
-        let (terminal, completion_rx) = build_test_terminal(cx, "echo", &["done"]).await;
+        let terminal = build_test_terminal(cx, "echo", &["done"]).await;
 
         // Wait for the command to complete naturally
-        let exit_status = completion_rx
-            .recv()
-            .await
-            .expect("Should receive exit status");
-        assert_eq!(exit_status, Some(ExitStatus::default()));
+        let exit_status =
+            terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
+        assert_eq!(exit_status.await, Some(ExitStatus::default()));
 
         assert_content_eventually(&terminal, "done", cx).await;
 
@@ -7718,6 +8098,7 @@ mod tests {
                             position,
                             ..default()
                         },
+                        MouseInputMode::ReportToTerminal,
                         cx,
                     );
 
@@ -7728,6 +8109,7 @@ mod tests {
                             ..default()
                         },
                         1.0,
+                        MouseInputMode::ReportToTerminal,
                     );
 
                     assert!(

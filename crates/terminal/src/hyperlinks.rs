@@ -332,6 +332,8 @@ pub(crate) fn path_hyperlink_candidates_in_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_settings::TerminalSettings;
+    use settings::Settings;
 
     fn re_test(re: &str, hay: &str, expected: Vec<&str>) {
         let results: Vec<_> = Regex::new(re)
@@ -340,6 +342,36 @@ mod tests {
             .map(|m| m.as_str())
             .collect();
         assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn test_default_path_hyperlink_regexes() -> anyhow::Result<()> {
+        let content = settings::parse_json_with_comments(&settings::default_settings())?;
+        let settings = TerminalSettings::from_settings(&content);
+        let searches = RegexSearches::new(
+            &settings.path_hyperlink_regexes,
+            Duration::from_millis(settings.path_hyperlink_timeout_ms),
+        );
+        let examples = [
+            (r#"File "src/main.py", line 42"#, "src/main.py", Some("42")),
+            ("src/main.rs:42", "src/main.rs:42", None),
+        ];
+        assert_eq!(searches.path_hyperlink_regexes.len(), examples.len());
+        assert_eq!(
+            searches.path_hyperlink_regexes.len(),
+            settings.path_hyperlink_regexes.len()
+        );
+        for (regex, (input, path, line)) in searches.path_hyperlink_regexes.iter().zip(examples) {
+            let captures = regex
+                .captures(input)
+                .ok_or_else(|| anyhow::anyhow!("Default regex does not match {input}"))?;
+            assert_eq!(
+                captures.name("path").map(|capture| capture.as_str()),
+                Some(path)
+            );
+            assert_eq!(captures.name("line").map(|capture| capture.as_str()), line);
+        }
+        Ok(())
     }
 
     #[test]
@@ -483,7 +515,13 @@ mod tests {
     #[test]
     fn path_only() {
         // "/test/cool.rs", hovering column 1 ('t' in "test").
-        assert_path_match(PATH_LINE_COLUMN_REGEX, "/test/cool.rs", 1, "/test/cool.rs", 0..13);
+        assert_path_match(
+            PATH_LINE_COLUMN_REGEX,
+            "/test/cool.rs",
+            1,
+            "/test/cool.rs",
+            0..13,
+        );
     }
 
     #[test]
@@ -523,8 +561,12 @@ mod tests {
     #[test]
     fn no_match_when_regex_finds_nothing_on_line() {
         let regexes = vec![Regex::new(PATH_LINE_COLUMN_REGEX).unwrap()];
-        let candidates =
-            path_hyperlink_candidates_in_line("no path here", 3, &regexes, Duration::from_millis(500));
+        let candidates = path_hyperlink_candidates_in_line(
+            "no path here",
+            3,
+            &regexes,
+            Duration::from_millis(500),
+        );
         assert!(candidates.is_empty());
     }
 
