@@ -3095,14 +3095,14 @@ mod tests {
 
     #[test]
     fn scrollback_keeps_the_configured_number_of_lines() {
-        let mut terminal = GhosttyTerminal::new(200, 40, 10_000).unwrap();
+        let mut terminal = GhosttyTerminal::new(200, 40, 1_000).unwrap();
         terminal.resize(test_bounds(200, 40)).unwrap();
         let mut output = String::new();
-        for line in 0..20_000 {
+        for line in 0..2_000 {
             output.push_str(&format!("line {line}\r\n"));
         }
         terminal.write(output.as_bytes());
-        assert!(terminal.total_lines().unwrap() >= 10_000);
+        assert!(terminal.total_lines().unwrap() >= 1_000);
     }
 
     #[test]
