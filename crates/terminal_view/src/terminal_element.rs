@@ -685,8 +685,12 @@ impl TerminalElement {
                     '▄' => Some(false),
                     _ => None,
                 };
+                // decorated cells take the text path, which draws underlines and strikethroughs.
                 if let Some(fg_on_top) = half_block_fg_on_top
                     && !is_default_background_color(bg)
+                    && !cell.has_underline()
+                    && !cell.has_strikeout()
+                    && cell.hyperlink().is_none()
                     && !cell.is_wide_char_spacer()
                     && !matches!(cell.zerowidth(), Some(chars) if !chars.is_empty())
                 {
@@ -775,12 +779,16 @@ impl TerminalElement {
                         );
 
                         let cell_point = LayoutPoint::new(display_line, point.column as i32);
-                        if Self::collect_block_element_regions(
-                            cell_point,
-                            cell.character(),
-                            cell_style.color,
-                            &mut block_element_regions,
-                        ) {
+                        let decorated =
+                            cell_style.underline.is_some() || cell_style.strikethrough.is_some();
+                        if !decorated
+                            && Self::collect_block_element_regions(
+                                cell_point,
+                                cell.character(),
+                                cell_style.color,
+                                &mut block_element_regions,
+                            )
+                        {
                             if let Some(batch) = current_batch.take() {
                                 batched_runs.push(batch);
                             }
@@ -2325,6 +2333,56 @@ mod tests {
     use super::*;
     use gpui::{AbsoluteLength, Hsla, TestAppContext, font};
     use ui::utils::apca_contrast;
+
+    #[gpui::test]
+    async fn decorated_block_elements_keep_their_underline_and_strikethrough(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, _workspace, window_handle) = crate::tests::init_test_with_window(cx).await;
+        let (_pane, terminal, _terminal_view) =
+            crate::tests::add_display_only_terminal(&project, window_handle, true, false, cx);
+        terminal.update(cx, |terminal, cx| {
+            // plain, underlined, and struck-through half blocks on a red background, then a
+            // plain and an underlined full block.
+            terminal.write_output(
+                "\x1b[41m▀\x1b[4m▀\x1b[24;9m▀\x1b[0m█\x1b[4m█".as_bytes(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let cells = terminal.read(cx).last_content().cells.clone();
+            let text_style = TextStyle::default();
+            let (_rects, text_runs, block_rects, split_rects) = TerminalElement::layout_grid(
+                cells.into_iter().filter(|cell| cell.point.line == 0),
+                0,
+                &text_style,
+                None,
+                0.0,
+                cx,
+            );
+
+            assert_eq!(
+                split_rects
+                    .iter()
+                    .map(|rect| rect.num_of_cells)
+                    .sum::<usize>(),
+                1,
+                "only the plain half block is fused"
+            );
+            assert!(
+                !block_rects.is_empty(),
+                "the plain full block is drawn as a quad"
+            );
+            let decorated_text = text_runs
+                .iter()
+                .filter(|run| run.style.underline.is_some() || run.style.strikethrough.is_some())
+                .map(|run| run.text.clone())
+                .collect::<String>();
+            assert_eq!(decorated_text, "▀▀█");
+        });
+    }
 
     #[gpui::test]
     async fn terminal_input_handler_respects_read_only_mode(cx: &mut TestAppContext) {
