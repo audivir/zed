@@ -4,7 +4,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Datetime, Duration};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
@@ -108,6 +108,14 @@ pub struct TypstSystemWorld {
     pub root: PathBuf,
     pub file_overrides: HashMap<PathBuf, MultiBufferSnapshot>,
     pub sources: RwLock<HashMap<FileId, Source>>,
+    disk_files: RwLock<HashMap<PathBuf, DiskFile>>,
+}
+
+/// Container for file bytes read from disk, keyed by their modification time and size.
+struct DiskFile {
+    modified: Option<SystemTime>,
+    len: u64,
+    bytes: typst::foundations::Bytes,
 }
 
 impl TypstSystemWorld {
@@ -137,11 +145,40 @@ impl TypstSystemWorld {
             root,
             file_overrides: Default::default(),
             sources: RwLock::new(Default::default()),
+            disk_files: RwLock::new(Default::default()),
         };
 
         log::debug!("Initialized TypstWorld in {:?}", start.elapsed());
 
         world
+    }
+
+    /// Returns the bytes of `path`, re-reading only when its modification time or size changed.
+    ///
+    /// The flag reports whether the file was re-read.
+    fn read_disk_file(&self, path: &Path) -> FileResult<(typst::foundations::Bytes, bool)> {
+        let not_found = || FileError::NotFound(path.to_path_buf());
+        let metadata = std::fs::metadata(path).map_err(|_| not_found())?;
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        if let Some(file) = self.disk_files.read().get(path)
+            && file.modified.is_some()
+            && file.modified == modified
+            && file.len == len
+        {
+            return Ok((file.bytes.clone(), false));
+        }
+
+        let bytes = typst::foundations::Bytes::new(std::fs::read(path).map_err(|_| not_found())?);
+        self.disk_files.write().insert(
+            path.to_path_buf(),
+            DiskFile {
+                modified,
+                len,
+                bytes: bytes.clone(),
+            },
+        );
+        Ok((bytes, true))
     }
 
     /// Replaces the main source with the given editor text.
@@ -211,9 +248,17 @@ impl World for TypstSystemWorld {
         let path = self.resolve_path(id)?;
 
         let text = if let Some(override_text) = self.file_overrides.get(&path) {
+            // forget the disk state so the file is re-read once the override disappears.
+            self.disk_files.write().remove(&path);
             override_text.text()
         } else {
-            std::fs::read_to_string(&path).map_err(|_| FileError::NotFound(path.clone()))?
+            let (bytes, changed) = self.read_disk_file(&path)?;
+            if !changed && let Some(source) = self.sources.read().get(&id) {
+                return Ok(source.clone());
+            }
+            std::str::from_utf8(&bytes)
+                .map_err(|_| FileError::InvalidUtf8)?
+                .to_string()
         };
 
         let mut sources = self.sources.write();
@@ -233,10 +278,8 @@ impl World for TypstSystemWorld {
 
     fn file(&self, id: FileId) -> FileResult<typst::foundations::Bytes> {
         let path = self.resolve_path(id)?;
-
-        let bytes = std::fs::read(&path).map_err(|_| FileError::NotFound(path.clone()))?;
-
-        Ok(typst::foundations::Bytes::new(bytes))
+        let (bytes, _changed) = self.read_disk_file(&path)?;
+        Ok(bytes)
     }
 
     fn font(&self, index: usize) -> Option<Font> {
@@ -344,6 +387,28 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    #[test]
+    fn disk_sources_are_reread_after_changes() {
+        let dir = ScratchDir::new("typst_world_disk_cache_test");
+        let path = dir.0.join("chapter.typ");
+        std::fs::write(&path, "first").unwrap();
+        let world = TypstSystemWorld::new(dir.0.clone());
+        let id = FileId::new(RootedPath::new(
+            VirtualRoot::Project,
+            VirtualPath::new("/chapter.typ").unwrap(),
+        ));
+
+        assert_eq!(world.source(id).unwrap().text(), "first");
+        assert_eq!(world.source(id).unwrap().text(), "first");
+
+        std::fs::write(&path, "second version").unwrap();
+        assert_eq!(world.source(id).unwrap().text(), "second version");
+        assert_eq!(
+            world.file(id).unwrap().as_slice(),
+            b"second version".as_slice()
+        );
     }
 
     #[test]
