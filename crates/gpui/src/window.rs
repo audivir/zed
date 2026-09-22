@@ -4575,13 +4575,9 @@ impl Window {
         }
     }
 
-    /// Paint a batch of quads into the scene for the next frame at a single, shared paint
-    /// order, rather than computing one individually per quad as `paint_quad` does. Intended
-    /// for callers that paint many quads at once (e.g. per-cell terminal backgrounds) where
-    /// the individual paint order of each quad relative to the others doesn't matter.
+    /// Paints a batch of opaque fill quads at a single shared paint order.
     ///
-    /// Unlike `paint_quad`, this doesn't split border-only quads around their transparent
-    /// interior. Only use it for quads you know are opaque fills.
+    /// Unlike `paint_quad`, border-only quads are not split around their transparent interior.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_quads(&mut self, quads: impl IntoIterator<Item = PaintQuad>) {

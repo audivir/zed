@@ -881,10 +881,10 @@ pub fn linear_gradient(
     }
 }
 
-/// Creates a background vertically split between a top and bottom color.
+/// Creates a background split vertically between a top and bottom color.
 ///
-/// `split_y` is the fraction (0.0 to 1.0) of the element's height where the split occurs -
-/// everything above it is painted `top`, everything below `bottom`.
+/// `split_y` is the fraction (0.0 to 1.0) of the element height where `top` ends and `bottom`
+/// begins.
 pub fn vertical_split_background(
     top: impl Into<Hsla>,
     bottom: impl Into<Hsla>,

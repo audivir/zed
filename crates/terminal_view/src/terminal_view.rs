@@ -159,24 +159,13 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
-    /// Caches Kitty graphics protocol images converted to GPUI's
-    /// `RenderImage`, keyed by image id, so `TerminalElement::paint`
-    /// (re-created every frame) only rebuilds an entry when its
-    /// `ImagePlacement::generation` changes. `RefCell` rather than routing
-    /// through `Context` since this is pure paint-time caching that never
-    /// needs to trigger a re-render.
+    /// Kitty graphics images converted to `RenderImage`, keyed by image ID.
     ///
-    /// TODO: entries are only ever inserted, never evicted. When a Kitty
-    /// delete command (`\x1b_Ga=d,d=A\x1b\\` clear all, `a=d` clear visible,
-    /// `a=d,d=i,i=<ID>` delete by ID) removes an image, its placement stops
-    /// appearing in `last_content.images` (so this cache stops being
-    /// consulted for it), but the stale `(generation, RenderImage)` entry
-    /// itself is never removed. A session that creates and deletes many
-    /// distinct image IDs (e.g. a script cycling through images with fresh
-    /// random IDs each time) grows this cache without bound. Low priority
-    /// (bounded by however many distinct image IDs a session ever uses, not
-    /// by time), but worth pruning entries whose `image_id` hasn't appeared
-    /// in `last_content.images` for some number of frames/some time window.
+    /// An entry is rebuilt only when `ImagePlacement::generation` changes. `RefCell` suffices
+    /// since this paint-time cache never needs to trigger a re-render.
+    ///
+    /// TODO: entries are never evicted, so deleted Kitty images leak until the view is dropped.
+    /// Prune IDs that stop appearing in `last_content.images`.
     pub(crate) image_cache: RefCell<HashMap<u32, (u64, Arc<RenderImage>)>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
@@ -661,9 +650,8 @@ impl TerminalView {
             });
         }
 
-        // A theme switch is itself a settings change, so this also keeps
-        // Ghostty's default OSC 4/10/11/12 colors current with the active
-        // theme (see `Terminal::sync_ghostty_theme_colors`).
+        // a theme switch is a settings change, so this also keeps the default OSC 4/10/11/12
+        // colors of Ghostty in sync with the theme.
         self.terminal.update(cx, |term, cx| {
             term.sync_ghostty_theme_colors(cx);
         });

@@ -235,11 +235,10 @@ impl BlockElementLayoutRect {
     }
 }
 
-/// A cell-space rect painted as a single vertically-split quad instead of the usual pair of
-/// overlapping quads (a full-cell background rect plus a half-cell foreground block-element
-/// rect). Only ever produced for the plain upper/lower half-block characters (`▀`/`▄`) with a
-/// non-default background, since that's the one case where the pair-of-quads path is
-/// redundant: a genuine background/foreground split, not an approximation of one.
+/// Cell-space rect painted as one vertically split quad.
+///
+/// Only produced for the half-block characters `▀` and `▄` on a non-default background, where the
+/// usual background quad plus half-cell foreground quad describes a true two-color split.
 #[derive(Clone, Debug)]
 pub struct SplitBackgroundRect {
     point: LayoutPoint,
@@ -432,11 +431,9 @@ impl TerminalLayoutCell for &IndexedCell {
 
 /// Merge grid regions to minimize the number of rectangles.
 ///
-/// Regions are sorted, coalesced horizontally when adjacent or overlapping on the same line,
-/// then merged vertically when a region's column span exactly matches the region directly
-/// above it. This is linear-ish (a sort plus one pass with a small per-line lookback) rather
-/// than the pairwise O(n^2) merge it replaces, which matters for workloads dominated by
-/// colored background cells (ANSI animation, benchmark output, etc).
+/// Regions are sorted, coalesced horizontally when adjacent or overlapping on a line, then merged
+/// vertically when a column span matches the region directly above. This avoids a pairwise
+/// O(n^2) merge on output dominated by colored backgrounds.
 fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundRegion> {
     if regions.is_empty() {
         return regions;
@@ -552,14 +549,11 @@ impl TerminalElement {
         .track_focus(&focus)
     }
 
-    /// Paints Kitty graphics protocol image placements behind text, using
-    /// GPUI's `paint_image` (the same primitive `img()` and video playback
-    /// use), so no custom rendering/shader work is needed. Positions are in
-    /// viewport-relative grid cells (see `terminal::ImagePlacement`); pixel
-    /// dimensions come pre-resolved from libghostty-vt. Takes cloned entity
-    /// handles rather than `&self` so it can be called from inside the
-    /// `self.interactivity.paint` closure without conflicting with that
-    /// call's concurrent `&mut self.interactivity` borrow.
+    /// Paints Kitty graphics image placements behind the text.
+    ///
+    /// Positions are viewport-relative grid cells and pixel sizes come resolved from Ghostty.
+    /// Takes entity handles instead of `&self` so it can run inside the
+    /// `self.interactivity.paint` closure.
     fn paint_images(
         terminal: &Entity<Terminal>,
         terminal_view: &Entity<TerminalView>,
@@ -594,11 +588,8 @@ impl TerminalElement {
                     placement.viewport_column as f32 * layout.dimensions.cell_width,
                     placement.viewport_row as f32 * layout.dimensions.line_height,
                 );
-            // Paint at the placement's resolved pixel size, but capped to its
-            // reserved grid cell allocation (`grid_columns` x `grid_rows`) so
-            // rounding differences between libghostty-vt's whole-pixel cell
-            // math and GPUI's fractional line height never cause the image to
-            // overflow into adjacent text rows (e.g. the prompt row below a large image).
+            // cap the image to its reserved grid cells so rounding differences between whole-pixel
+            // cell math in Ghostty and fractional GPUI line heights never overflow into text rows.
             let mut pixel_width = placement.pixel_width as f32;
             let mut pixel_height = placement.pixel_height as f32;
             if placement.grid_columns > 0 {
@@ -674,11 +665,7 @@ impl TerminalElement {
                     mem::swap(&mut fg, &mut bg);
                 }
 
-                // Fuse a plain upper/lower half-block character with a non-default
-                // background into a single vertical-split quad instead of the usual pair:
-                // a full-cell background rect plus a half-cell foreground block-element
-                // rect covering the same area. Only these two characters get this
-                // treatment, see `SplitBackgroundRect`'s doc comment for why.
+                // fuse a half-block character on a non-default background into one split quad.
                 let half_block_fg_on_top = match cell.character() {
                     '▀' => Some(true),
                     '▄' => Some(false),
@@ -2144,10 +2131,10 @@ impl InputHandler for TerminalInputHandler {
     }
 }
 
-/// Whether `cell` needs its own text run painted. A plain space never does: its background
-/// (if any) is already covered by the separate background-region pass, so painting a space
-/// glyph on top of it would be pure overhead. Spaces with a hyperlink or a visible style
-/// modifier (underline, strikeout, inverse) still need a run so those decorations render.
+/// Whether `cell` needs its own text run.
+///
+/// Plain spaces are skipped since the background pass already paints them. Spaces with a
+/// hyperlink or a visible decoration (underline, strikeout, and inverse) still need a run.
 pub fn is_blank(cell: &Cell) -> bool {
     if cell.character() != ' ' {
         return false;
@@ -2164,11 +2151,9 @@ pub fn is_blank(cell: &Cell) -> bool {
     true
 }
 
-/// Converts a decoded Kitty graphics placement (RGBA8, per
-/// `terminal::ImagePlacement`) into GPUI's `RenderImage`. Despite its name,
-/// `RenderImage` expects pixel data in BGRA8 byte order (see the doc comment
-/// on `gpui::RenderImage` and the equivalent conversion in
-/// `livekit_client`'s WebRTC frame handling).
+/// Converts a decoded RGBA8 Kitty graphics placement into a `RenderImage`.
+///
+/// `RenderImage` expects BGRA8 byte order, so the red and blue channels are swapped.
 fn render_image_from_placement(placement: &ImagePlacement) -> Option<RenderImage> {
     let width = placement.pixel_width;
     let height = placement.pixel_height;
@@ -2295,13 +2280,13 @@ pub fn convert_color(fg: &Color, theme: &Theme) -> Hsla {
     }
 }
 
-/// Number of possible `Color::Indexed` values (a `u8`), sized to cover the full palette.
+/// Number of possible `Color::Indexed` values.
 const INDEXED_COLOR_CACHE_LEN: usize = 256;
 
-/// Same as `convert_color`, but memoizes `Color::Indexed` lookups in `cache`. Indexed colors
-/// repeat heavily within a single layout pass (e.g. a themed prompt or progress bar reusing
-/// the same palette entry across many cells), and `get_color_at_index` redoes the 6x6x6
-/// cube/grayscale-ramp math on every call otherwise.
+/// Converts `color` like `convert_color`, memoizing `Color::Indexed` lookups in `cache`.
+///
+/// Indexed colors repeat heavily within a layout pass, and `get_color_at_index` otherwise redoes
+/// the color cube math on every call.
 fn convert_color_cached(
     color: &Color,
     theme: &Theme,
@@ -2457,10 +2442,8 @@ mod tests {
         assert!(!TerminalElement::is_decorative_character('\u{1FB3C}')); // Just after
     }
 
-    /// Verifies all three Kitty image rendering invariants across various image heights:
-    /// 1. Exact pixel height: rendered height matches original `placement.pixel_height`.
-    /// 2. No leak in next/bottom row: image bottom <= start of the next text row.
-    /// 3. No empty lines: gap between image bottom and next text row < 1 line height.
+    // checks that images keep their exact pixel height, stay above the next text row, and leave
+    // less than one line of gap below them.
     #[test]
     fn test_image_rendering_invariants_exact_pixel_height_no_leak_no_empty_lines() {
         let test_cases = [
@@ -2487,7 +2470,7 @@ mod tests {
                 data: std::sync::Arc::new([]),
             };
 
-            // Invariant 1: exact pixel height (unscaled)
+            // exact pixel height.
             let rendered_height = placement.pixel_height as f32;
             assert_eq!(
                 rendered_height, pixel_height as f32,
@@ -2498,13 +2481,13 @@ mod tests {
             let next_row_top =
                 ((placement.viewport_row + placement.grid_rows as i32) as f32) * line_height;
 
-            // Invariant 2: image does not leak into next/bottom row (prompt row)
+            // no overflow into the next row.
             assert!(
                 rendered_bottom <= next_row_top + 0.001,
                 "pixel_height={pixel_height}: rendered_bottom ({rendered_bottom}) leaks into next_row_top ({next_row_top})"
             );
 
-            // Invariant 3: no empty lines below image
+            // no empty line below the image.
             let empty_margin = next_row_top - rendered_bottom;
             assert!(
                 empty_margin < line_height,
@@ -2585,15 +2568,15 @@ mod tests {
         rect.append_cell();
         assert_eq!(rect.num_of_cells, 2);
 
-        // Same colors and split, but not adjacent (gap at column 2): can't merge.
+        // not adjacent.
         assert!(!rect.can_append(LayoutPoint::new(0, 3), 0.5, top, bottom));
-        // Different line: can't merge.
+        // different line.
         assert!(!rect.can_append(LayoutPoint::new(1, 2), 0.5, top, bottom));
-        // Different split fraction: can't merge (would visually misalign).
+        // different split fraction would misalign visually.
         assert!(!rect.can_append(LayoutPoint::new(0, 2), 0.25, top, bottom));
-        // Swapped colors: can't merge (different appearance).
+        // swapped colors look different.
         assert!(!rect.can_append(LayoutPoint::new(0, 2), 0.5, bottom, top));
-        // Adjacent, same split and colors: can merge.
+        // adjacent with the same split and colors.
         assert!(rect.can_append(LayoutPoint::new(0, 2), 0.5, top, bottom));
     }
 
@@ -2793,7 +2776,7 @@ mod tests {
             &Color::Indexed(15)
         ));
 
-        // Boundary: index 16 is the first entry of the 6x6x6 cube, so it's application-chosen.
+        // index 16 is the first entry of the color cube, so it is application-chosen.
         assert!(TerminalElement::is_app_chosen_exact_color(&Color::Indexed(
             16
         )));

@@ -8,12 +8,10 @@ use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// The render scale used for thumbnail-sidebar images. Fixed rather than zoom-dependent,
-/// since thumbnails never need to sharpen with the main view's zoom level, so unlike the
-/// main page cache, a thumbnail is either cached at this one scale or not cached at all.
+/// Render scale for thumbnail sidebar images, independent of the zoom level.
 const THUMBNAIL_SCALE: f32 = 0.2;
 
-/// Assure pages are removed even if GPUI cancels a task
+/// Removes the page from `rendering_pages` even if GPUI cancels the task.
 #[derive(Debug)]
 struct Guard {
     pdf: Arc<Pdf>,
@@ -26,7 +24,7 @@ impl Drop for Guard {
     }
 }
 
-/// Same purpose as `Guard`, but for the separate thumbnail-rendering bookkeeping.
+/// Removes the page from `rendering_thumbnails` even if GPUI cancels the task.
 struct ThumbnailGuard {
     pdf: Arc<Pdf>,
     page: usize,
@@ -38,44 +36,38 @@ impl Drop for ThumbnailGuard {
     }
 }
 
-/// A PDF document, containing its raw bytes and a cache of rendered frames
+/// PDF document with its raw bytes and rendered page caches.
 #[derive(Debug)]
 pub struct Pdf {
-    /// The unique ID for the PDF
     pub id: u64,
-    /// The raw PDF bytes
     pub bytes: Arc<Vec<u8>>,
-    /// Document metadata about pages and chapters
     pub metadata: Arc<DocumentMetadata>,
-    /// Cache of rendered pages: Key is page_index
+    /// Rendered pages keyed by page index.
     pub page_cache: RwLock<HashMap<usize, PageData>>,
-    /// Text extracted without ever rendering a bitmap, see `request_text_spans`. Consulted
-    /// as a fallback by `text_spans_for_page` for pages `page_cache` doesn't have yet (a
-    /// full render already extracts text as a side effect, so this only ever fills in for
-    /// pages that haven't been rasterized).
+    /// Text extracted without rendering, used for pages missing from `page_cache`.
     pub text_only_cache: RwLock<HashMap<usize, Arc<Vec<PdfTextSpan>>>>,
-    /// Tracking currently rendering pages, and the scale/rotation they're rendering at
+    /// Pages currently rendering, with their scale and rotation.
     pub rendering_pages: Mutex<HashMap<usize, (f32, PageRotation)>>,
-    /// Pages whose most recent render attempt failed, and the scale/rotation that failed,
-    /// so we don't silently re-attempt (and re-fail) the same render every frame.
+    /// Pages whose last render failed, with the failing scale and rotation.
+    ///
+    /// Prevents retrying the same failing render every frame.
     pub failed_pages: Mutex<HashMap<usize, (f32, PageRotation)>>,
-    /// Cache of rendered thumbnail-sidebar images, kept separate from `page_cache` since
-    /// thumbnails and the main view want the same page at very different scales at the same
-    /// time, and sharing one cache would mean one view constantly evicting the other's render.
+    /// Rendered thumbnail images.
+    ///
+    /// Kept apart from `page_cache` since thumbnails and the main view need the same page at very
+    /// different scales and would otherwise evict each other.
     pub thumbnail_cache: RwLock<HashMap<usize, PageData>>,
     rendering_thumbnails: Mutex<HashSet<usize>>,
     failed_thumbnails: Mutex<HashSet<usize>>,
-    /// The password used to open this document, if any. `Pdf` is otherwise immutable after
-    /// construction, so retrying with a different password creates a new `Pdf` rather than
-    /// mutating this one.
+    /// Password used to open the document.
+    ///
+    /// Retrying with another password creates a new `Pdf`.
     pub password: Option<String>,
 }
 
 impl Drop for Pdf {
     fn drop(&mut self) {
-        // Best-effort: releases the cached, parsed PdfDocument for this content hash once
-        // nothing references it anymore, so closed PDFs don't accumulate in the renderer's
-        // document cache for the lifetime of the process.
+        // releases the parsed document from the renderer cache so closed PDFs do not accumulate.
         crate::pdf_renderer::evict_document(self.id);
     }
 }
@@ -95,7 +87,7 @@ impl Hash for Pdf {
 }
 
 impl Pdf {
-    /// An empty PDF containing no data
+    /// Returns an empty PDF without data.
     pub fn empty() -> Self {
         Self {
             id: 0,
@@ -112,9 +104,9 @@ impl Pdf {
         }
     }
 
-    /// Create a PDF from bytes, optionally unlocking it with `password` if it's encrypted.
-    /// If the document turns out to be password-protected, check
-    /// `metadata.needs_password` on the result rather than treating this as a load failure.
+    /// Creates a PDF from bytes, unlocking it with `password` if encrypted.
+    ///
+    /// A missing or wrong password sets `metadata.needs_password` instead of failing.
     pub async fn from_bytes(
         bytes: Vec<u8>,
         pages_max_width: Option<(Vec<PageMetadata>, f32)>,
@@ -142,17 +134,15 @@ impl Pdf {
         }
     }
 
-    /// Get this PDF's ID
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// Get the raw bytes of the PDF
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 
-    /// Get the size of a specific page
+    /// Returns the size of the page at `page_idx`.
     pub fn get_page_size(&self, page_idx: usize) -> Result<Size<f32>> {
         if let Some(page_metadata) = self.metadata.pages.get(page_idx) {
             return Ok(page_metadata.size);
@@ -160,15 +150,11 @@ impl Pdf {
         bail!("Out of bounds")
     }
 
-    /// Request the parsing and rendering of a page at a specific scale. `visible_center_y`
-    /// is the page-point-space Y coordinate the caller is most interested in (e.g. the
-    /// vertical center of what's currently visible), only relevant for pages too tall to
-    /// render whole at this scale, where it decides which vertical strip gets rendered (see
-    /// `MAX_RENDER_HEIGHT` in `pdf_renderer.rs`); pass `0.0` if the caller has no viewport
-    /// context (e.g. search's adjacent-match prefetch). `priority` controls how eagerly this
-    /// render is scheduled relative to other pending page renders (e.g. a currently-visible
-    /// page should use `Priority::High`, a prerender/prefetch page `Priority::Low`), see the
-    /// comment at this function's call sites in `pdf_viewer.rs`.
+    /// Requests rendering of a page at the given scale.
+    ///
+    /// `visible_center_y` is the page-space Y coordinate of interest. For pages too tall to render
+    /// whole, it selects the rendered strip; pass `0.0` without viewport context. `priority`
+    /// orders this render against other pending renders.
     #[allow(clippy::too_many_arguments)]
     pub fn request_page(
         self: Arc<Self>,
@@ -180,23 +166,19 @@ impl Pdf {
         priority: gpui::Priority,
         on_rendered: impl FnOnce(&mut App) + Send + 'static,
     ) -> Option<Task<()>> {
-        // Fast path: check if we already have an image at this resolution or higher, at the
-        // right rotation, that also covers the page-point we're interested in (relevant for
-        // strip-rendered pages; always true for an ordinary whole-page render).
+        // reuse a cached render at this rotation and at least this scale that covers the point.
         let prev_page = {
-            // Acquire the read lock
             let cache = self.page_cache.read();
 
             if let Some(rendered) = cache.get(&page_idx) {
-                // Buffer of 0.01 handles tiny float precision mismatches
+                // tolerance for float precision.
                 if rendered.scale >= requested_scale * 0.99
                     && rendered.rotation == rotation
                     && rendered.covers_page_y(visible_center_y)
                 {
                     return None; // We already have a good enough render, abort the task
                 }
-                // A cached render at the wrong rotation isn't reusable as a scale/coverage
-                // fallback either: its pixels are the wrong shape for the new rotation.
+                // a render at another rotation has the wrong shape.
                 (rendered.rotation == rotation).then(|| rendered.clone())
             } else {
                 None
@@ -252,9 +234,7 @@ impl Pdf {
 
                             let mut cache = pdf.page_cache.write();
 
-                            // Overwrite only if the new render is better than what snuck into
-                            // the cache, or that cached render is now stale because it's at a
-                            // different rotation.
+                            // overwrite only a worse or stale-rotation render that landed first.
                             let should_insert = cache.get(&page_idx).is_none_or(|c| {
                                 c.scale <= requested_scale || c.rotation != rotation
                             });
@@ -273,15 +253,11 @@ impl Pdf {
                 })
                 .await;
 
-            // Notify the UI safely
             cx.update(|cx| on_rendered(cx));
         }))
     }
 
-    /// Requests a low-resolution thumbnail render of `page_idx` for the thumbnail sidebar,
-    /// at a fixed `THUMBNAIL_SCALE` rather than the caller-chosen scale `request_page` takes -
-    /// see `thumbnail_cache`'s doc comment for why thumbnails use a separate cache/request
-    /// path instead of sharing `request_page`'s.
+    /// Requests a thumbnail render of `page_idx` at `THUMBNAIL_SCALE`.
     pub fn request_thumbnail(
         self: Arc<Self>,
         cx: &mut App,
@@ -311,9 +287,7 @@ impl Pdf {
                     };
 
                     match PdfRenderer::new(pdf.id, bytes, password)
-                        // Thumbnails always render unrotated. They're a small navigation
-                        // aid, not expected to visually match the (possibly rotated) main
-                        // view pixel-for-pixel.
+                        // thumbnails always render unrotated.
                         .process_page(
                             page_idx,
                             THUMBNAIL_SCALE,
@@ -343,9 +317,7 @@ impl Pdf {
         }))
     }
 
-    /// `page_idx`'s text spans, from whichever cache already has them: `page_cache` (a full
-    /// render already extracts text as a side effect) if present, else `text_only_cache` (see
-    /// `request_text_spans`). `None` if neither has extracted this page's text yet.
+    /// Returns the text spans of `page_idx` from `page_cache` or `text_only_cache`.
     pub fn text_spans_for_page(&self, page_idx: usize) -> Option<Arc<Vec<PdfTextSpan>>> {
         if let Some(data) = self.page_cache.read().get(&page_idx) {
             return Some(data.text_spans.clone());
@@ -353,16 +325,11 @@ impl Pdf {
         self.text_only_cache.read().get(&page_idx).cloned()
     }
 
-    /// Extracts and caches `page_idx`'s text layer without rasterizing a bitmap at all (see
-    /// `PdfRenderer::extract_text_only`). Lets full-document operations like Select All read
-    /// every page's text without forcing every page to render first, the same way Chrome/
-    /// Edge's own PDFium-based viewer decouples text extraction from rendering. A no-op if
-    /// the text is already available via either cache. Unlike `request_page`, this doesn't
-    /// dedup against a concurrent in-flight request for the same page: a plain cache miss
-    /// here just means redoing some (cheap, non-rasterizing) PDFium work, and callers of this
-    /// (currently just Select All, invoked at most a handful of times a session) don't queue
-    /// up densely enough for that to matter the way it does for prerendering's per-frame
-    /// `request_page` calls.
+    /// Extracts and caches the text layer of `page_idx` without rasterizing.
+    ///
+    /// Lets full-document operations like Select All read text without rendering every page.
+    /// Does nothing if the text is already cached. Concurrent requests are not deduplicated,
+    /// since the extraction is cheap and rarely requested.
     pub fn request_text_spans(self: Arc<Self>, cx: &mut App, page_idx: usize) -> Task<()> {
         if self.text_spans_for_page(page_idx).is_some() {
             return Task::ready(());
@@ -401,10 +368,8 @@ mod tests {
 
     #[test]
     fn from_bytes_reports_a_graceful_error_for_a_corrupted_file_instead_of_panicking() {
-        // Not a garbage/empty buffer, but a real PDF header and object stream, truncated
-        // partway through (missing its xref table and trailer entirely). This is what
-        // actually shows up in practice (an interrupted download/save, a disk full mid-write)
-        // more than a fully empty or non-PDF file.
+        // a real PDF header and object stream truncated before the xref table and trailer, as left
+        // by an interrupted download or save.
         let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -421,9 +386,7 @@ mod tests {
         assert!(!pdf.metadata.needs_password);
     }
 
-    // PDFIUM_TEST_LOCK is only ever taken by test bodies themselves, never by production
-    // code or another task within the same test, so holding it across an await here can't
-    // deadlock; it's exactly the kind of case this lint can't distinguish from a real one.
+    // only test bodies take `PDFIUM_TEST_LOCK`, so holding it across an await cannot deadlock.
     #[allow(clippy::await_holding_lock)]
     #[gpui::test]
     async fn request_text_spans_extracts_without_ever_rasterizing_a_bitmap(
@@ -507,9 +470,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[gpui::test]
     async fn request_page_renders_once_then_short_circuits_from_cache(cx: &mut TestAppContext) {
-        // This exercises real PDFium FFI calls and a real (non-gpui) async mutex on a
-        // background task, not simulated work gpui's deterministic test scheduler can drive
-        // itself; it needs to actually block a thread.
+        // real PDFium calls on a background task need to block a thread.
         cx.executor().allow_parking();
         let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
             .lock()
@@ -542,9 +503,8 @@ mod tests {
         );
         assert!(pdf.page_cache.read().contains_key(&0));
 
-        // Same page, same-or-lower resolution, already cached: should short-circuit rather
-        // than spawn another render (this is what makes it safe for callers like search's
-        // adjacent-match prefetch to call request_page speculatively on every match).
+        // a cached page at the same or lower resolution short-circuits, so speculative prefetch is
+        // cheap.
         let second = cx.update(|cx| {
             pdf.clone().request_page(
                 cx,
@@ -597,9 +557,7 @@ mod tests {
             .expect("page should be cached after rendering")
             .page_offset_pt;
 
-        // Same page, same resolution, but the far end of the page: the cached strip from
-        // the first request doesn't cover this point, so this must NOT short-circuit like
-        // the ordinary (same-point) cache-hit case does.
+        // the cached strip does not cover the far end of the page, so this must render again.
         let bottom_task = cx
             .update(|cx| {
                 pdf.clone().request_page(
@@ -654,7 +612,7 @@ mod tests {
 
         assert!(rendered.load(Ordering::SeqCst));
         assert!(pdf.thumbnail_cache.read().contains_key(&0));
-        // The main page cache is untouched: thumbnails use their own cache/scale entirely.
+        // thumbnails do not touch the main page cache.
         assert!(!pdf.page_cache.read().contains_key(&0));
 
         let second = cx.update(|cx| pdf.clone().request_thumbnail(cx, 0, |_| {}));
@@ -677,9 +635,7 @@ mod tests {
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
         assert_eq!(pdf.metadata.page_count, 1);
 
-        // Page 5 doesn't exist on this 1-page document, so process_page will fail with
-        // "Page out of bounds", exercising the real render-failure path end to end, rather
-        // than just asserting on manually-populated state.
+        // page 5 does not exist, so the real render failure path runs.
         let task = cx
             .update(|cx| {
                 pdf.clone().request_page(
@@ -701,8 +657,7 @@ mod tests {
         );
         assert!(!pdf.page_cache.read().contains_key(&5));
 
-        // A second request for the same page at the same scale must short-circuit instead of
-        // re-attempting (and re-failing) the same render on every subsequent frame.
+        // a repeated request for a failed page must not retry the render.
         let second = cx.update(|cx| {
             pdf.clone().request_page(
                 cx,

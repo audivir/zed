@@ -13,7 +13,7 @@ use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use ui::SharedString;
 
-/// A lazy-loader for fonts to prevent loading gigabytes of font data into RAM at startup.
+/// Lazily loaded font, avoiding reading all font data at startup.
 #[derive(Clone)]
 pub enum FontSlot {
     Memory(Font),
@@ -38,8 +38,7 @@ impl FontSlot {
     }
 }
 
-/// Reads `FontInfo` out of every face `db` knows about and records a lazy [`FontSlot`] for
-/// each, appending both into `book`/`fonts`.
+/// Records font info and a lazy [`FontSlot`] for every face in `db`.
 fn collect_fontdb_faces(db: &fontdb::Database, book: &mut FontBook, fonts: &mut Vec<FontSlot>) {
     for face in db.faces() {
         let path = match &face.source {
@@ -47,8 +46,7 @@ fn collect_fontdb_faces(db: &fontdb::Database, book: &mut FontBook, fonts: &mut 
             _ => continue,
         };
 
-        // Read the file once to extract Typst's FontInfo, then immediately drop the bytes.
-        // The FontSlot will reload the bytes lazily if Typst actually tries to render it.
+        // read once for the font info and drop the bytes; `FontSlot` reloads them on demand.
         if let Ok(data) = std::fs::read(&path) {
             let bytes = typst::foundations::Bytes::new(data);
             if let Some(font) = typst::text::Font::new(bytes, face.index) {
@@ -63,11 +61,10 @@ fn collect_fontdb_faces(db: &fontdb::Database, book: &mut FontBook, fonts: &mut 
     }
 }
 
-/// Typst's bundled asset fonts plus every font installed on the system. Neither depends on
-/// the active project root, so scanning them (parsing every bundled font's metadata, walking
-/// every system font directory) is done once per process instead of on every project-root
-/// switch. `FontBook` and `FontSlot` are both cheap to clone (metadata + `Arc`-backed fonts),
-/// so callers just clone this and layer project-local fonts on top.
+/// Returns bundled Typst fonts plus installed system fonts, scanned once per process.
+///
+/// Both are independent of the project root and cheap to clone, so callers layer
+/// project-local fonts on top of a clone.
 fn static_fonts() -> &'static (FontBook, Vec<FontSlot>) {
     static STATIC_FONTS: OnceLock<(FontBook, Vec<FontSlot>)> = OnceLock::new();
 
@@ -99,8 +96,9 @@ fn static_fonts() -> &'static (FontBook, Vec<FontSlot>) {
     })
 }
 
-/// A Typst World implementation that keeps fonts and the main buffer in memory,
-/// but dynamically resolves includes and images from the physical workspace directory.
+/// Typst world that keeps fonts and the main buffer in memory.
+///
+/// Includes and images resolve from the workspace directory on disk.
 pub struct TypstSystemWorld {
     library: LazyHash<Library>,
     book: LazyHash<FontBook>,
@@ -116,8 +114,7 @@ impl TypstSystemWorld {
     pub fn new(root: PathBuf) -> Self {
         let start = Instant::now();
 
-        // Bundled + system fonts are cached process-wide (see `static_fonts`); only the
-        // project-local font directory actually depends on `root` and needs rescanning here.
+        // bundled and system fonts are cached process-wide; only project fonts depend on `root`.
         let (static_book, static_font_slots) = static_fonts();
         let mut book = static_book.clone();
         let mut fonts = static_font_slots.clone();
@@ -147,7 +144,7 @@ impl TypstSystemWorld {
         world
     }
 
-    /// Update the main source file dynamically
+    /// Replaces the main source with the given editor text.
     pub fn update_main(&mut self, text: SharedString, file_path: &Path) {
         let rel_path = file_path
             .strip_prefix(&self.root)
@@ -174,7 +171,6 @@ impl TypstSystemWorld {
         }
     }
 
-    /// Provides access to the main source file
     pub fn main_source(&self) -> &Source {
         &self.main_source
     }
@@ -206,12 +202,12 @@ impl World for TypstSystemWorld {
     }
 
     fn source(&self, id: FileId) -> FileResult<Source> {
-        // 1. Serve the active unsaved editor buffer
+        // serve the unsaved editor buffer.
         if id == self.main_id {
             return Ok(self.main_source.clone());
         }
 
-        // 2. Resolve `#import` paths to the real disk (including packages)
+        // resolve imports, including packages, from disk.
         let path = self.resolve_path(id)?;
 
         let text = if let Some(override_text) = self.file_overrides.get(&path) {
@@ -252,10 +248,7 @@ impl World for TypstSystemWorld {
         let naive = match offset {
             None => now.naive_local(),
             Some(offset) => {
-                // `offset` comes from user-controlled Typst source
-                // (`datetime.today(offset: ...)`); use checked conversion so an
-                // out-of-range offset falls through to `None` instead of
-                // overflowing.
+                // `offset` comes from user-controlled Typst source, so overflow yields `None`.
                 let seconds = offset.seconds();
                 if !seconds.is_finite() {
                     return None;
@@ -336,8 +329,7 @@ fn package_dir(spec: &typst::syntax::package::PackageSpec) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// A scratch directory that removes itself on drop, so a failed assertion doesn't leave
-    /// stray fixture files behind in the OS temp dir.
+    /// Scratch directory that removes itself on drop.
     struct ScratchDir(PathBuf);
 
     impl ScratchDir {
@@ -385,9 +377,7 @@ mod tests {
         let world_b = TypstSystemWorld::new(dir_b.0.clone());
 
         let (_, static_font_slots) = static_fonts();
-        // Neither scratch dir has its own fonts, so both worlds should end up with exactly
-        // the cached static font set, confirming `new()` reuses `static_fonts()` rather
-        // than re-scanning the system from scratch for every project root.
+        // without project fonts, both worlds reuse the cached static font set.
         assert_eq!(world_a.fonts.len(), static_font_slots.len());
         assert_eq!(world_b.fonts.len(), static_font_slots.len());
     }

@@ -43,33 +43,33 @@ pub mod pdf_store;
 actions!(
     pdf_viewer,
     [
-        /// Zoom in the pdf.
+        /// Zooms in the PDF.
         ZoomIn,
-        /// Zoom out the pdf.
+        /// Zooms out the PDF.
         ZoomOut,
-        /// Reset zoom to 100%.
+        /// Resets the zoom to 100%.
         ResetZoom,
-        /// Fit the pdf to view.
+        /// Fits the PDF to the view.
         FitToView,
-        /// Fit the pdf to width.
+        /// Fits the PDF to the view width.
         FitToWidth,
-        /// Zoom to actual size (100%).
+        /// Zooms to the actual size (100%).
         ZoomToActualSize,
-        /// Go to the next page.
+        /// Goes to the next page.
         NextPage,
-        /// Go to the previous page.
+        /// Goes to the previous page.
         PreviousPage,
-        /// Copy the selected text.
+        /// Copies the selected text.
         Copy,
-        /// Select all text on currently-rendered pages.
+        /// Selects all text in the document.
         SelectAll,
-        /// Toggle the bookmark/outline sidebar.
+        /// Toggles the outline sidebar.
         ToggleOutline,
-        /// Toggle the thumbnail sidebar.
+        /// Toggles the thumbnail sidebar.
         ToggleThumbnails,
-        /// Toggle between continuous-scroll and single-page view.
+        /// Toggles between continuous scrolling and single-page view.
         ToggleSinglePageView,
-        /// Rotate the view 90 degrees clockwise (view-only, not saved to the file).
+        /// Rotates the view 90 degrees clockwise without modifying the file.
         RotatePageClockwise
     ]
 );
@@ -105,18 +105,17 @@ pub enum ScrollAnchor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
-    /// All pages laid out top-to-bottom, scrolling freely between them (the default).
+    /// All pages laid out top to bottom with free scrolling.
     Continuous,
-    /// Only `current_page` is rendered/shown; navigation is page-by-page (`NextPage`/
-    /// `PreviousPage`/outline/thumbnail clicks, all of which already route through
-    /// `jump_to_page`). Note this doesn't clamp manual scroll-wheel input to stay within the
-    /// current page, see `ToggleSinglePageView`'s doc comment.
+    /// Only `current_page` is shown, and navigation goes page by page.
+    ///
+    /// Manual scrolling is not clamped to the current page.
     SinglePage,
 }
 
-/// A position within a document's text, identified the same way `PageData.text_spans`
-/// already orders characters: by page, then by index within that page's per-character spans
-/// (PDFium's own extraction order, which is reading order).
+/// Position in the document text as a page index and a character index within its spans.
+///
+/// Characters follow the PDFium extraction order, which is reading order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TextPosition {
     page_index: usize,
@@ -130,7 +129,7 @@ struct TextSelection {
 }
 
 impl TextSelection {
-    /// Returns `(start, end)` in document order, regardless of which direction the drag ran.
+    /// Returns `(start, end)` in document order, regardless of drag direction.
     fn ordered(&self) -> (TextPosition, TextPosition) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
@@ -140,9 +139,9 @@ impl TextSelection {
     }
 }
 
-/// Finds the character in `text_spans` whose bounds are closest to `point` (both in
-/// page-point space). Used to turn a mouse click into a `TextPosition`. Returns `None` only
-/// when the page has no extracted text at all.
+/// Returns the index of the character in `text_spans` closest to `point` in page space.
+///
+/// Returns `None` only when the page has no text.
 fn nearest_char_index(text_spans: &[PdfTextSpan], point: Point<f32>) -> Option<usize> {
     text_spans
         .iter()
@@ -164,8 +163,9 @@ fn distance_to_bounds_center(bounds: Bounds<f32>, point: Point<f32>) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// The half-open range of `text_spans` indices selected on `page_index`, or `None` if this
-/// page isn't part of the selection at all. `span_count` is that page's `text_spans.len()`.
+/// Returns the half-open range of selected span indices on `page_index`.
+///
+/// `span_count` is the number of text spans on that page.
 fn selected_char_range_for_page(
     selection: &TextSelection,
     page_index: usize,
@@ -188,10 +188,10 @@ fn selected_char_range_for_page(
     (range_start < range_end).then_some(range_start..range_end)
 }
 
-/// Groups consecutive same-line characters in `range` into per-line rectangles, so rendering
-/// a selection spanning many characters doesn't need one element per character, roughly one
-/// per line instead. Two spans are treated as the same line when their vertical bounds
-/// overlap by at least half of the shorter one's height.
+/// Groups consecutive characters in `range` into one rectangle per line.
+///
+/// Two spans share a line when their vertical bounds overlap by at least half of the shorter
+/// height.
 fn selection_highlight_rects(
     text_spans: &[PdfTextSpan],
     range: std::ops::Range<usize>,
@@ -223,10 +223,7 @@ fn selection_highlight_rects(
     rects
 }
 
-/// Extracts the selected text across however many of `page_text_spans` (one entry per
-/// selected page, in order, paired with that page's `text_spans`) are actually available.
-/// Pages outside the currently-rendered/cached set simply aren't included, see the note on
-/// `PdfView::text_selection` for why that's an intentional scope cut, not a bug.
+/// Returns the selected text across the available pages in `page_text_spans`.
 fn selection_to_text(
     selection: &TextSelection,
     page_text_spans: &[(usize, Arc<Vec<PdfTextSpan>>)],
@@ -246,15 +243,13 @@ fn selection_to_text(
     result
 }
 
-/// A page's screen bounds and text spans, captured once per `prepaint` pass for the outer
-/// container's drag-selection mouse handlers to hit-test against.
+/// Screen bounds and text spans of a page, captured in `prepaint` for drag hit-testing.
 type SelectionHitRegion = (usize, Bounds<Pixels>, Arc<Vec<PdfTextSpan>>);
 
-/// Turns a window-space drag point into a `TextPosition`, for extending a selection as the
-/// mouse moves. Prefers whichever page region actually contains the point; if the drag has
-/// gone above/below the whole document, falls back to the vertically-nearest page instead of
-/// leaving the selection stuck, matching how dragging past a text editor's edges still
-/// extends the selection there.
+/// Converts a window-space drag point into a `TextPosition`.
+///
+/// Prefers the page region containing the point and otherwise falls back to the vertically
+/// nearest page, so dragging past the document edges still extends the selection.
 fn hit_test_selection_point(
     regions: &[SelectionHitRegion],
     point: Point<Pixels>,
@@ -307,10 +302,7 @@ fn char_class(c: char) -> CharClass {
     }
 }
 
-/// Each `PdfTextSpan` is one character (see `PdfRenderer::process_page`'s `text_page.chars()`
-/// extraction), so classifying a span is just classifying its first char. An empty `text`
-/// (shouldn't happen, but PDFium's `unicode_string()` isn't guaranteed non-empty) is treated
-/// as whitespace rather than panicking on an empty-string index.
+/// Returns the character class of a single-character span; empty text counts as whitespace.
 fn span_char_class(span: &PdfTextSpan) -> CharClass {
     span.text
         .chars()
@@ -319,10 +311,9 @@ fn span_char_class(span: &PdfTextSpan) -> CharClass {
         .unwrap_or(CharClass::Whitespace)
 }
 
-/// The maximal run of same-class (word / punctuation / whitespace) characters containing
-/// `char_index`, for double-click word selection. Mirrors how most text editors treat a
-/// contiguous run of punctuation as its own "word" too, rather than only ever selecting
-/// alphanumeric runs.
+/// Returns the maximal run of same-class characters containing `char_index`.
+///
+/// Used for double-click word selection, where punctuation runs count as words.
 fn word_range_at(text_spans: &[PdfTextSpan], char_index: usize) -> std::ops::Range<usize> {
     let Some(span) = text_spans.get(char_index) else {
         return char_index..char_index;
@@ -339,11 +330,10 @@ fn word_range_at(text_spans: &[PdfTextSpan], char_index: usize) -> std::ops::Ran
     start..end + 1
 }
 
-/// The maximal run of characters on the same visual line as `char_index`, for triple-click
-/// line selection. Uses the same "vertical bounds overlap by at least half the shorter span's
-/// height" test as `selection_highlight_rects` groups lines by, but compares every candidate
-/// directly against the clicked char's own bounds (rather than chaining neighbor-to-neighbor)
-/// so the scan can't drift onto an adjacent line one char at a time.
+/// Returns the maximal run of characters on the visual line of `char_index`.
+///
+/// Every candidate is compared against the clicked character directly, so the scan cannot
+/// drift onto an adjacent line.
 fn line_range_at(text_spans: &[PdfTextSpan], char_index: usize) -> std::ops::Range<usize> {
     let Some(anchor_bounds) = text_spans.get(char_index).map(|s| s.bounds) else {
         return char_index..char_index;
@@ -366,10 +356,10 @@ fn line_range_at(text_spans: &[PdfTextSpan], char_index: usize) -> std::ops::Ran
     start..end + 1
 }
 
-/// Builds the `TextSelection` spanning every page in `pages_with_text` (each a `(page_index,
-/// char_count)` pair for a page that has at least one character), from the first page's start
-/// to the last page's end. `None` if no page has any text yet. Pulled out of `PdfView::select_all`
-/// so the "which pages bound the selection" decision can be tested without a real render pipeline.
+/// Returns the selection from the first to the last page in `pages_with_text`.
+///
+/// Each entry is a `(page_index, char_count)` pair for a page with text. Returns `None` if no
+/// page has text.
 fn select_all_range(pages_with_text: &[(usize, usize)]) -> Option<TextSelection> {
     let mut sorted = pages_with_text.to_vec();
     sorted.sort_unstable_by_key(|(page_index, _)| *page_index);
@@ -386,12 +376,9 @@ fn select_all_range(pages_with_text: &[(usize, usize)]) -> Option<TextSelection>
     })
 }
 
-/// Tracks which outline/bookmark tree nodes the user has explicitly expanded or collapsed,
-/// identified by their path of child indices from the root (e.g. `[1, 0]` is the first child
-/// of the second top-level chapter). Nodes with no entry here fall back to a default:
-/// top-level chapters expanded, anything deeper collapsed, so a freshly opened document's
-/// outline isn't a single collapsed list, but also isn't fully expanded for a deeply nested
-/// one.
+/// Container for explicitly expanded or collapsed outline nodes, keyed by child index path.
+///
+/// Nodes without an entry default to expanded at the top level and collapsed below.
 #[derive(Default)]
 struct OutlineExpansionState(HashSet<Vec<usize>>);
 
@@ -416,8 +403,7 @@ impl OutlineExpansionState {
         }
     }
 
-    /// A path is never a real child-index sequence once it ends in `usize::MAX`, so this
-    /// doubles as an explicit "collapsed" record without needing a second set alongside `0`.
+    /// Returns the path with a trailing `usize::MAX`, which records an explicit collapse.
     fn collapsed_marker(path: &[usize]) -> Vec<usize> {
         let mut marker = path.to_vec();
         marker.push(usize::MAX);
@@ -447,36 +433,25 @@ pub struct PdfView {
     pub on_page_click: Option<Arc<dyn Fn(usize, Point<f32>, &mut Window, &mut Context<Self>)>>,
     password_input: Entity<Editor>,
     password_task: Option<Task<()>>,
-    /// The in-flight `select_all` extraction task, if any. Stored rather than `.detach()`ed
-    /// so tests can retrieve and await it directly, matching `password_task`/
-    /// `clear_jump_task`'s pattern for other spawned tasks that mutate `self` on completion.
+    /// In-flight `select_all` extraction, stored so tests can await it.
     select_all_task: Option<Task<()>>,
-    /// The current text selection, if any. Click-drag selection is limited to pages that
-    /// have already been rendered (`text_spans` is only populated as a side effect of
-    /// `process_page`'s full render, and drag hit-testing needs a rendered page's on-screen
-    /// bounds anyway), dragging into a not-yet-rendered page just doesn't extend there.
-    /// `select_all` isn't subject to that limit: it requests every page's text via the
-    /// separate, non-rasterizing `Pdf::request_text_spans` path instead, see its doc
-    /// comment.
+    /// Current text selection.
+    ///
+    /// Drag selection only reaches rendered pages, while `select_all` extracts text for every
+    /// page.
     text_selection: Option<TextSelection>,
-    /// A plain (single-click, not double/triple) mouse-down's anchor, held here instead of
-    /// in `text_selection` until the drag actually moves to a different character. Chrome/
-    /// Edge only ever show a selection after a real drag or a double/triple-click, so eagerly
-    /// putting the 1-character click position into `text_selection` (then clearing it on
-    /// mouse-up if nothing moved) made an unwanted selection flash on screen for one frame
-    /// before disappearing, rather than never appearing at all.
+    /// Anchor of a single-click mouse-down, held until the drag reaches another character.
+    ///
+    /// Keeps a one-character selection from flashing on a plain click.
     pending_click_anchor: Option<TextPosition>,
     is_selecting_text: bool,
     show_outline: bool,
     outline_expanded: OutlineExpansionState,
     show_thumbnails: bool,
-    /// Set by `restore_view_state` when reopening a previously-serialized PdfView, to stop
-    /// the first `prepaint` pass from overwriting the restored zoom with its usual
-    /// fit-to-view-on-first-layout default.
+    /// Keeps the first `prepaint` from overwriting a restored zoom with fit-to-view.
     suppress_initial_fit_to_view: bool,
     view_mode: ViewMode,
-    /// View-only page rotation (see `PageRotation`'s doc comment). A per-session display
-    /// setting, not persisted and never written back to the file.
+    /// View-only page rotation, not persisted.
     rotation: PageRotation,
 }
 
@@ -531,7 +506,7 @@ impl PdfView {
         })
     }
 
-    /// Helper to grab the current PDF regardless of its source
+    /// Returns the current PDF regardless of its source.
     pub fn pdf(&self, cx: &App) -> Arc<Pdf> {
         match &self.source {
             PdfSource::Item(item) => item.read(cx).pdf.clone(),
@@ -539,7 +514,7 @@ impl PdfView {
         }
     }
 
-    /// Create a PdfView from an already loaded Pdf
+    /// Creates a view for an already loaded PDF.
     pub fn from_pdf(pdf: Arc<Pdf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             source: PdfSource::Memory(pdf),
@@ -575,7 +550,7 @@ impl PdfView {
         }
     }
 
-    /// Update the underlying pdf
+    /// Replaces the underlying PDF.
     pub fn update_pdf(&mut self, pdf: Arc<Pdf>, cx: &mut Context<Self>) {
         if let PdfSource::Memory(_) = &self.source {
             self.stale_pdf = Some(self.pdf(cx));
@@ -673,16 +648,9 @@ impl PdfView {
         }
     }
 
-    /// Selects all text on currently-rendered pages. Selection (see `text_selection`'s doc
-    /// comment) is already scoped to pages that have actually been rasterized/text-extracted,
-    /// not the whole document sight-unseen. "Select all" inherits that same scope rather than
-    /// forcing every page in a large, mostly-unrendered document to render just to be selected.
-    /// Chrome/Edge's PDF viewer can select-all across an entire document instantly because
-    /// PDFium text extraction is decoupled from rasterizing a bitmap: extraction is cheap
-    /// (just walking already-parsed page objects), rendering is the expensive part. Request
-    /// every page's text the same way (`Pdf::request_text_spans` /
-    /// `PdfRenderer::extract_text_only`, no bitmap involved) rather than limiting Select All
-    /// to whatever already happens to be on screen.
+    /// Selects all text in the document.
+    ///
+    /// Extracts the text of every page without rasterizing, so unrendered pages are included.
     fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
         let pdf = self.pdf(cx);
         let page_count = pdf.metadata.page_count;
@@ -691,14 +659,8 @@ impl PdfView {
         }
 
         self.select_all_task = Some(cx.spawn(async move |this, cx| {
-            // One page at a time, not all of them at once: every extraction (like every
-            // render) goes through the same single PDFium instance behind one async mutex
-            // (see `get_pdfium`), and firing page_count requests concurrently would queue that
-            // many waiters on it in one burst, which can starve the currently-visible page's
-            // own (higher-priority) render behind a long line of this low-priority work on a
-            // large document, making the whole viewer look stuck on "Loading...". Awaiting
-            // sequentially keeps at most one extra waiter ahead of any render request that
-            // comes in while this runs.
+            // extract one page at a time, since concurrent requests would queue ahead of the
+            // visible page render on the single PDFium mutex.
             for page_index in 0..page_count {
                 let task = cx.update(|cx| pdf.clone().request_text_spans(cx, page_index));
                 task.await;
@@ -753,9 +715,7 @@ impl PdfView {
             ViewMode::Continuous => ViewMode::SinglePage,
             ViewMode::SinglePage => ViewMode::Continuous,
         };
-        // Re-snap to the top of the current page either way: entering single-page mode
-        // shouldn't leave the view mid-scroll through a page that's no longer rendered, and
-        // leaving it re-aligns continuous scroll now that neighboring pages are back.
+        // re-snap to the page top so the view is not left mid-scroll in either mode.
         self.jump_to_page(self.current_page, cx);
     }
 
@@ -766,15 +726,10 @@ impl PdfView {
         cx: &mut Context<Self>,
     ) {
         self.rotation = self.rotation.rotated_clockwise();
-        // Text selection, search-highlight boxes, and link click-through hit-testing are
-        // computed in the page's own (unrotated) coordinate space and aren't rotation-aware
-        // yet (see PdfContentElement::paint), so clear any in-progress selection rather than
-        // leave one anchored to coordinates that no longer line up with what's on screen.
+        // selection, search highlights, and links are not rotation-aware yet.
         self.text_selection = None;
         self.is_selecting_text = false;
-        // A quarter-turn swaps this page's on-screen width/height, so re-snap the scroll
-        // position the same way toggling single-page view does, rather than leaving the
-        // viewport wherever the old (now wrong-shaped) layout happened to have it.
+        // a quarter turn swaps the page dimensions, so re-snap the scroll position.
         self.jump_to_page(self.current_page, cx);
         cx.notify();
     }
@@ -813,8 +768,7 @@ impl PdfView {
         let pdf = self.pdf(cx);
         let is_current = page_idx == self.current_page;
 
-        // Kick off (or reuse an in-flight/already-cached) thumbnail render; once it lands,
-        // on_rendered just asks for a re-render so this row picks up the freshly cached image.
+        // start or reuse a thumbnail render; `on_rendered` re-renders this row.
         let view_weak = cx.entity().downgrade();
         if let Some(task) = pdf.clone().request_thumbnail(cx, page_idx, move |cx| {
             if let Some(view) = view_weak.upgrade() {
@@ -1041,9 +995,7 @@ impl PdfView {
         let scale_x = container_width / page_size.width;
         let scale_y = container_height / page_size.height;
         let zoom = scale_x.min(scale_y).min(1.0);
-        // Degenerate container/page bounds (e.g. pane not yet sized, or a
-        // corrupt page with zero width/height) can produce 0/NaN/inf here;
-        // fall back to a sane default rather than propagating that further.
+        // unsized panes and zero-sized pages produce 0, NaN, or infinity here.
         if zoom.is_finite() && zoom > 0.0 {
             zoom.clamp(MIN_ZOOM, MAX_ZOOM)
         } else {
@@ -1072,7 +1024,7 @@ impl PdfView {
         let old_zoom = self.zoom_level;
 
         if (new_zoom - old_zoom).abs() > 0.001 {
-            // Use read() to guarantee we don't skip the cache update if a background task is inserting
+            // `read` ensures the cache update is not skipped while a background task inserts.
             let pdf = self.pdf(cx);
             let cache = pdf.page_cache.read();
             for (k, v) in cache.iter() {
@@ -1121,7 +1073,7 @@ impl PdfView {
             return;
         }
 
-        // Calculate dynamic base offset due to margin centering
+        // the base offset changes with margin centering.
         let viewport_width = self
             .container_bounds
             .map(|b| b.size.width)
@@ -1132,11 +1084,11 @@ impl PdfView {
         let old_base_offset_x = (viewport_width - old_max_width).max(px(0.0)) / 2.0;
         let new_base_offset_x = (viewport_width - new_max_width).max(px(0.0)) / 2.0;
 
-        // Calculate exact horizontal document position relative to the document's true origin
+        // horizontal document position relative to the document origin.
         let doc_x = -offset.x + center_x - old_base_offset_x;
         offset.x = -((doc_x * zoom_ratio) + new_base_offset_x - center_x);
 
-        // Calculate exact vertical document position considering unscaled gaps
+        // vertical document position including unscaled gaps.
         let doc_y = -offset.y + center_y;
 
         let gap = px(PAGE_GAP);
@@ -1167,11 +1119,9 @@ impl PdfView {
         cx.notify();
     }
 
-    /// Applies a previously-saved zoom level and page, e.g. right after reopening a PdfView
-    /// that was serialized on a prior session (see `SerializableItem::deserialize`). Must be
-    /// called before the view's first `prepaint` for `suppress_initial_fit_to_view` to have
-    /// any effect. After that pass, the fit-to-view default it suppresses never runs again
-    /// regardless.
+    /// Applies a saved zoom level and page, such as after deserialization.
+    ///
+    /// Must be called before the first `prepaint` to suppress the initial fit-to-view.
     pub fn restore_view_state(
         &mut self,
         zoom_level: f32,
@@ -1183,7 +1133,7 @@ impl PdfView {
         self.jump_to_page(page_index, cx);
     }
 
-    /// Jump to the beginning of a page
+    /// Scrolls to the top of a page.
     pub fn jump_to_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
         self.jump_to_target(
             PdfTarget {
@@ -1197,7 +1147,7 @@ impl PdfView {
         );
     }
 
-    /// Jump to a point of a page, center if if center=true
+    /// Scrolls to a point on a page, positioned according to `mode`.
     pub fn jump_to_target(&mut self, target: PdfTarget, mode: ScrollMode, cx: &mut Context<Self>) {
         use ScrollMode::*;
 
@@ -1210,17 +1160,17 @@ impl PdfView {
         let mut total_y_offset = 0.0;
         let zoom = self.zoom_level;
 
-        // sum the heights and gaps of all pages BEFORE the target page
+        // sum the heights and gaps of all pages before the target page.
         for i in 0..target.page_index {
             let size = pdf.get_page_size(i).unwrap();
             total_y_offset += size.height * zoom + PAGE_GAP;
         }
 
-        // add the final page offset
+        // add the offset within the target page.
         total_y_offset += target.point.y * zoom;
         let x_offset = target.point.x * zoom;
 
-        // apply the scroll offset, must be negative
+        // scroll offsets are negative.
         let mut scroll_y = total_y_offset;
         let mut scroll_x = x_offset;
 
@@ -1398,9 +1348,7 @@ impl Element for PdfContentElement {
             return None;
         }
 
-        // A page's own on-screen box swaps width/height under a quarter-turn rotation, so
-        // the rendered (already-rotated, see PdfRenderer::process_page) image still fills it
-        // correctly instead of looking squashed or letterboxed.
+        // a quarter turn swaps the on-screen page box so the rotated image fills it.
         let display_page_size = |size: Size<f32>| {
             if rotation.swaps_dimensions() {
                 Size {
@@ -1412,8 +1360,7 @@ impl Element for PdfContentElement {
             }
         };
 
-        // A restored zoom (see PdfView::restore_view_state) takes priority over the usual
-        // fit-to-view-on-first-layout default.
+        // a restored zoom takes priority over the initial fit-to-view.
         let initial_zoom_level = (first_layout && !suppress_initial_fit_to_view).then(|| {
             PdfView::compute_fit_to_view_zoom(
                 bounds,
@@ -1423,14 +1370,8 @@ impl Element for PdfContentElement {
 
         let zoom_level = initial_zoom_level.unwrap_or(current_zoom_level);
 
-        // GPUI's Pixels are logical/device-independent. Rasterizing at exactly `zoom_level`
-        // px-per-point leaves the bitmap under-resolved on a HiDPI display, where the
-        // compositor scales that same logical-pixel box up to more physical pixels than the
-        // source image actually has, producing a blurry upscale. `PageData::scale` records
-        // whatever was actually requested (see `request_page`'s call below), so every other
-        // comparison against a page's cached scale in this function must use this same value,
-        // not the bare `zoom_level`, otherwise a page rendered at `render_scale` never
-        // matches an `== zoom_level` check and looks permanently uncached.
+        // rasterize at physical pixel density to stay sharp on HiDPI displays. Every comparison
+        // against a cached `PageData::scale` must use this value, or pages never match.
         let render_scale = zoom_level * window.scale_factor();
 
         let gap = px(PAGE_GAP);
@@ -1463,7 +1404,7 @@ impl Element for PdfContentElement {
             let visible_end = viewport_bottom.min(page_bottom);
             let visible_height = (visible_end - visible_start).max(px(0.0));
 
-            // If even 1 pixel is visible, add it to our visible bounds
+            // any visible pixel counts.
             if visible_height > px(0.0) {
                 if first_visible.is_none() {
                     first_visible = Some(page_idx);
@@ -1471,7 +1412,7 @@ impl Element for PdfContentElement {
                 last_visible = Some(page_idx);
             }
 
-            // Keep tracking best_page for the UI sidebar/breadcrumbs
+            // track the most visible page for the sidebar.
             if visible_height > max_visible_height {
                 max_visible_height = visible_height;
                 best_page = page_idx;
@@ -1483,10 +1424,8 @@ impl Element for PdfContentElement {
         let first_visible = first_visible.unwrap_or(best_page);
         let last_visible = last_visible.unwrap_or(best_page);
 
-        // Single-page mode ignores the scroll-derived visible range above and pins it to
-        // current_page. Navigation (NextPage/PreviousPage, outline/thumbnail clicks) already
-        // routes through jump_to_page, which keeps the scroll offset aligned with that page,
-        // so this is consistent with (not fighting) the geometry those computed from.
+        // single-page mode pins the visible range to `current_page`, which `jump_to_page` keeps
+        // aligned with the scroll offset.
         let (first_visible, last_visible) = if view_mode == ViewMode::SinglePage {
             (current_page, current_page)
         } else {
@@ -1522,8 +1461,7 @@ impl Element for PdfContentElement {
                 .retain(|&page_idx, _| page_idx >= start_prerender && page_idx <= end_prerender);
         });
 
-        // Evict rendered bitmaps for pages that have scrolled far outside the
-        // prerender window so the cache doesn't grow unbounded over a long scroll.
+        // evict bitmaps of pages far outside the prerender window.
         pdf.page_cache
             .write()
             .retain(|&page_idx, _| page_idx >= start_prerender && page_idx <= end_prerender);
@@ -1531,10 +1469,8 @@ impl Element for PdfContentElement {
             .lock()
             .retain(|&page_idx, _| page_idx >= start_prerender && page_idx <= end_prerender);
 
-        // Visible pages render at `High` priority, prerender-window pages at `Low`, so a
-        // fast scroll's newly-visible pages don't sit queued behind still-in-flight
-        // prefetch work for pages the user hasn't scrolled to yet, mirroring how Chromium
-        // prioritizes visible-viewport tiles over prefetch.
+        // visible pages render at high priority and prerender pages at low priority, so newly
+        // visible pages are not stuck behind prefetch work.
         let mut render_queue = Vec::new();
 
         for p in first_visible..=last_visible {
@@ -1555,11 +1491,8 @@ impl Element for PdfContentElement {
             let pdf = pdf.clone();
             let pdf_view_weak = self.pdf_view.downgrade();
 
-            // Page-point-space Y this page cares about most: the overall viewport's
-            // vertical center, clamped into this page's own bounds. Only affects pages too
-            // tall to render whole at this scale (see MAX_RENDER_HEIGHT); clamping means
-            // even an off-screen prerender page picks the edge closest to the viewport
-            // rather than always defaulting to its top.
+            // the viewport center clamped into this page selects the strip for tall pages, so
+            // off-screen pages render the edge closest to the viewport.
             let page_top = page_tops[page_idx];
             let page_height = page_dimensions[page_idx].1;
             let clamped_center = ((viewport_top + viewport_bottom) / 2.0)
@@ -1596,7 +1529,7 @@ impl Element for PdfContentElement {
             }
         });
 
-        // Center the pages safely without clipping the scroll axis
+        // center the pages without clipping the scroll axis.
         let max_width = page_dimensions
             .iter()
             .map(|(w, _)| w.into())
@@ -1611,9 +1544,7 @@ impl Element for PdfContentElement {
         let mut current_render_top = px(0.0);
 
         let text_selection = self.pdf_view.read(cx).text_selection.clone();
-        // Screen bounds + text spans per page, captured for the outer container's
-        // mouse-move/mouse-up handlers below to turn a window-space drag point into a
-        // (page_index, char_index) TextPosition without redoing the whole layout pass.
+        // page bounds and text spans for the drag handlers of the outer container.
         let mut selection_hit_regions: Vec<SelectionHitRegion> = Vec::new();
 
         for (page_idx, &(width, height)) in page_dimensions.iter().enumerate() {
@@ -1629,7 +1560,7 @@ impl Element for PdfContentElement {
                 },
                 size: Size { width, height },
             };
-            // 1. Fetch page data, BUT filter it so we don't accidentally accept the old resolution as "new"!
+            // exclude renders at an older resolution.
             let page_data = pdf
                 .page_cache
                 .read()
@@ -1654,11 +1585,8 @@ impl Element for PdfContentElement {
             let zoom = zoom_level;
 
             let active_data = page_data.as_ref().or(stale_data.as_ref());
-            // Text selection, link hit-testing, and search highlighting below are all
-            // computed in the page's own (unrotated) coordinate space. Under a rotation
-            // they'd land in the wrong place relative to what's actually on screen, so
-            // they're disabled entirely while rotated rather than shown misaligned. See
-            // FEATURE_ROADMAP.md's rotate-page entry.
+            // selection, links, and search highlights use unrotated page coordinates, so they are
+            // disabled while rotated.
             let interactive_layers_supported = rotation == PageRotation::None;
             if interactive_layers_supported && let Some(data) = active_data {
                 selection_hit_regions.push((page_idx, global_page_bounds, data.text_spans.clone()));
@@ -1704,12 +1632,8 @@ impl Element for PdfContentElement {
                     let Some(char_index) = nearest_char_index(text_spans, local) else {
                         return;
                     };
-                    // Double-click selects the word under the cursor, triple-click the whole
-                    // line; anything beyond that (quadruple-click, etc.) just repeats the
-                    // triple-click behavior rather than needing a paragraph/document notion.
-                    // A plain (click_count 1) click doesn't select anything yet, see
-                    // `pending_click_anchor`'s doc comment; it only records where a
-                    // subsequent drag, if any, should start from.
+                    // double-click selects a word and triple-click or more a line. A single click
+                    // only records the anchor of a potential drag.
                     if let Some(view) = view_weak_for_selection.upgrade() {
                         view.update(cx, |this, cx| {
                             if e.click_count == 1 {
@@ -1742,16 +1666,12 @@ impl Element for PdfContentElement {
                     }
                 });
 
-            // 2. Stack the images instead of mutually exclusive if/else!
+            // stack stale and new images.
             let mut image_container = div().size_full().relative();
             let mut need_cache_page = false;
 
-            // Layer 1: Always put the stale data on the bottom layer to prevent a blank frame
-            //
-            // An oversized page's PageData only covers a vertical strip of it (see
-            // MAX_RENDER_HEIGHT in pdf_renderer.rs), positioned by page_offset_pt /
-            // covered_height_pt rather than filling the whole page box. For an ordinary
-            // page these just work out to 0 and the full page height, matching size_full().
+            // stale data goes on the bottom layer to avoid a blank frame. Strip renders are
+            // positioned by `page_offset_pt` and `covered_height_pt`.
             if let Some(old_data) = &stale_data {
                 if do_log {
                     log::info!("Drawn stale for page {:?}", page_idx);
@@ -1770,7 +1690,7 @@ impl Element for PdfContentElement {
                 need_cache_page = true;
             }
 
-            // Layer 2: Put the new data on top, but only if it's actually different from the stale data
+            // new data goes on top when it differs from the stale data.
             if let Some(new_data) = &page_data {
                 let is_same = stale_data
                     .as_ref()
@@ -1798,7 +1718,7 @@ impl Element for PdfContentElement {
                 need_cache_page = false;
             }
 
-            // Fallback: If neither are ready, show loading
+            // show a loading state while neither is ready.
             if page_data.is_none() && stale_data.is_none() {
                 image_container = image_container.child(
                     div()
@@ -1816,7 +1736,6 @@ impl Element for PdfContentElement {
             child_element = child_element.child(image_container);
             need_cache = need_cache || need_cache_page;
 
-            // Text selection highlight
             if let Some(selection) = &text_selection
                 && let Some(data) = active_data
                 && let Some(range) =
@@ -1841,7 +1760,6 @@ impl Element for PdfContentElement {
                 child_element = child_element.child(selection_layer);
             }
 
-            // Interactive Links
             if interactive_layers_supported && let Some(data) = active_data {
                 let mut link_layer = div().absolute().top_0().left_0().size_full();
 
@@ -1892,7 +1810,6 @@ impl Element for PdfContentElement {
                 child_element = child_element.child(link_layer);
             }
 
-            // Render Search Highlights
             if interactive_layers_supported && !search_matches.is_empty() {
                 let mut highlight_layer = div().absolute().top_0().left_0().size_full();
 
@@ -1935,41 +1852,28 @@ impl Element for PdfContentElement {
                 child_element = child_element.child(highlight_layer);
             }
 
-            // Render Active Jump Highlight
             if let Some((anchor, jump)) = &active_jump
                 && jump.page_index == page_idx
             {
                 use ScrollAnchor::*;
 
-                // A fixed 20pt guess when the jump source has no real font-size info to
-                // derive this from (bookmarks, links, search matches), see PdfTarget's doc
-                // comment. Typst preview jumps carry the paragraph's actual font size instead,
-                // so the bar's height tracks the document's real text size rather than always
-                // over/undershooting it by some fixed amount.
+                // fall back to 20pt for jump sources without font size information.
                 let line_height = px(jump.line_height.unwrap_or(20.0) * zoom_level);
                 let y = px(jump.point.y * zoom_level);
 
-                // Typst jump.point.y targets the text baseline. Shift up by `line_height` so
-                // the bar sits above the baseline.
+                // Typst jumps target the baseline, so shift the bar up by one line.
                 let top = match anchor {
                     Top => y,
                     Baseline => y - line_height + px(4.0 * zoom_level),
                 };
-                // block_bottom_y (see PdfTarget's doc comment) is the baseline of the last
-                // line covered by the same source block/span jump.point's first line came
-                // from. Extend the bar down to cover all of it, not just the first line's
-                // height, so it doesn't look stuck on the block's first line regardless of
-                // where in the block the cursor actually is. Falls back to jump.point.y (a
-                // zero-height extension, i.e. just line_height) for jump sources with no
-                // block notion: bookmarks, links, search matches.
+                // extend the bar to `block_bottom_y`, the baseline of the last line of the
+                // source block. Sources without a block fall back to a single line.
                 let block_extent =
                     px((jump.block_bottom_y.unwrap_or(jump.point.y) - jump.point.y) * zoom_level);
                 let h = line_height + block_extent;
 
-                // Matches the Markdown preview's own current-position gutter marker (see
-                // `push_root_block`/`pop_root_block` in the markdown crate): a subtle
-                // `border`-colored bar with small rounded corners, not an accent color with a
-                // drop shadow: a quieter indicator that doesn't compete with the page itself.
+                // a subtle border-colored bar matching the position marker of the Markdown
+                // preview.
                 child_element = child_element.child(
                     div()
                         .absolute()
@@ -1995,7 +1899,6 @@ impl Element for PdfContentElement {
                 .size_full()
                 .flex()
                 .flex_col()
-                // .items_center()
                 .gap(gap)
                 .overflow_scroll()
                 .track_scroll(&scroll_handle)
@@ -2025,8 +1928,7 @@ impl Element for PdfContentElement {
                             } else if let Some(anchor) = this.pending_click_anchor
                                 && position != anchor
                             {
-                                // The drag has actually moved off the click's starting
-                                // character; only now does a selection become visible.
+                                // the drag left the starting character, so show the selection.
                                 this.text_selection = Some(TextSelection {
                                     anchor,
                                     head: position,
@@ -2595,15 +2497,9 @@ impl SearchableItem for PdfView {
             let pdf = self.pdf(cx);
             let page_idx = m.page_index;
 
-            // Fire and forget: request_page's own logic already prevents
-            // duplicate rendering if it's already cached or in-flight! Low priority: these
-            // are adjacent search matches, not necessarily the currently visible page. We do
-            // know roughly where on the page the match itself is, though, so use that as the
-            // strip center rather than defaulting to the top.
+            // `request_page` skips cached and in-flight pages. Center the strip on the match.
             let visible_center_y = m.bounds.first().map_or(0.0, |b| b.origin.y);
-            // Same HiDPI scaling as the main prerender loop in `prepaint`, otherwise a
-            // prefetched adjacent-match page would cache at a blurrier resolution than the
-            // one the main loop would request for it once it actually scrolls into view.
+            // same HiDPI scale as `prepaint`, so prefetched pages are not blurrier.
             let render_scale = self.zoom_level * window.scale_factor();
             if let Some(task) = pdf.request_page(
                 cx,
@@ -2657,8 +2553,7 @@ impl SearchableItem for PdfView {
         }
 
         cx.spawn(async move |this, cx| {
-            // Debounce: Wait 300ms before starting the heavy FFI search task.
-            // If the user types another letter, Zed drops this Task, and the timer cancels.
+            // debounce the expensive search; typing again drops this task.
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
 
             let search_string_bg = search_string.to_string();
@@ -2703,7 +2598,7 @@ impl SearchableItem for PdfView {
             return Some(active);
         }
 
-        // If no match is currently active, find the closest one to the current viewport
+        // without an active match, pick the one closest to the viewport.
         match direction {
             Direction::Next => matches
                 .iter()
@@ -3073,10 +2968,8 @@ mod persistence {
     db::static_connection!(PdfViewerDb, [WorkspaceDb]);
 
     impl PdfViewerDb {
-        // Saves the path together with the last-known view state (zoom/page) in one
-        // INSERT OR REPLACE, rather than as two separate queries. REPLACE deletes and
-        // reinserts the row, so a second query that only updated some columns would have its
-        // values wiped out by a later call to this one.
+        // store the path and view state in one statement, since `INSERT OR REPLACE` would wipe
+        // columns written by a separate query.
         query! {
             pub async fn save_pdf_view_state(
                 item_id: ItemId,
@@ -3099,7 +2992,7 @@ mod persistence {
             }
         }
 
-        // Returns (zoom_level, current_page), if they were ever saved for this item.
+        // returns `(zoom_level, current_page)` if saved.
         query! {
             pub fn get_pdf_view_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(f64, i64)>> {
                 SELECT zoom_level, current_page
@@ -3127,9 +3020,7 @@ mod tests {
         }
     }
 
-    /// Two lines of "Hello"/"World", five 10x10 chars each, left-to-right, top line at y=0,
-    /// second line at y=10, a small but representative fixture for the hit-testing/range/
-    /// highlight-grouping tests below.
+    // two lines, `Hello` and `World`, of 10x10 characters at y=0 and y=10.
     fn two_line_fixture() -> Vec<PdfTextSpan> {
         "Hello"
             .chars()
@@ -3148,17 +3039,17 @@ mod tests {
     fn nearest_char_index_finds_the_closest_span() {
         let spans = two_line_fixture();
 
-        // Dead center of the 'e' in "Hello" (index 1, bounds x:[10,20) y:[0,10)).
+        // center of `e` in `Hello`.
         assert_eq!(
             nearest_char_index(&spans, Point { x: 15.0, y: 5.0 }),
             Some(1)
         );
-        // Dead center of the 'o' in "World" (index 9, second line, last char).
+        // center of the last `o` in `World`.
         assert_eq!(
             nearest_char_index(&spans, Point { x: 45.0, y: 15.0 }),
             Some(9)
         );
-        // Far outside the page entirely, still resolves to *something* close, not None.
+        // points far outside the page still resolve.
         assert_eq!(
             nearest_char_index(
                 &spans,
@@ -3173,8 +3064,7 @@ mod tests {
         assert_eq!(nearest_char_index(&[], Point { x: 0.0, y: 0.0 }), None);
     }
 
-    /// One line, "Hi, Bob" (7 chars incl. the comma and both spaces), for word-boundary tests:
-    /// indices 0-1 "Hi" (word), 2 "," (punctuation), 3 " " (whitespace), 4-6 "Bob" (word).
+    // one line, `Hi, Bob`: a word, punctuation, whitespace, and another word.
     fn word_boundary_fixture() -> Vec<PdfTextSpan> {
         "Hi, Bob"
             .chars()
@@ -3187,14 +3077,14 @@ mod tests {
     fn word_range_at_stops_at_class_boundaries() {
         let spans = word_boundary_fixture();
 
-        // Anywhere inside "Hi" selects the whole word, not just the clicked char.
+        // any character of `Hi` selects the word.
         assert_eq!(word_range_at(&spans, 0), 0..2);
         assert_eq!(word_range_at(&spans, 1), 0..2);
-        // The comma is its own single-char "word", a distinct class from either neighbor.
+        // the comma forms its own run.
         assert_eq!(word_range_at(&spans, 2), 2..3);
-        // The space between "," and "Bob" is its own run too.
+        // the space forms its own run.
         assert_eq!(word_range_at(&spans, 3), 3..4);
-        // Anywhere inside "Bob" selects the whole word, including up to the last char.
+        // any character of `Bob` selects the word.
         assert_eq!(word_range_at(&spans, 4), 4..7);
         assert_eq!(word_range_at(&spans, 6), 4..7);
 
@@ -3205,10 +3095,10 @@ mod tests {
     fn line_range_at_stops_at_line_boundaries() {
         let spans = two_line_fixture();
 
-        // Anywhere inside "Hello" (first line, indices 0..5) selects the whole line.
+        // the first line.
         assert_eq!(line_range_at(&spans, 0), 0..5);
         assert_eq!(line_range_at(&spans, 4), 0..5);
-        // Anywhere inside "World" (second line, indices 5..10) selects that line instead.
+        // the second line.
         assert_eq!(line_range_at(&spans, 5), 5..10);
         assert_eq!(line_range_at(&spans, 9), 5..10);
 
@@ -3217,8 +3107,7 @@ mod tests {
 
     #[test]
     fn select_all_range_spans_first_to_last_page_regardless_of_input_order() {
-        // Deliberately out of order and with a gap (page 1 has no text yet); select-all
-        // should still bound on the lowest/highest page that actually has text.
+        // unordered pages with a gap still bound on the lowest and highest page with text.
         let pages_with_text = vec![(4, 3), (0, 10)];
 
         let selection = select_all_range(&pages_with_text).expect("pages have text");
@@ -3229,7 +3118,7 @@ mod tests {
                 char_index: 0,
             }
         );
-        // Last char index is span_count - 1 (inclusive), not span_count itself.
+        // the last character index is inclusive.
         assert_eq!(
             selection.head,
             TextPosition {
@@ -3257,23 +3146,21 @@ mod tests {
             },
         };
 
-        // Before the selection's first page: nothing selected.
+        // before the first page.
         assert_eq!(selected_char_range_for_page(&selection, 0, 10), None);
-        // First page: from char_index 3 to the end of that page's spans.
+        // first page, from the anchor to the end.
         assert_eq!(selected_char_range_for_page(&selection, 1, 10), Some(3..10));
-        // Middle page (fully within the selection, if there were one): everything.
-        // Last page: from the start up to and including char_index 1.
+        // last page, up to and including the head.
         assert_eq!(selected_char_range_for_page(&selection, 2, 10), Some(0..2));
-        // Past the selection's last page: nothing selected.
+        // after the last page.
         assert_eq!(selected_char_range_for_page(&selection, 3, 10), None);
-        // A page with no text at all: nothing selected, regardless of range.
+        // page without text.
         assert_eq!(selected_char_range_for_page(&selection, 1, 0), None);
     }
 
     #[test]
     fn selected_char_range_for_page_is_direction_independent() {
-        // Dragging bottom-to-top (head before anchor in document order) must select the same
-        // range as the equivalent top-to-bottom drag.
+        // a backward drag selects the same range as a forward drag.
         let forward = TextSelection {
             anchor: TextPosition {
                 page_index: 0,
@@ -3303,7 +3190,7 @@ mod tests {
     #[test]
     fn single_line_selection_stays_one_rect() {
         let spans = two_line_fixture();
-        // All of "Hello" (indices 0..5), one line, should collapse to one rect spanning it.
+        // one line collapses to one rectangle.
         let rects = selection_highlight_rects(&spans, 0..5);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].origin.x, 0.0);
@@ -3313,7 +3200,7 @@ mod tests {
     #[test]
     fn multi_line_selection_produces_one_rect_per_line() {
         let spans = two_line_fixture();
-        // "llo" (end of line 1) through "Wor" (start of line 2): two lines, two rects.
+        // two lines yield two rectangles.
         let rects = selection_highlight_rects(&spans, 2..8);
         assert_eq!(rects.len(), 2);
     }
@@ -3356,7 +3243,7 @@ mod tests {
             page0,
         )];
 
-        // Inside the page's bounds: hits normally.
+        // inside the page bounds.
         let inside = hit_test_selection_point(
             &regions,
             Point {
@@ -3373,8 +3260,7 @@ mod tests {
             })
         );
 
-        // Below the page entirely (e.g. dragged past the last page): still resolves via the
-        // nearest-region fallback instead of leaving the selection stuck.
+        // below the last page, via the nearest-region fallback.
         let below = hit_test_selection_point(
             &regions,
             Point {
@@ -3402,8 +3288,7 @@ mod tests {
     fn outline_nodes_default_expanded_at_the_top_level_only() {
         let state = OutlineExpansionState::default();
 
-        // Depth 0 (top-level chapters, one index in the path) default to expanded; anything
-        // deeper defaults to collapsed until the user opens it.
+        // top-level nodes default to expanded and deeper nodes to collapsed.
         assert!(state.is_expanded(&[0]));
         assert!(state.is_expanded(&[3]));
         assert!(!state.is_expanded(&[0, 0]));
@@ -3414,15 +3299,14 @@ mod tests {
     fn toggling_an_outline_node_flips_its_expanded_state_independent_of_its_default() {
         let mut state = OutlineExpansionState::default();
 
-        // Collapse a node that starts expanded by default (top-level).
+        // collapse a top-level node.
         assert!(state.is_expanded(&[0]));
         state.toggle(vec![0]);
         assert!(!state.is_expanded(&[0]));
         state.toggle(vec![0]);
         assert!(state.is_expanded(&[0]));
 
-        // Expand a node that starts collapsed by default (depth > 0), and confirm a sibling
-        // at the same depth is unaffected.
+        // expand a nested node without affecting its sibling.
         assert!(!state.is_expanded(&[0, 0]));
         assert!(!state.is_expanded(&[0, 1]));
         state.toggle(vec![0, 0]);
@@ -3439,17 +3323,14 @@ mod tests {
         });
     }
 
-    // PDFIUM_TEST_LOCK is only ever taken by test bodies themselves, never by production
-    // code or another task within the same test, so holding it across an await here can't
-    // deadlock; it's exactly the kind of case this lint can't distinguish from a real one.
+    // only test bodies take `PDFIUM_TEST_LOCK`, so holding it across an await cannot deadlock.
     #[allow(clippy::await_holding_lock)]
     #[gpui::test]
     async fn restore_view_state_sets_zoom_and_page_and_suppresses_auto_fit(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx);
-        // Pdf::from_bytes does real PDFium FFI work on a background task, not something
-        // gpui's deterministic test scheduler can drive itself.
+        // real PDFium work on a background task needs to block a thread.
         cx.executor().allow_parking();
         let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
             .lock()
@@ -3463,8 +3344,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             assert!(!view.suppress_initial_fit_to_view);
-            // Restoring a zoom well past MAX_ZOOM should still come out clamped, the same
-            // way any other zoom_level assignment does.
+            // restored zoom levels are clamped like any other.
             view.restore_view_state(MAX_ZOOM * 5.0, 0, cx);
 
             assert_eq!(view.zoom_level, MAX_ZOOM);
@@ -3519,10 +3399,7 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.rotation, PageRotation::None);
 
-            // Text selection, search highlighting, and link hit-testing aren't
-            // rotation-aware yet (see prepaint's interactive_layers_supported gate), so an
-            // in-progress selection must be dropped rather than left anchored to
-            // coordinates that no longer match what's on screen post-rotation.
+            // rotation must drop the selection, since it is not rotation-aware.
             view.text_selection = Some(TextSelection {
                 anchor: TextPosition {
                     page_index: 0,
@@ -3622,18 +3499,14 @@ mod tests {
 
         let (view, cx) =
             cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
-        // Give the fire-and-forget render task kicked off by the first prepaint time to
-        // actually rasterize page 0 (real PDFium FFI work on a background thread), then let
-        // its on_rendered callback's cx.notify() drive a second paint that picks the now-
-        // cached PageData up into `active_data`.
+        // let the background render finish and trigger a second paint with the cached page.
         cx.run_until_parked();
         cx.run_until_parked();
 
         let text_spans = pdf
             .text_spans_for_page(0)
             .expect("page 0 should have rendered with real text by now");
-        // A real multi-char word, not punctuation/whitespace, so word_range_at actually
-        // selects more than one character and a wrong-word regression has room to show up.
+        // a multi-character word, so selecting the wrong word is detectable.
         let (target_index, expected_range) = (0..text_spans.len())
             .map(|i| (i, word_range_at(&text_spans, i)))
             .find(|(i, range)| {
@@ -3719,10 +3592,7 @@ mod tests {
             .text_spans_for_page(0)
             .expect("page 0 should have rendered with real text by now");
 
-        // Collect every real word on the page ("TopWord", "MiddleWord", "BottomWord", see
-        // the fixture's generator), spanning from near the top of the page to near the
-        // bottom, so at least one of them is far from wherever the initial strip's center
-        // happens to land.
+        // words spread from top to bottom, so some lie far from the initial strip center.
         let mut words = Vec::new();
         let mut i = 0;
         while i < text_spans.len() {
@@ -3742,9 +3612,7 @@ mod tests {
             words.len()
         );
 
-        // A zoom level high enough (combined with this test window's HiDPI scale factor)
-        // that the page's rendered bitmap exceeds MAX_RENDER_HEIGHT and only a strip of it
-        // actually gets rasterized, the scenario under test.
+        // high enough zoom that only a strip of the page is rasterized.
         let zoom = 6.0_f32;
         view.update_in(cx, |view, _window, cx| {
             view.restore_view_state(zoom, 0, cx);
@@ -3773,12 +3641,7 @@ mod tests {
                 y: bounds.origin.y + bounds.size.height / 2.0,
             };
 
-            // Scroll so the target word is actually within the viewport before clicking it -
-            // a real user can't click something scrolled off-screen, and doing so here would
-            // just silently no-op (leaving whatever the previous iteration selected) rather
-            // than exercising the hit-test at all. This also forces `prepaint` to request a
-            // *different* strip of the page (centered on this word), which is the case that
-            // actually matters for this test.
+            // scroll the word into view before clicking, which also requests a new strip.
             let target_y_in_page = target_center.y * zoom;
             view.update_in(cx, |view, _window, cx| {
                 view.scroll_handle.set_offset(Point {
@@ -3881,10 +3744,7 @@ mod tests {
             words.len()
         );
 
-        // A zoom level high enough (with this test window's HiDPI scale factor) that a
-        // standard-width letter page hits *both* MAX_RENDER_WIDTH and MAX_RENDER_HEIGHT,
-        // forcing a capped-resolution, strip-rendered page, the most extreme real-world
-        // case, matching a user zooming a normal document in past 500%.
+        // high enough zoom to hit both `MAX_RENDER_WIDTH` and `MAX_RENDER_HEIGHT`.
         let zoom = 8.0_f32;
         view.update_in(cx, |view, _window, cx| {
             view.restore_view_state(zoom, 0, cx);
@@ -3911,8 +3771,7 @@ mod tests {
             "expected MAX_RENDER_HEIGHT to force a strip render too"
         );
 
-        // Every real word on the page, scattered across all ten lines, not just whatever
-        // happens to be near the initial strip's center.
+        // every word on the page, across all ten lines.
         for expected_range in &words {
             let bounds = text_spans[expected_range.start].bounds;
             let target_center = Point {
@@ -3920,10 +3779,7 @@ mod tests {
                 y: bounds.origin.y + bounds.size.height / 2.0,
             };
 
-            // Scroll both axes so the target word is actually within the viewport before
-            // clicking it. At extreme zoom the page is wider than the window too, not just
-            // taller, so a word past the right edge needs a horizontal pan just as much as a
-            // word further down needs a vertical scroll.
+            // pan both axes, since the page is wider and taller than the window.
             let target_x_in_page = target_center.x * zoom;
             let target_y_in_page = target_center.y * zoom;
             view.update_in(cx, |view, _window, cx| {
@@ -4044,9 +3900,7 @@ mod tests {
             }
         };
 
-        // A plain click (mouse down, then straight back up at the same point, click_count 1)
-        // must never populate `text_selection`, not even transiently, since that's what
-        // painted the one-frame "flicker" this test guards against.
+        // a plain click must never populate `text_selection`, not even transiently.
         let plain_click_point = click_point_for(&words[0]);
         cx.simulate_event(gpui::MouseDownEvent {
             position: plain_click_point,
@@ -4074,7 +3928,7 @@ mod tests {
             );
         });
 
-        // A real drag from one word to another must still produce a visible selection.
+        // a drag between words produces a visible selection.
         let drag_start = click_point_for(&words[0]);
         let drag_end = click_point_for(&words[1]);
         cx.simulate_event(gpui::MouseDownEvent {
@@ -4129,8 +3983,7 @@ mod tests {
         assert!(zoom.is_finite() && zoom > 0.0);
         assert!((MIN_ZOOM..=MAX_ZOOM).contains(&zoom));
 
-        // A pane that hasn't been sized yet (zero container bounds) would otherwise divide
-        // by zero and produce a zoom of 0; falls back to 1.0 instead.
+        // zero container bounds fall back to a zoom of 1.0.
         let zero_bounds = Bounds {
             origin: Point::default(),
             size: Size {
@@ -4141,8 +3994,7 @@ mod tests {
         let zoom = PdfView::compute_fit_to_view_zoom(zero_bounds, page_size);
         assert_eq!(zoom, 1.0);
 
-        // A corrupt page with zero-sized bounds would otherwise divide by zero the other way
-        // (an infinite or NaN scale factor).
+        // zero page bounds would yield an infinite or NaN scale.
         let zero_page = Size {
             width: 0.0,
             height: 0.0,

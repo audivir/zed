@@ -14,18 +14,15 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Hard ceiling on a single rendered page's pixel width, regardless of requested zoom.
-/// See the comment at its use site in `process_page` for why this exists.
+/// Maximum pixel width of a rendered page, regardless of zoom.
 const MAX_RENDER_WIDTH: f32 = 8192.0;
 
-/// Hard ceiling on a single rendered *bitmap's* pixel height. Unlike `MAX_RENDER_WIDTH`,
-/// this doesn't cap the page's effective resolution. When a page's full height at the
-/// requested scale would exceed this, `process_page` renders a vertical strip of that
-/// height around `visible_center_y` instead of downscaling the whole page.
+/// Maximum pixel height of a rendered bitmap.
+///
+/// Taller pages render a strip of this height around `visible_center_y` instead of downscaling.
 const MAX_RENDER_HEIGHT: f32 = 8192.0;
 
-/// A page's extracted interactive text layer and link annotations, as returned by
-/// `PdfRenderer::extract_text_and_links`.
+/// Text layer and link annotations of a page.
 type TextAndLinks = (Arc<Vec<PdfTextSpan>>, Arc<Vec<PdfLink>>);
 
 fn rect_to_bounds(rect: &PdfRect) -> Bounds<f32> {
@@ -41,7 +38,7 @@ fn rect_to_bounds(rect: &PdfRect) -> Bounds<f32> {
     }
 }
 
-/// Represents a localized piece of text on the page for the interactive text layer.
+/// Container for a positioned piece of text in the interactive text layer.
 #[derive(Debug, Clone)]
 pub struct PdfTextSpan {
     pub text: String,
@@ -52,18 +49,13 @@ pub struct PdfTextSpan {
 pub struct PdfTarget {
     pub page_index: usize,
     pub point: Point<f32>,
-    /// The page-point-space Y coordinate of the bottom of the "block" `point` belongs to, if
-    /// the caller knows one, e.g. the Typst preview's source-to-PDF sync uses this so the
-    /// active-jump highlight can cover a whole (possibly multi-line) source span instead of
-    /// just its first line. `None` for jump sources with no such notion (bookmarks, links,
-    /// search matches), where the highlight falls back to a single line's height around
-    /// `point` as before.
+    /// Page-space Y coordinate of the bottom of the block containing `point`.
+    ///
+    /// Lets the jump highlight cover a multi-line source span. `None` highlights a single line.
     pub block_bottom_y: Option<f32>,
-    /// The approximate height, in page points, of a single line of text at `point`. Used to
-    /// pad the active-jump highlight above/below the raw baseline-to-baseline range
-    /// (`point.y`..`block_bottom_y`) so it actually covers each line's glyphs instead of just
-    /// their baselines. `None` falls back to a fixed guess, for jump sources with no real
-    /// font-size information to derive this from.
+    /// Approximate height of one text line at `point`, in page points.
+    ///
+    /// Pads the jump highlight to cover glyphs rather than baselines. `None` uses a fixed guess.
     pub line_height: Option<f32>,
 }
 
@@ -79,9 +71,9 @@ pub struct PdfLink {
     pub action: PdfLinkAction,
 }
 
-/// A view-only, per-session rotation applied at render time. Never written back to the
-/// PDF's own `/Rotate` page attribute. Whole-document rather than per-page, matching
-/// Chrome/Edge's single rotate-clockwise toolbar action.
+/// View-only rotation for the whole document, applied at render time.
+///
+/// Never written back to the `/Rotate` attribute of the PDF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageRotation {
     #[default]
@@ -92,7 +84,7 @@ pub enum PageRotation {
 }
 
 impl PageRotation {
-    /// The next rotation state after clicking "rotate clockwise" once more.
+    /// Returns the rotation after one more clockwise quarter turn.
     pub fn rotated_clockwise(self) -> Self {
         match self {
             PageRotation::None => PageRotation::Clockwise90,
@@ -102,8 +94,7 @@ impl PageRotation {
         }
     }
 
-    /// Whether this rotation swaps a page's effective width/height for layout and rendering
-    /// (a quarter-turn), as opposed to a half-turn or no rotation.
+    /// Whether this rotation is a quarter turn that swaps page width and height.
     pub fn swaps_dimensions(self) -> bool {
         matches!(self, PageRotation::Clockwise90 | PageRotation::Clockwise270)
     }
@@ -145,8 +136,7 @@ pub struct DocumentMetadata {
     pub page_count: usize,
     pub max_width: f32,
     pub error: Option<String>,
-    /// Set when the document could not be opened because it is password-protected,
-    /// either because no password was supplied or the supplied one was incorrect.
+    /// Whether opening failed because a password is missing or wrong.
     pub needs_password: bool,
 }
 
@@ -179,52 +169,43 @@ impl DocumentMetadata {
     }
 }
 
-/// Extracted assets of a PDF page
+/// Container for the rendered image, text, and links of a PDF page.
 #[derive(Clone)]
 pub struct PageData {
     pub image: Arc<RenderImage>,
-    /// The scale this render was requested *for*. Compared against a future request's
-    /// scale to decide whether this cached render is still good enough. Can be higher than
-    /// `image_scale` when the page hit `MAX_RENDER_WIDTH`'s cap: rendering "again" at the
-    /// same nominal `scale` wouldn't produce a sharper image (the cap is what's limiting
-    /// it, not how many times it's been rendered), so treating the capped result as
-    /// satisfying that nominal scale avoids re-rendering it every frame for nothing.
+    /// Scale this render was requested for.
+    ///
+    /// Exceeds `image_scale` when capped by `MAX_RENDER_WIDTH`. Treating the capped render as
+    /// satisfying the requested scale avoids re-rendering it every frame.
     pub scale: f32,
-    /// The scale actually used to rasterize `image`, in pixels per page-point. Equal to
-    /// `scale` unless the page hit `MAX_RENDER_WIDTH`'s cap. Use this (not `scale`) to
-    /// convert `image`'s pixel dimensions back to page-point space.
+    /// Scale used to rasterize `image`, in pixels per page point.
+    ///
+    /// Use this rather than `scale` to convert pixel sizes back to page space.
     pub image_scale: f32,
-    /// Page-point-space Y offset where `image` starts. Zero for an ordinary whole-page
-    /// render; nonzero when the page was too tall to render whole at this scale (see
-    /// `MAX_RENDER_HEIGHT`) and `image` only covers a vertical strip of it, the strip
-    /// closest to whatever `visible_center_y` was requested at render time.
+    /// Page-space Y offset where `image` starts.
+    ///
+    /// Nonzero only for strips of pages taller than `MAX_RENDER_HEIGHT`.
     pub page_offset_pt: f32,
-    /// The rotation `image` was rasterized at. Compared against a future request's rotation
-    /// the same way `scale` is: a cached render at the wrong rotation isn't reusable, no
-    /// matter how good its resolution is.
+    /// Rotation `image` was rasterized at; renders at another rotation are not reusable.
     pub rotation: PageRotation,
     pub text_spans: Arc<Vec<PdfTextSpan>>,
     pub links: Arc<Vec<PdfLink>>,
 }
 
 impl PageData {
-    /// The page-point-space height `image` covers, derived from its pixel height and the
-    /// scale it was actually rendered at.
+    /// Page-space height covered by `image`.
     pub fn covered_height_pt(&self) -> f32 {
         self.image.size(0).height.0 as f32 / self.image_scale
     }
 
-    /// Whether `image` already covers page-point-space Y coordinate `y_pt`, i.e. whether a
-    /// caller interested in that point can reuse this render as-is rather than requesting a
-    /// new strip centered elsewhere. Always true for an unstripped (ordinary, whole-page)
-    /// render, since its covered range is the entire page.
+    /// Whether `image` covers the page-space Y coordinate `y_pt`.
     pub fn covers_page_y(&self, y_pt: f32) -> bool {
         y_pt >= self.page_offset_pt && y_pt <= self.page_offset_pt + self.covered_height_pt()
     }
 }
 
 impl std::fmt::Debug for PageData {
-    // `RenderImage` doesn't implement `Debug`, so this is written by hand rather than derived.
+    // `RenderImage` does not implement `Debug`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PageData")
             .field("scale", &self.scale)
@@ -236,39 +217,31 @@ impl std::fmt::Debug for PageData {
     }
 }
 
-/// Holds the process-lifetime PDFium binding together with a cache of already-opened
-/// documents, so that repeated page renders and searches against the same document don't
-/// each have to re-parse it from scratch. All access is serialized behind a single mutex
-/// because PDFium itself is not safe to call from multiple threads concurrently, even
-/// across unrelated documents.
+/// Container for the PDFium binding and a cache of opened documents.
+///
+/// A single mutex serializes all access, since PDFium is not thread-safe even across documents.
 struct PdfiumState {
     pdfium: &'static Pdfium,
-    /// Keyed by `Pdf::id` (a content hash), so opening the same document twice, even in
-    /// separate `Pdf` instances, shares a single parsed `PdfDocument`.
+    /// Documents keyed by `Pdf::id`, a content hash, so identical content shares one parse.
     documents: HashMap<u64, PdfDocument<'static>>,
 }
 
-/// Global PDFium instance to share across all GPUI background tasks
+/// Global PDFium instance shared by all background tasks.
 static PDFIUM: OnceCell<Mutex<PdfiumState>> = OnceCell::new();
 
-/// Document IDs that `evict_document` couldn't remove immediately because the `PDFIUM` mutex
-/// was held elsewhere. `Drop` can't await the async mutex, so that eviction is a best-effort
-/// `try_lock`; without this queue, losing that race means the entry, and the `PdfDocument` it
-/// holds, would stay cached for the rest of the process. Drained the next time anyone actually
-/// acquires the mutex (see `lock_pdfium_state`), so eviction is always eventually applied.
+/// Document IDs whose eviction lost the `try_lock` race against the `PDFIUM` mutex.
+///
+/// Drained by `lock_pdfium_state`, so every eviction eventually applies.
 static PENDING_EVICTIONS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
-/// Serializes every test in this crate that performs real PDFium FFI work (across `pdf.rs`,
-/// `pdf_renderer.rs`, and `pdf_viewer.rs`). Rust's test harness runs `#[test]`/`#[gpui::test]`
-/// functions concurrently on separate threads by default; without this, they all queue up on
-/// the single `PDFIUM` async mutex above at once, and a test can end up waiting long enough to
-/// trip gpui's 15-second "parking" timeout even though nothing is actually deadlocked. This
-/// lock has nothing to do with correctness of the production code. It's only about keeping the test
-/// suite's real (non-simulated) FFI work from contending with itself.
+/// Serializes tests in this crate that call into PDFium.
+///
+/// Concurrent tests otherwise queue on the `PDFIUM` mutex long enough to trip the 15-second
+/// parking timeout of gpui.
 #[cfg(test)]
 pub(crate) static PDFIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Automatically binds to system libpdfium.dylib / .so / .dll
+/// Binds to the system PDFium library.
 fn get_bindings() -> Result<Box<dyn PdfiumLibraryBindings>> {
     let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
         .or_else(|_| {
@@ -294,9 +267,7 @@ fn get_pdfium() -> Result<&'static Mutex<PdfiumState>> {
     PDFIUM.get_or_try_init(|| {
         let bindings = get_bindings()?;
 
-        // Leaked deliberately: PDFium has no shutdown story we hook into, and leaking here
-        // is what lets cached `PdfDocument`s (which borrow this reference) live for as long
-        // as they're needed instead of being tied to the lifetime of a `MutexGuard`.
+        // leaked so cached `PdfDocument`s, which borrow the binding, can outlive any guard.
         let pdfium: &'static Pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
 
         Ok(Mutex::new(PdfiumState {
@@ -306,10 +277,10 @@ fn get_pdfium() -> Result<&'static Mutex<PdfiumState>> {
     })
 }
 
-/// Returns the cached, already-parsed document for `id`, opening and inserting it on first
-/// access. Uses `load_pdf_from_byte_vec` (rather than `load_pdf_from_byte_slice`) so the
-/// returned `PdfDocument` only borrows the process-lifetime `Pdfium` binding, not `bytes` -
-/// letting it safely outlive the call that opened it and be reused by later renders/searches.
+/// Returns the cached document for `id`, opening it on first access.
+///
+/// `load_pdf_from_byte_vec` makes the document borrow only the process-lifetime binding, so it
+/// can be reused by later renders and searches.
 fn open_document<'s>(
     state: &'s mut PdfiumState,
     id: u64,
@@ -327,10 +298,10 @@ fn open_document<'s>(
     }
 }
 
-/// Evicts a document from the shared cache, e.g. once the last `Arc<Pdf>` referencing it is
-/// dropped. Uses `try_lock` rather than blocking, since `Drop` can't await the async mutex; if
-/// the mutex is contended, the id is queued in `PENDING_EVICTIONS` instead so it's still
-/// guaranteed to be evicted (see `lock_pdfium_state`) rather than left cached indefinitely.
+/// Evicts a document from the shared cache.
+///
+/// Uses `try_lock` since `Drop` cannot await; on contention, the ID is queued in
+/// `PENDING_EVICTIONS`.
 pub fn evict_document(id: u64) {
     if let Some(state_lock) = PDFIUM.get()
         && let Some(mut state) = state_lock.try_lock()
@@ -344,9 +315,9 @@ pub fn evict_document(id: u64) {
         .push(id);
 }
 
-/// Locks the shared `PdfiumState`, applying any evictions that `evict_document` queued while it
-/// couldn't acquire the lock itself. Every call site that needs the mutex should go through this
-/// rather than locking `PDFIUM` directly, so a document dropped mid-render doesn't leak forever.
+/// Locks the shared `PdfiumState` and applies queued evictions.
+///
+/// All access to `PDFIUM` must go through this, so documents dropped mid-render do not leak.
 async fn lock_pdfium_state() -> Result<futures::lock::MutexGuard<'static, PdfiumState>> {
     let mut state = get_pdfium()?.lock().await;
     let pending = std::mem::take(
@@ -375,7 +346,7 @@ impl PdfRenderer {
         }
     }
 
-    /// Extracts the dimensions of every page without rendering them.
+    /// Extracts the dimensions of every page without rendering.
     pub async fn get_metadata(
         &self,
         pages_max_width: Option<(Vec<PageMetadata>, f32)>,
@@ -407,7 +378,7 @@ impl PdfRenderer {
                 .iter()
                 .enumerate()
                 .map(|(i, page)| {
-                    // PDFium returns sizes in points (1/72 of an inch)
+                    // PDFium sizes are in points (1/72 inch).
                     let page_bounds = page
                         .boundaries()
                         .crop()
@@ -465,7 +436,7 @@ impl PdfRenderer {
         Ok(metadata)
     }
 
-    /// Recursive helper to parse a bookmark and all its children
+    /// Parses a bookmark and its children recursively.
     #[allow(clippy::only_used_in_recursion)]
     fn parse_bookmark(
         bookmark: &PdfBookmark,
@@ -475,12 +446,8 @@ impl PdfRenderer {
         let mut page_index = 0;
         let mut point = Point { x: 0.0, y: 0.0 };
 
-        // The target may be attached to the bookmark directly. For documents (often
-        // Acrobat-authored) that route every outline entry through an explicit action,
-        // it's wrapped in a `GoToDestinationInSameDocument` action instead. Same target,
-        // one extra level of indirection. Other action types (opening a different
-        // document, launching a file, etc.) aren't internal navigation and are left
-        // unresolved.
+        // the target is attached directly or wrapped in a `GoToDestinationInSameDocument`
+        // action, as Acrobat writes it. Other actions are not internal navigation.
         let action = bookmark.action();
         let destination = bookmark.destination().or_else(|| {
             action
@@ -492,13 +459,11 @@ impl PdfRenderer {
         if let Some(destination) = destination
             && let Some((idx, target_point)) = Self::resolve_destination_target(&destination, pages)
         {
-            // A corrupt or adversarial document can point at a page index that doesn't
-            // exist; fall back to the default (page 0, origin) rather than panicking.
+            // corrupt documents may reference missing pages; keep the page 0 default.
             page_index = idx;
             point = target_point;
         }
 
-        // Recursively parse children
         let mut children = Vec::new();
         for child in bookmark.iter_direct_children() {
             let child_chapter = Self::parse_bookmark(&child, document, pages);
@@ -530,7 +495,6 @@ impl PdfRenderer {
         }
     }
 
-    // Get point of a destination
     fn get_point(destination: &PdfDestination, page_bounds: &Bounds<f32>) -> Point<f32> {
         let bounds_left = page_bounds.origin.x;
         let bounds_top = page_bounds.origin.y;
@@ -539,11 +503,9 @@ impl PdfRenderer {
         let mut target_top = 0.0;
 
         if let Ok(view_settings) = destination.view_settings() {
-            // Import the enum variants to keep the match arms clean
             use pdfium_render::prelude::PdfDestinationViewSettings::*;
 
             match view_settings {
-                // Tuple variant: (Left, Top, Zoom)
                 SpecificCoordinatesAndZoom(left, top, _zoom) => {
                     if let Some(l) = left {
                         target_left = l.value - bounds_left;
@@ -552,24 +514,21 @@ impl PdfRenderer {
                         target_top = bounds_top - t.value;
                     }
                 }
-                // Tuple variant: (Top)
                 FitPageHorizontallyToWindow(top) | FitBoundsHorizontallyToWindow(top) => {
                     if let Some(t) = top {
                         target_top = bounds_top - t.value;
                     }
                 }
-                // Tuple variant: (Left)
                 FitPageVerticallyToWindow(left) | FitBoundsVerticallyToWindow(left) => {
                     if let Some(l) = left {
                         target_left = l.value - bounds_left;
                     }
                 }
-                // Tuple variant: (PdfRect)
                 FitPageToRectangle(rect) => {
                     target_left = rect.left().value - bounds_left;
                     target_top = bounds_top - rect.top().value;
                 }
-                // For anything else, retain our top-left defaults
+                // keep the top-left default.
                 FitPageToWindow | FitBoundsToWindow | Unknown => {}
             }
         }
@@ -580,11 +539,9 @@ impl PdfRenderer {
         }
     }
 
-    /// Resolves a `PdfDestination`'s target page index and its point within that page's
-    /// own coordinate space. Returns `None` if the destination points at a page that
-    /// doesn't actually exist in this document (a corrupt/adversarial document, or a
-    /// bookmark/link whose target page was later deleted), rather than panicking on an
-    /// out-of-bounds index.
+    /// Resolves the target page index of a destination and its point within that page.
+    ///
+    /// Returns `None` if the target page does not exist in this document.
     fn resolve_destination_target(
         destination: &PdfDestination,
         pages: &[PageMetadata],
@@ -619,9 +576,8 @@ impl PdfRenderer {
                 });
             }
 
-            // The destination may be attached to the link directly. For documents
-            // (often Acrobat-authored) that route every link through an explicit action,
-            // it's wrapped in a `GoToDestinationInSameDocument` action instead.
+            // the destination is attached directly or wrapped in a
+            // `GoToDestinationInSameDocument` action, as Acrobat writes it.
             let destination = link.destination().or_else(|| {
                 action
                     .as_ref()
@@ -648,19 +604,16 @@ impl PdfRenderer {
         None
     }
 
-    // Processes a specific page using PDFium
+    /// Renders a page and extracts its text and links.
     pub async fn process_page(
         &self,
         page_index: usize,
         scale: f32,
-        // Page-point-space Y coordinate the caller most wants rendered, e.g. the vertical
-        // center of what's currently visible. Only matters when the page needs to be
-        // rendered as a strip (see MAX_RENDER_HEIGHT below); ignored otherwise.
+        // page-space Y coordinate to center a strip on; ignored unless the page is rendered as a
+        // strip.
         visible_center_y: f32,
-        // View-only rotation, applied at render time only. Never touches the page's own
-        // `/Rotate` attribute. text_spans/links extracted below are unaffected by it (they
-        // stay in the page's natural coordinate space), which is why `prev_data` is reused
-        // for them regardless of what rotation it was rendered at.
+        // view-only rotation. Text and links stay in page space, so `prev_data` is reused for them
+        // at any rotation.
         rotation: PageRotation,
         prev_data: Option<PageData>,
         metadata: Arc<DocumentMetadata>,
@@ -682,28 +635,21 @@ impl PdfRenderer {
             .get(page_index as i32)
             .map_err(|e| anyhow!("Page out of bounds: {:?}", e))?;
 
-        // A quarter-turn swaps which of the page's own dimensions ends up as the rendered
-        // output's width vs. height; a half-turn or no rotation doesn't.
+        // a quarter turn swaps output width and height.
         let (source_width_pt, source_height_pt) = if rotation.swaps_dimensions() {
             (page.height().value, page.width().value)
         } else {
             (page.width().value, page.height().value)
         };
 
-        // Cap the rendered bitmap's width instead of ever asking pdfium for an arbitrarily
-        // large one at high zoom: a several-thousand-point-wide page at max zoom could
-        // otherwise ask for a multi-gigabyte allocation. Height following proportionally
-        // from this would still be uncapped for a narrow-but-very-tall page, so height is
-        // handled separately below.
+        // cap the width so extreme zoom cannot request a multi-gigabyte bitmap. Height is
+        // capped separately below.
         let target_width = ((source_width_pt * scale).round()).min(MAX_RENDER_WIDTH) as i32;
         let effective_scale = target_width as f32 / source_width_pt;
         let full_height_px = source_height_pt * effective_scale;
 
-        // Chromium's PDF viewer tiles oversized pages so only the tiles inside the current
-        // viewport are ever rendered/held. We render a single vertical strip instead of a
-        // full 2D tile grid: when the page is too tall to render whole at this scale, render
-        // just a MAX_RENDER_HEIGHT-tall strip around `visible_center_y`, positioned within
-        // the page by `page_offset_pt` (see PageData) rather than the whole page downscaled.
+        // render only a strip around `visible_center_y` for pages too tall to render whole, a
+        // one-dimensional version of the tiling in the Chromium PDF viewer.
         let (target_height, page_offset_pt) = if full_height_px > MAX_RENDER_HEIGHT {
             let strip_height_pt = MAX_RENDER_HEIGHT / effective_scale;
             let max_offset_pt = (source_height_pt - strip_height_pt).max(0.0);
@@ -717,12 +663,8 @@ impl PdfRenderer {
             .map_err(|e| anyhow!("Failed to allocate render target: {:?}", e))?;
 
         let render_config = PdfRenderConfig::new()
-            // Both width and height are set explicitly (rather than relying on
-            // set_target_width alone to infer an aspect-preserving height) so the output
-            // size reflects source_width_pt/source_height_pt, the *post-rotation* logical
-            // dimensions, rather than pdfium-render's own aspect-ratio inference, which
-            // only accounts for rotation via a separate maximum-width/height constraint path
-            // this crate doesn't use.
+            // set both dimensions explicitly so the output follows the rotated logical size rather
+            // than the aspect inference of pdfium-render.
             .set_target_width(target_width)
             .set_target_height((source_height_pt * effective_scale).round() as i32)
             .set_origin(0, -((page_offset_pt * effective_scale).round() as i32))
@@ -732,12 +674,8 @@ impl PdfRenderer {
         page.render_into_bitmap_with_config(&mut bitmap, &render_config)
             .map_err(|e| anyhow!("Render failed: {:?}", e))?;
 
-        // gpui's `RenderImage` expects BGRA bytes. `as_rgba_bytes()` normalizes whatever
-        // pixel format pdfium actually rendered (Gray/BGR/BGRA/BGRx all differ) into true
-        // RGBA; swapping R and B gets us the rest of the way to BGRA. This is still one
-        // lightweight in-memory pass instead of the BMP encode+decode round trip this used
-        // to go through (encode via `image::write_to`, then gpui's asset pipeline decoding
-        // the very bytes we just wrote right back into pixels).
+        // `as_rgba_bytes` normalizes every PDFium pixel format to RGBA; swapping red and blue
+        // yields the BGRA that `RenderImage` expects.
         let width = bitmap.width() as u32;
         let height = bitmap.height() as u32;
         let mut bgra_bytes = bitmap.as_rgba_bytes();
@@ -775,11 +713,7 @@ impl PdfRenderer {
         })
     }
 
-    /// Extracts a page's interactive text layer and link annotations, the "just walk what
-    /// PDFium already parsed" half of `process_page`, without any of its bitmap
-    /// rasterization. Shared by `process_page` (which needs both, once per page, alongside
-    /// the render) and `extract_text_only` (which needs just this, cheaply, for pages that
-    /// don't otherwise need to be rasterized at all, see its doc comment).
+    /// Extracts the text layer and link annotations of a page without rasterizing.
     fn extract_text_and_links(
         page: &PdfPage,
         page_index: usize,
@@ -791,7 +725,7 @@ impl PdfRenderer {
             .ok_or_else(|| anyhow!("Page metadata missing for page {}", page_index))?;
         let page_bounds = page_metadata.bounds;
 
-        // TODO: dont propagate error, but add error logging
+        // TODO: log errors instead of propagating them.
 
         let mut text_spans_vec = Vec::new();
         if let Ok(text_page) = page.text() {
@@ -806,7 +740,7 @@ impl PdfRenderer {
                 }
             }
         }
-        // TODO: add error logging
+        // TODO: log errors.
 
         let link_annotations = page
             .annotations()
@@ -828,11 +762,9 @@ impl PdfRenderer {
         Ok((Arc::new(text_spans_vec), Arc::new(links_vec)))
     }
 
-    /// Extracts `page_index`'s text layer without rasterizing a bitmap at all. Much cheaper
-    /// than `process_page`, which this crate's full-document operations (namely Select All)
-    /// need: reading every page's text shouldn't require rendering every page's image first,
-    /// the same way Chrome/Edge's own PDFium-based viewer decouples (cheap) text extraction
-    /// from (expensive) rasterization.
+    /// Extracts the text layer of `page_index` without rasterizing.
+    ///
+    /// Lets Select All read every page without rendering it.
     pub async fn extract_text_only(
         &self,
         page_index: usize,
@@ -857,7 +789,7 @@ impl PdfRenderer {
         Ok(text_spans)
     }
 
-    /// Search the document for a specific text string using PDFium
+    /// Searches the document for `query`.
     pub async fn search_document(
         &self,
         query: &str,
@@ -891,9 +823,6 @@ impl PdfRenderer {
                     let mut bounds_vec = Vec::new();
 
                     for segment in match_segments.iter() {
-                        // let rect = segment.bounds();
-                        // bounds_vec.push(Self::get_bounds(&rect, &page_bounds));
-
                         let mut min_left = f32::MAX;
                         let mut max_right = f32::MIN;
                         let mut min_bottom = f32::MAX;
@@ -945,9 +874,8 @@ impl PdfRenderer {
 }
 
 impl PdfChapter {
-    /// Recursively formats the chapter and its children into a readable string buffer.
+    /// Formats the chapter and its children as an indented tree.
     pub fn format_tree(&self, depth: usize, out: &mut String) {
-        // Create an indentation string (e.g., 0 spaces, 2 spaces, 4 spaces...)
         let indent = "  ".repeat(depth);
 
         let title = self.title.as_deref().unwrap_or("<Untitled>");
@@ -955,13 +883,11 @@ impl PdfChapter {
         let x = self.target.point.x;
         let y = self.target.point.y;
 
-        // Append the current chapter's info
         out.push_str(&format!(
             "{}- {} (Page: {}, x: {:.2}, y: {:.2})\n",
             indent, title, page, x, y
         ));
 
-        // Recursively format all children, increasing the depth by 1
         for child in &self.children {
             child.format_tree(depth + 1, out);
         }
@@ -969,7 +895,7 @@ impl PdfChapter {
 }
 
 impl DocumentMetadata {
-    /// Helper to print the entire bookmark tree to the console/logs
+    /// Logs the bookmark tree.
     pub fn debug_log_bookmarks(&self) {
         if self.chapters.is_empty() {
             log::info!("No bookmarks found in this PDF.");
@@ -978,11 +904,9 @@ impl DocumentMetadata {
         let mut output = String::from("\n--- PDF Bookmark Tree ---\n");
 
         for chapter in self.chapters.iter() {
-            // Start formatting from depth 0
             chapter.format_tree(0, &mut output);
         }
 
-        // Log the final built string
         log::info!("{}", output);
     }
 }
@@ -991,12 +915,8 @@ impl DocumentMetadata {
 mod tests {
     use super::*;
 
-    // All tests in this module load the same fixture, so they'd otherwise share one entry
-    // in the process-global `DOCUMENT_CACHE` (correct behavior in the app, where a document
-    // unlocked once stays unlocked, but it makes the tests interfere with each other when
-    // Rust runs them concurrently). Serialize them and evict before/after each so every test
-    // starts from, and leaves, a clean cache. This also happens to be the same crate-wide
-    // lock other pdfium-touching tests use to avoid contending on the global `PDFIUM` mutex.
+    // tests load the same fixture and would share one cached document, so they run serialized
+    // and evict before and after each test.
     use super::PDFIUM_TEST_LOCK as TEST_LOCK;
 
     fn fixture(name: &str) -> (u64, Arc<Vec<u8>>) {
@@ -1045,9 +965,7 @@ mod tests {
         assert!(!metadata.needs_password);
         assert_eq!(metadata.page_count, 1);
 
-        // A second renderer for the same content, *without* the password, should still be
-        // able to render a page: the already-unlocked document is shared via the cache
-        // rather than each renderer re-opening (and re-authenticating) the file itself.
+        // a second renderer without the password reuses the unlocked cached document.
         let cached_renderer = PdfRenderer::new(id, bytes, None);
         let page = futures::executor::block_on(cached_renderer.process_page(
             0,
@@ -1080,9 +998,7 @@ mod tests {
             "expected the document to be cached after get_metadata"
         );
 
-        // Simulate `Pdf::drop` racing a render: hold the mutex ourselves so
-        // `evict_document`'s `try_lock` loses the race, and confirm it queues the id
-        // instead of silently leaving it cached forever.
+        // hold the mutex so the `try_lock` in `evict_document` fails and the ID is queued.
         let held = futures::executor::block_on(get_pdfium().unwrap().lock());
         evict_document(id);
         assert!(
@@ -1091,7 +1007,7 @@ mod tests {
         );
         drop(held);
 
-        // The next real lock acquisition must apply the deferred eviction.
+        // the next lock applies the deferred eviction.
         futures::executor::block_on(lock_pdfium_state()).unwrap();
         assert!(
             !get_pdfium()
@@ -1129,15 +1045,12 @@ mod tests {
         assert!(width > 0 && height > 0);
 
         let buffer = page.image.as_bytes(0).unwrap();
-        // Sample the center pixel to stay clear of any antialiased edges.
+        // sample the center pixel to avoid antialiased edges.
         let offset = ((height / 2) * width + width / 2) * 4;
         let pixel = &buffer[offset..offset + 4];
         let [b, g, r, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
 
-        // process_page builds the RenderImage directly from pdfium's normalized RGBA bytes
-        // plus a manual R/B swap, rather than routing through a BMP encode/decode round
-        // trip. A solid-red PDF fill is exactly the case that would come out wrong, e.g.
-        // blue instead of red, if that swap were missing, backwards, or applied twice.
+        // a solid red fill comes out blue if the red and blue swap is missing or doubled.
         assert!(r > 200, "expected a strong red channel, got {pixel:?}");
         assert!(b < 50, "expected a near-zero blue channel, got {pixel:?}");
         assert!(g < 50, "expected a near-zero green channel, got {pixel:?}");
@@ -1155,9 +1068,7 @@ mod tests {
 
         let metadata = futures::executor::block_on(renderer.get_metadata(None)).unwrap();
 
-        // The fixture page is 100pt wide; at scale 1000 an uncapped render would ask
-        // pdfium for a 100,000px-wide bitmap. It should come back capped instead of
-        // hanging or failing.
+        // an uncapped render at scale 1000 would request a 100,000px wide bitmap.
         let page = futures::executor::block_on(renderer.process_page(
             0,
             1000.0,
@@ -1237,22 +1148,20 @@ mod tests {
         ))
         .unwrap();
 
-        // Both strips are capped rather than covering the (uncapped) full page height.
+        // both strips are capped below the full page height.
         let strip_height = top_strip.image.size(0).height.0 as f32;
         assert!(strip_height <= MAX_RENDER_HEIGHT);
         assert!(strip_height < page_height_pt);
         assert_eq!(strip_height, bottom_strip.image.size(0).height.0 as f32);
 
-        // Requesting near the top vs. near the bottom should land at different offsets,
-        // each covering the point that was actually asked for and not the other one.
+        // requests near the top and bottom land at different offsets covering their points.
         assert!(top_strip.page_offset_pt < bottom_strip.page_offset_pt);
         assert!(top_strip.covers_page_y(0.0));
         assert!(bottom_strip.covers_page_y(page_height_pt));
         assert!(!top_strip.covers_page_y(page_height_pt));
         assert!(!bottom_strip.covers_page_y(0.0));
 
-        // And the actual rendered pixels should differ, proving the two requests produced
-        // genuinely different content, not the same (clamped) strip both times.
+        // the strips render different content.
         assert_ne!(
             top_strip.image.as_bytes(0),
             bottom_strip.image.as_bytes(0),
@@ -1264,11 +1173,8 @@ mod tests {
 
     #[test]
     fn page_annotations_are_rendered_by_default() {
-        // PdfRenderConfig::new() defaults do_set_flag_render_annotations to true and
-        // process_page never calls .render_annotations(false), so a PDF's own annotations
-        // (highlights, stamps, ink, ...) should already show up in the rendered bitmap with
-        // no extra work. This fixture has a solid blue Rectangle *annotation* (not page
-        // content) covering the whole page, so an unannotated render would come back white.
+        // the fixture has a solid blue rectangle annotation covering the page, so the render is
+        // blue only if annotations are rendered, which is the PDFium default.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (id, bytes) = fixture("annotated_page.pdf");
         evict_document(id);
@@ -1303,13 +1209,8 @@ mod tests {
 
     #[test]
     fn clockwise_rotation_swaps_output_dimensions_and_actually_rotates_the_pixels() {
-        // A 200x100pt page with its left half (x in [0,100], full height) filled solid blue,
-        // the right half left white. A real 90-degree-clockwise rotation, not just a
-        // dimension swap, moves that left-half content to the top half of the (now
-        // 100x200) output: rotating a photo 90 degrees clockwise turns its left edge into
-        // its new top edge. If PageRotation::Clockwise90 were wired up wrong (e.g. rotating
-        // the wrong direction, or resizing the bitmap without actually telling pdfium to
-        // rotate), this would come back either the wrong shape or blue in the wrong half.
+        // a 200x100pt page with a blue left half. A clockwise quarter turn moves that half to
+        // the top of the 100x200 output.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (id, bytes) = fixture("left_half_blue.pdf");
         evict_document(id);
@@ -1370,10 +1271,7 @@ mod tests {
 
     #[test]
     fn get_metadata_does_not_panic_on_a_dangling_bookmark_reference() {
-        // A bookmark that pointed at a real page, which was then removed from the document -
-        // its destination now references a page object that's no longer part of /Pages,
-        // approximating the "bookmark points somewhere page_index() can't resolve validly"
-        // case parse_bookmark's out-of-bounds guard protects against.
+        // a bookmark whose target page was removed from the document.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (id, bytes) = fixture("dangling_bookmark.pdf");
         evict_document(id);
@@ -1381,8 +1279,7 @@ mod tests {
 
         let metadata = futures::executor::block_on(renderer.get_metadata(None));
 
-        // The key assertion is simply that this doesn't panic. Whatever chapter data comes
-        // back (possibly none, if pdfium can't resolve the destination at all) is secondary.
+        // the key assertion is that parsing does not panic.
         assert!(
             metadata.is_ok(),
             "expected a dangling bookmark to be handled gracefully, got {metadata:?}"
@@ -1393,12 +1290,8 @@ mod tests {
 
     #[test]
     fn bookmark_targets_wrapped_in_a_goto_action_are_resolved_not_defaulted_to_page_zero() {
-        // pypdf (like Acrobat) writes every outline entry as an /A GoTo-action dict rather
-        // than a direct /Dest entry. A bookmark whose target is only reachable by unwrapping
-        // that action must resolve to the real target, not silently fall back to (page 0,
-        // origin) as if it were genuinely dangling. This fixture's target (page index 2, a
-        // 400x600 page, deliberately a different size than pages 0/1) exercises both the
-        // action-unwrapping and the target-page-bounds lookup in the same pass.
+        // pypdf, like Acrobat, writes outline entries as GoTo actions. The target is page 2, sized
+        // differently from pages 0 and 1 to exercise the target page bounds lookup.
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (id, bytes) = fixture("action_based_bookmark.pdf");
         evict_document(id);
@@ -1412,10 +1305,8 @@ mod tests {
             .first()
             .expect("expected the one outline entry to be parsed");
         assert_eq!(chapter.target.page_index, 2);
-        // Fit.xyz(left=50, top=500) in PDF's bottom-up space: get_point's y is measured
-        // down from the *target* page's own top edge, so on this 600pt-tall page that's
-        // 600 - 500 = 100. Using page 0/1's height (200) for that subtraction instead, the
-        // bug this test guards against, would give a nonsensical negative 200 - 500 = -300.
+        // `top=500` on the 600pt target page is 100pt from its top edge. Using the height of
+        // page 0 instead would give -300.
         assert!(
             (chapter.target.point.x - 50.0).abs() < 1.0,
             "expected target x near 50, got {}",

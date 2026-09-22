@@ -138,10 +138,7 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
-    /// Inserts a batch of quads that share a single paint order, computed once from their
-    /// combined (clipped) bounds instead of per-quad, so a caller painting many small quads
-    /// at once (e.g. terminal cell backgrounds) does one `primitive_bounds` insertion instead
-    /// of one per quad.
+    /// Inserts a batch of quads sharing one paint order computed from their combined bounds.
     pub fn insert_quads(&mut self, mut quads: Vec<Quad>) {
         let mut combined_bounds: Option<Bounds<ScaledPixels>> = None;
         quads.retain(|quad| {

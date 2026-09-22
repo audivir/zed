@@ -84,8 +84,7 @@ impl PdfItem {
         let (tx, rx) = futures::channel::oneshot::channel();
 
         let content = local_file.load_bytes(cx);
-        // Preserve the password across an on-disk reload so an externally-edited,
-        // still-encrypted document doesn't reprompt the user for it.
+        // keep the password so an encrypted document does not reprompt after an on-disk reload.
         let password = self.pdf.password.clone();
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             if let Some(bytes) = content
@@ -108,9 +107,9 @@ impl PdfItem {
         Some(rx)
     }
 
-    /// Retries opening this document with a user-supplied password, e.g. after
-    /// `metadata.needs_password` was set because none was supplied or a prior guess was
-    /// wrong. Reuses the already-loaded raw bytes instead of re-reading the file from disk.
+    /// Retries opening the document with a user-supplied password.
+    ///
+    /// Reuses the already-loaded bytes instead of re-reading the file.
     pub fn submit_password(&mut self, password: String, cx: &mut Context<Self>) {
         let bytes = (*self.pdf.bytes).clone();
         self.reload_task = Some(cx.spawn(async move |this, cx| {
@@ -227,7 +226,7 @@ impl PdfStore {
                     _subscription: subscription,
                 };
 
-                // Catch up on existing worktrees that were already open
+                // catch up on worktrees that were already open.
                 let worktrees = worktree_store.read(cx).worktrees().collect::<Vec<_>>();
                 for worktree in worktrees {
                     log::info!("Subscribing to existing worktree during init");
@@ -274,11 +273,9 @@ impl PdfStore {
         };
 
         let loading_watch = match self.loading_pdfs_by_path.entry(project_path.clone()) {
-            // If the given path is already being loaded, then wait for that existing
-            // task to complete and return the same pdf.
+            // share the in-flight load for this path.
             hash_map::Entry::Occupied(e) => e.get().clone(),
 
-            // Otherwise, record the fact that this path is now being loaded.
             hash_map::Entry::Vacant(entry) => {
                 let (mut tx, rx) = postage::watch::channel();
                 entry.insert(rx.clone());
@@ -288,7 +285,6 @@ impl PdfStore {
                 cx.spawn(async move |this, cx| {
                     let load_result = load_pdf.await;
                     *tx.borrow_mut() = Some(this.update(cx, |this, _cx| {
-                        // Record the fact that the pdf is no longer loading.
                         this.loading_pdfs_by_path.remove(&project_path);
                         let pdf = load_result.map_err(Arc::new)?;
                         Ok(pdf)
@@ -633,14 +629,10 @@ impl PdfProject {
         project
     }
 
-    /// Whether this project is from collab (not counting remote servers).
+    /// Whether the project comes from collab, not counting remote servers.
     #[inline]
     pub fn is_via_collab(&self) -> bool {
         false
-        // match &self.client_state {
-        //     ProjectClientState::Local | ProjectClientState::Shared { .. } => false,
-        //     ProjectClientState::Collab { .. } => true,
-        // }
     }
 
     fn on_pdf_store_event(
@@ -665,7 +657,7 @@ impl PdfProject {
         event: &PdfItemEvent,
         cx: &mut Context<Self>,
     ) -> Option<()> {
-        // TODO: handle image events from remote
+        // TODO: handle PDF events from remote.
         if let PdfItemEvent::ReloadNeeded = event
             && !self.is_via_collab()
         {

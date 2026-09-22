@@ -3,10 +3,8 @@ use workspace::Workspace;
 pub mod typst_preview_view;
 pub mod typst_world;
 
-// Shared with the editor crate's mouse-context-menu/keymap (see zed_actions::preview). Editor
-// can't depend on this crate, so these two live in a dependency-free shared spot the same way
-// markdown/svg preview's OpenPreview/OpenPreviewToTheSide do) rather than this crate's own
-// namespace.
+// these actions live in `zed_actions` because the editor context menu needs them and cannot
+// depend on this crate.
 pub use zed_actions::preview::typst::{OpenPreview, OpenPreviewToTheSide};
 
 actions!(
@@ -14,11 +12,11 @@ actions!(
     [
         /// Opens a preview that follows the active Typst editor.
         OpenFollowingPreview,
-        /// Opens a preview strictly for the active Typst document, ignoring project root.
+        /// Opens a preview for the active Typst document, ignoring the project root.
         OpenFixedPreview,
-        /// Opens a preview strictly for the active Typst document in a split pane.
+        /// Opens a preview for the active Typst document in a split pane.
         OpenFixedPreviewToTheSide,
-        /// Opens a preview that follows the active editor, always compiling the active file directly.
+        /// Opens a following preview that always compiles the active file directly.
         OpenFixedFollowingPreview
     ]
 );

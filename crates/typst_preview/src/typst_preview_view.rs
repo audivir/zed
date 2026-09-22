@@ -46,9 +46,7 @@ pub struct TypstPreviewView {
     document: Option<Arc<PagedDocument>>,
     active_source_index: Option<usize>,
     compile_state: TypstCompileState,
-    /// Warnings from the most recent successful compile. Typst can produce
-    /// these even when compilation otherwise succeeds; they don't fail the
-    /// compile so they don't flow through TypstCompileState::Failed.
+    /// Warnings from the last successful compile, which do not fail compilation.
     compile_warnings: Vec<String>,
     pending_update_task: Option<Task<Result<()>>>,
     mode: TypstPreviewMode,
@@ -57,9 +55,9 @@ pub struct TypstPreviewView {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TypstPreviewMode {
-    /// The preview will always show the contents of the provided editor.
+    /// Always shows the contents of the provided editor.
     Default,
-    /// The preview will "follow" the currently active editor.
+    /// Follows the active editor.
     Follow,
 }
 
@@ -72,16 +70,15 @@ pub enum TypstCompileState {
     Failed(String),
 }
 
-/// A fake language server id reserved for diagnostics `typst_preview` publishes itself
-/// (typst compile errors/warnings), distinct from any real language server that might also
-/// be attached to the same `.typ` buffer (e.g. a user-installed Typst LSP extension) so
-/// neither source clobbers the other's diagnostics on the same buffer.
+/// Language server ID for diagnostics published by the Typst preview itself.
+///
+/// Kept distinct from any real Typst language server so neither clobbers the diagnostics of the
+/// other on the same buffer.
 const TYPST_PREVIEW_DIAGNOSTICS_SERVER_ID: LanguageServerId = LanguageServerId(usize::MAX - 100);
 
-/// A Typst compile diagnostic (error or warning) with its source location resolved to a real
-/// file path and byte range, rather than just a flattened message string. `file_path`/`range`
-/// are `None` when the diagnostic's `Span` doesn't resolve to a location (Typst does emit
-/// spanless diagnostics in some cases). The message is still shown, just without a squiggle.
+/// Container for a Typst compile diagnostic with its resolved file path and byte range.
+///
+/// `file_path` and `range` are `None` for spanless diagnostics, which show without a squiggle.
 struct TypstDiagnostic {
     severity: DiagnosticSeverity,
     message: String,
@@ -89,10 +86,9 @@ struct TypstDiagnostic {
     range: Option<Range<usize>>,
 }
 
-/// Resolves each diagnostic's `Span` to a `(file_path, byte_range)` via the same `World` the
-/// compile just ran against, while `world`/its sources are still in scope. Must run
-/// synchronously right after `typst::compile`. `Span`s aren't meaningful once `world` is
-/// dropped or mutated again (e.g. by the next debounced recompile).
+/// Resolves the span of each diagnostic to a file path and byte range.
+///
+/// Must run right after `typst::compile`, since spans are meaningless once `world` changes.
 fn resolve_typst_diagnostics(
     world: &TypstSystemWorld,
     diagnostics: &[typst::diag::SourceDiagnostic],
@@ -119,13 +115,10 @@ fn resolve_typst_diagnostics(
         .collect()
 }
 
-/// Publishes `diagnostics` as inline squiggles on `editor`'s buffer, replacing whatever
-/// `typst_preview` published there last time (an empty `diagnostics` list correctly clears
-/// stale ones once an error is fixed, since `Buffer::update_diagnostics` replaces the whole
-/// set for a given server id rather than appending to it). Only diagnostics whose resolved
-/// file matches the editor's own file are applied. Diagnostics for other files (e.g. an
-/// `#import`ed file that isn't open) are dropped here; they're still visible in the
-/// compile-warnings banner in the preview pane itself.
+/// Publishes `diagnostics` as squiggles on the buffer of `editor`, replacing the previous set.
+///
+/// Only diagnostics for the file of the editor apply. Others, such as those in imported files,
+/// remain visible in the warnings banner of the preview.
 fn publish_editor_diagnostics(
     editor: Option<&Entity<Editor>>,
     diagnostics: &[TypstDiagnostic],
@@ -175,9 +168,9 @@ fn publish_editor_diagnostics(
     });
 }
 
-/// Whether a syntax node of `kind`, as a sibling within a paragraph's flow, still belongs to
-/// the *same* paragraph as its neighbors. `false` for whatever actually starts a new block
-/// (a blank-line paragraph break, a heading, a list/enum/term item, a math block/equation).
+/// Whether a sibling of `kind` within a paragraph still belongs to the same paragraph.
+///
+/// Returns `false` for paragraph breaks, headings, list items, and math blocks.
 fn continues_same_paragraph(kind: SyntaxKind) -> bool {
     !matches!(
         kind,
@@ -190,13 +183,10 @@ fn continues_same_paragraph(kind: SyntaxKind) -> bool {
     )
 }
 
-/// Walks up from `leaf` through inline-formatting wrappers (`*Strong*`, `_Emph_`) to the node
-/// whose direct children are the actual paragraph-level flow `leaf` sits in: plain text
-/// interleaved with inline formatting, but not yet past whatever block-level container (a
-/// heading's own text, a list item's own text, the document root, ...) that paragraph itself
-/// lives inside. Needed because `*Typst*` inside a sentence puts "Typst" one level deeper in
-/// the tree (inside `Strong`'s own nested content) than the plain text on either side of it,
-/// which otherwise splits one visual paragraph into several unrelated per-leaf lookups.
+/// Returns the node holding the paragraph flow of `leaf`, skipping inline formatting.
+///
+/// `*Strong*` and `_Emph_` nest their text one level deeper than the surrounding text, which
+/// would otherwise split one visual paragraph into several lookups.
 fn paragraph_container<'a>(leaf: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
     let mut container = leaf.parent()?.clone();
     while let Some(parent) = container.parent()
@@ -207,14 +197,10 @@ fn paragraph_container<'a>(leaf: &LinkedNode<'a>) -> Option<LinkedNode<'a>> {
     Some(container)
 }
 
-/// Every leaf's span (recursively, so nested `Strong`/`Emph` content is included) that
-/// belongs to the same paragraph as the plain-text leaf containing `cursor`, not just that
-/// one leaf's own span. A "leaf" is one run of plain text between markup elements (e.g. the
-/// text on either side of a `*bold*` word), the granularity Typst's own span tracking
-/// supports; a paragraph is usually several of these siblings back to back, so highlighting
-/// only the single leaf under the cursor made the block-highlight's extent depend on which
-/// side of a `*bold*`/`_italic_` word you clicked, inconsistent for what's visually one
-/// paragraph. `None` if `cursor` isn't inside any text at all.
+/// Returns the spans of all leaves in the paragraph containing `cursor`.
+///
+/// Includes nested `Strong` and `Emph` content, so the highlight does not depend on which side
+/// of a formatted word was clicked. Returns `None` if `cursor` is not inside text.
 fn paragraph_leaf_spans(source: &Source, cursor: usize) -> Option<Vec<Span>> {
     fn is_text(node: &LinkedNode) -> bool {
         matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText)
@@ -228,8 +214,7 @@ fn paragraph_leaf_spans(source: &Source, cursor: usize) -> Option<Vec<Span>> {
             collect_leaf_spans(&child, out);
         }
     }
-    /// The direct child of `container` that `leaf` descends from (`leaf` itself, if it's
-    /// already a direct child).
+    /// Returns the direct child of `container` that `leaf` descends from.
     fn direct_child_containing<'a>(
         container: &LinkedNode<'a>,
         leaf: &LinkedNode<'a>,
@@ -278,12 +263,10 @@ fn paragraph_leaf_spans(source: &Source, cursor: usize) -> Option<Vec<Span>> {
     Some(spans)
 }
 
-/// Every point in `frame` (recursively through nested groups) where a text run's glyphs
-/// carry `span`. Mirrors `typst_ide::jump_from_cursor`'s private `find_in_frame`, except it
-/// keeps scanning every frame item instead of returning as soon as it finds the first
-/// match. A leaf's span is shared across however many lines it word-wraps to, so this is
-/// what lets the preview highlight the whole block instead of only ever landing on its
-/// first line the way a single `find_in_frame` call does.
+/// Collects every point in `frame` where glyphs of a text run carry `span`.
+///
+/// Unlike `typst_ide::jump_from_cursor`, keeps scanning after the first match, so a span that
+/// wraps across several lines highlights all of them.
 fn find_all_in_frame(frame: &Frame, span: Span, out: &mut Vec<(TypstPoint, Abs)>) {
     for &(pos, ref item) in frame.items() {
         match item {
@@ -306,10 +289,7 @@ fn find_all_in_frame(frame: &Frame, span: Span, out: &mut Vec<(TypstPoint, Abs)>
     }
 }
 
-/// A rough one-line highlight-box height for text set at `font_size`, not real typographic
-/// ascent/descent metrics (`Frame`/`TextItem` doesn't expose those here), just a multiple of
-/// the nominal size big enough to cover a line's glyphs plus a little breathing room. Tracks
-/// the paragraph's *actual* font size, unlike a single fixed guess that doesn't.
+/// Returns an approximate one-line highlight height for text at `font_size`.
 fn line_height_for_font_size(font_size: Abs) -> f32 {
     font_size.to_pt() as f32 * 1.4
 }
@@ -320,7 +300,7 @@ struct EditorState {
 }
 
 impl TypstPreviewView {
-    /// Get either a pane in the given direction or the active pane
+    /// Returns the pane in `direction`, or the active pane.
     fn get_pane(
         workspace: &mut Workspace,
         direction: Option<SplitDirection>,
@@ -574,7 +554,7 @@ impl TypstPreviewView {
 
             this.set_editor(active_editor, window, cx);
 
-            // Always observe the workspace so we can hook into typing on included files
+            // observe the workspace to react to typing in included files.
             if let Some(workspace_ent) = &workspace_handle.upgrade() {
                 let mut editors_to_observe = Vec::new();
                 for pane in workspace.panes() {
@@ -738,8 +718,7 @@ impl TypstPreviewView {
         cx: &mut Context<Self>,
     ) {
         if let Some(state) = &self.active_editor {
-            // Drop the old task to cancel it and reset the debounce timer
-            // so we don't start rendering while the user is still actively typing.
+            // dropping the old task cancels it and restarts the debounce while the user types.
             if wait_for_debounce {
                 self.pending_update_task = None;
             }
@@ -753,10 +732,10 @@ impl TypstPreviewView {
         }
     }
 
-    /// Walks up from `active_path` looking for a `typst.toml` (using its manifest
-    /// `entrypoint`) or a `main.typ` to resolve the project root and main file. Does real
-    /// filesystem I/O (`exists`/`read_to_string` per directory up to the root). Callers
-    /// must run this on a background thread, not synchronously on the UI thread.
+    /// Resolves the project root and main file from `active_path`.
+    ///
+    /// Walks up looking for a `typst.toml` entrypoint or a `main.typ`. Performs filesystem I/O,
+    /// so callers must run it on a background thread.
     fn resolve_project(project_resolution: bool, active_path: &Path) -> (PathBuf, PathBuf) {
         let unresolved = (
             active_path
@@ -839,11 +818,8 @@ impl TypstPreviewView {
                             {
                                 let normalized_path = util::normalize_path(&path_buf);
                                 if let Some(workspace) = workspace_weak.upgrade() {
-                                    // Is the file already open in any pane? Just update its
-                                    // cursor, don't focus it or change the active pane/tab,
-                                    // so clicking around in the PDF preview doesn't keep
-                                    // yanking focus away from it (matches how the Markdown
-                                    // preview's own click-to-source navigation behaves).
+                                    // move the cursor without focusing, so clicking in the preview
+                                    // does not steal focus, like the Markdown preview.
                                     let target_editor = workspace.update(cx, |ws, cx| {
                                         for pane in ws.panes() {
                                             for item in pane.read(cx).items() {
@@ -872,8 +848,7 @@ impl TypstPreviewView {
                                         return;
                                     }
 
-                                    // Not open anywhere yet, open it without focusing it,
-                                    // same reasoning as above.
+                                    // open without focusing it.
                                     window
                                         .spawn(cx, async move |cx| {
                                             cx.background_executor()
@@ -943,7 +918,6 @@ impl TypstPreviewView {
     ) -> Task<Result<()>> {
         cx.spawn_in(window, async move |view, cx| {
             if wait_for_debounce {
-                // Wait for the user to stop typing
                 cx.background_executor().timer(REPARSE_DEBOUNCE).await;
             }
 
@@ -997,7 +971,7 @@ impl TypstPreviewView {
                     HashMap::new()
                 };
 
-                // Prioritize the exact state of the currently active editor
+                // the active editor state takes precedence.
                 let mut final_overrides = overrides;
                 final_overrides.insert(active_path.clone(), active_snapshot);
 
@@ -1044,8 +1018,7 @@ impl TypstPreviewView {
                     .spawn(async move {
                         let start = Instant::now();
 
-                        // Off the UI thread: walks parent directories looking for
-                        // typst.toml/main.typ (see resolve_project's doc comment).
+                        // resolving the project performs filesystem I/O.
                         let (new_root, main_file_path) =
                             Self::resolve_project(project_resolution, &active_path);
 
@@ -1054,7 +1027,6 @@ impl TypstPreviewView {
                             None => Arc::new(Mutex::new(TypstSystemWorld::new(new_root))),
                         };
 
-                        // Extract main text fully off the UI thread
                         let main_contents = match final_overrides.get(&main_file_path) {
                             Some(snap) => snap.text(),
                             None => match std::fs::read_to_string(&main_file_path) {
@@ -1079,7 +1051,6 @@ impl TypstPreviewView {
                         log::info!("Prepared compilation in {:?}", start.elapsed());
                         let start = Instant::now();
 
-                        // Compile the document using the comemo-cached world
                         let compiled = typst::compile(&*world);
                         let mut diagnostics = resolve_typst_diagnostics(&world, &compiled.warnings);
                         for diagnostic in &diagnostics {
@@ -1106,7 +1077,6 @@ impl TypstPreviewView {
                         log::info!("Generated output in {:?}", start.elapsed());
                         let start = Instant::now();
 
-                        // Export to PDF bytes
                         let bytes =
                             match typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default()) {
                                 Ok(bytes) => bytes,
@@ -1268,14 +1238,8 @@ impl TypstPreviewView {
                     if let Some(position) = positions.last() {
                         let page_index = position.page.get() - 1;
 
-                        // jump_from_cursor only ever resolves to the position of the single
-                        // syntax leaf (a run of plain text between markup elements) the
-                        // cursor happens to be in. A paragraph is usually several such
-                        // leaves back to back (e.g. split by a *bold* word), so anchoring the
-                        // highlight to just that one leaf's own extent made it depend on
-                        // which side of the bold word was clicked, inconsistent for what's
-                        // visually one paragraph. Recompute both the anchor point and the
-                        // block's bottom from every leaf in the whole paragraph instead.
+                        // `jump_from_cursor` only resolves the single leaf under the cursor, so
+                        // the anchor and bottom are computed from every leaf in the paragraph.
                         let paragraph_hits: Vec<(TypstPoint, Abs)> =
                             paragraph_leaf_spans(&source, safe_index)
                                 .and_then(|spans| {
@@ -1303,10 +1267,7 @@ impl TypstPreviewView {
                             .iter()
                             .map(|(p, _)| p.y.to_pt() as f32)
                             .reduce(f32::max);
-                        // A rough one-line box height (covering a line's ascent/descent, not
-                        // just its baseline) derived from the paragraph's own font size,
-                        // rather than a fixed guess that doesn't track the document's actual
-                        // text size and made the highlight over/undershoot real lines.
+                        // derive the line height from the actual font size of the paragraph.
                         let line_height = paragraph_hits
                             .first()
                             .map(|(_, size)| line_height_for_font_size(*size));
@@ -1338,22 +1299,13 @@ impl TypstPreviewView {
     }
 
     fn sync_active_root_block(&mut self, _cx: &mut Context<Self>) {
-        // self.pdf_view.update(cx, |pdf_view, cx| {
-        //     pdf_view.set_active_root_for_source_index(self.active_source_index, cx);
-        // });
-        // if let Some(pdf_view) = &self.pdf_view {
-        // TODO: Implement Forward Search (scroll to element matching source index)
-        // pdf_view.update(cx, |pv, cx| pv.scroll_to_source_index(self.active_source_index, cx));
-        // }
+        // TODO: implement forward search by scrolling the PDF to the active source index.
     }
 
-    /// Moves `editor`'s cursor to the start of the line containing `source_index`, without
-    /// focusing `editor` or otherwise changing which pane/tab is active. Clicking around in
-    /// the PDF preview shouldn't keep yanking focus away from it. Snaps to the line rather
-    /// than the exact clicked character: matches how the Markdown preview's own
-    /// click-to-source navigation behaves (see `change_selection_to_source_index` there), and
-    /// is more robust than an exact offset, which doesn't mean much once a paragraph has
-    /// reflowed across the PDF's own line breaks anyway.
+    /// Moves the cursor of `editor` to the start of the line containing `source_index`.
+    ///
+    /// Does not focus `editor` or change the active pane. Snapping to the line matches the
+    /// Markdown preview and stays meaningful after the paragraph reflows in the PDF.
     fn move_cursor_to_source_index(
         editor: &Entity<Editor>,
         source_index: usize,
@@ -1515,7 +1467,7 @@ impl Render for TypstPreviewView {
 mod tests {
     use super::*;
 
-    /// A scratch directory tree that removes itself on drop.
+    /// Scratch directory tree that removes itself on drop.
     struct ScratchDir(PathBuf);
 
     impl ScratchDir {
@@ -1563,7 +1515,7 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/entry.typ"), "").unwrap();
-        // A main.typ also exists, but the manifest's entrypoint should win.
+        // the manifest entrypoint wins over `main.typ`.
         std::fs::write(root.join("main.typ"), "").unwrap();
         let active_path = root.join("src/entry.typ");
 
@@ -1575,8 +1527,7 @@ mod tests {
 
     #[test]
     fn resolve_project_falls_back_to_the_active_files_own_directory() {
-        // No typst.toml/main.typ anywhere above this file, so resolution should fall back
-        // to treating the active file's own directory as the root.
+        // without `typst.toml` or `main.typ` above, the directory of the file is the root.
         let root = ScratchDir::new("falls_back_when_nothing_found");
         let active_path = root.join("standalone.typ");
         std::fs::write(&active_path, "").unwrap();
@@ -1594,8 +1545,7 @@ mod tests {
         let active_path = root.join("standalone.typ");
         std::fs::write(&active_path, "").unwrap();
 
-        // Even though a main.typ exists right there, project_resolution: false must not
-        // walk the filesystem at all and should just treat the file as standalone.
+        // without project resolution, an adjacent `main.typ` is ignored.
         let (resolved_root, main_file) = TypstPreviewView::resolve_project(false, &active_path);
 
         assert_eq!(resolved_root, root.0);
@@ -1663,9 +1613,7 @@ mod tests {
     fn text_leaf_span_covers_a_full_wrapped_run_not_just_its_first_line() {
         let root = ScratchDir::new("wrapped_leaf_spans_multiple_lines");
         let main_path = root.join("main.typ");
-        // A narrow page plus one long run of plain text (no markup breaking it into more
-        // than one syntax leaf) forces word-wrap across several rendered lines while it all
-        // stays a single leaf/span as far as Typst's own source tracking is concerned.
+        // a narrow page wraps one unbroken text run, a single span, across several lines.
         let preamble = "#set page(width: 80pt, height: 400pt, margin: 4pt)\n";
         let sentence = "This is a long sentence that will definitely wrap across several lines on such a narrow page.";
         let source = format!("{preamble}{sentence}\n");
@@ -1677,8 +1625,7 @@ mod tests {
         let document = compiled.output.expect("fixture should compile");
         let typst_source = world.main_source().clone();
 
-        // A cursor near the end of the sentence, well past whatever its first rendered line
-        // covers.
+        // a cursor well past the first rendered line.
         let cursor = source
             .find("narrow page")
             .expect("fixture source contains this substring");
@@ -1702,10 +1649,7 @@ mod tests {
             points.len()
         );
 
-        // jump_from_cursor (what the highlight relied on exclusively before this fix)
-        // always resolves to the *first* line's position. Confirm the last line found by
-        // find_all_in_frame sits strictly below it, which is exactly the extra vertical
-        // extent the old fixed-height highlight bar couldn't cover.
+        // `jump_from_cursor` resolves to the first line; the last line found must lie below it.
         let positions = typst_ide::jump_from_cursor(&document, &typst_source, cursor);
         let first_line_y = positions
             .last()
@@ -1727,10 +1671,8 @@ mod tests {
     fn paragraph_highlight_is_consistent_on_either_side_of_a_bold_word() {
         let root = ScratchDir::new("paragraph_spans_bold_split");
         let main_path = root.join("main.typ");
-        // Wide enough that the plain-text run *before* "*Typst*" fits on one line by itself,
-        // but the whole paragraph (both text runs plus the bold word) still wraps across more
-        // than one line, so this test can actually tell "just the clicked leaf's own lines"
-        // (the old, inconsistent behavior) apart from "the whole paragraph's lines".
+        // the text before `*Typst*` fits one line, but the whole paragraph wraps, so leaf and
+        // paragraph highlights differ.
         let preamble = "#set page(width: 320pt, height: 400pt, margin: 4pt)\n";
         let sentence = "This is a small test file to demonstrate basic *Typst* formatting. \
              It compiles incredibly fast and has a very clean syntax.";
@@ -1744,8 +1686,7 @@ mod tests {
         let typst_source = world.main_source().clone();
         let page = document.pages().first().expect("fixture has one page");
 
-        // Two cursors either side of the bold word: different syntax leaves, but visually
-        // the same one paragraph.
+        // cursors on either side of the bold word hit different leaves of the same paragraph.
         let before_bold = source.find("small").expect("fixture contains this word");
         let after_bold = source.find("compiles").expect("fixture contains this word");
 
@@ -1754,10 +1695,7 @@ mod tests {
         let after_spans = paragraph_leaf_spans(&typst_source, after_bold)
             .expect("cursor sits inside a plain-text leaf");
 
-        // Sanity: the paragraph is genuinely made of more than one syntax leaf (the plain
-        // text before "*Typst*", the bold word itself, and the plain text after it): three
-        // leaves merged into one paragraph's worth of spans, not a single trivial leaf that
-        // would make this fixture unable to exercise the bug being fixed at all.
+        // the paragraph must consist of several leaves for this test to be meaningful.
         assert_eq!(
             before_spans.len(),
             3,
@@ -1793,9 +1731,7 @@ mod tests {
             "the rendered block extent must be identical regardless of which leaf was clicked"
         );
 
-        // Sanity: the paragraph actually wraps across multiple lines, otherwise this test
-        // couldn't distinguish "just the clicked leaf's own lines" from "the whole
-        // paragraph's lines" in the first place.
+        // the paragraph must wrap for this test to be meaningful.
         let (min_y, max_y) = before_bounds;
         assert!(
             max_y > min_y,
@@ -1814,8 +1750,7 @@ mod tests {
     fn highlight_line_height_tracks_the_documents_actual_font_size_not_a_fixed_guess() {
         let root = ScratchDir::new("line_height_tracks_font_size");
 
-        // Two otherwise-identical documents, differing only in body text size. The derived
-        // line height must scale accordingly rather than landing on the same fixed value.
+        // documents differing only in font size must yield different line heights.
         let render_line_height = |name: &str, font_size_pt: u32| -> f32 {
             let main_path = root.join(&format!("{name}.typ"));
             let source = format!(

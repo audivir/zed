@@ -39,15 +39,12 @@ impl RegexSearches {
         }
     }
 
-    /// The compiled `terminal.path_hyperlink_regexes` patterns, for
-    /// `GhosttyTerminal::hyperlink_at` to pass through to
-    /// `path_hyperlink_candidates_in_line`.
+    /// Compiled `terminal.path_hyperlink_regexes` patterns.
     pub(crate) fn compiled_path_hyperlink_regexes(&self) -> &[Regex] {
         &self.path_hyperlink_regexes
     }
 
-    /// The `terminal.path_hyperlink_timeout_ms` setting, likewise for
-    /// `GhosttyTerminal::hyperlink_at`.
+    /// Value of the `terminal.path_hyperlink_timeout_ms` setting.
     pub(crate) fn path_hyperlink_timeout(&self) -> Duration {
         self.path_hyperlink_timeout
     }
@@ -75,9 +72,9 @@ impl RegexSearches {
     }
 }
 
-/// Normalizes a raw URL/path match (from either backend) into a
-/// `HyperlinkMatch`, resolving `file://` URIs to plain paths so line numbers
-/// at the end of the path are handled correctly.
+/// Normalizes a raw URL or path match into a `HyperlinkMatch`.
+///
+/// `file://` URIs resolve to plain paths so trailing line numbers are handled correctly.
 pub(crate) fn normalize_hyperlink_match(
     maybe_url_or_path: String,
     is_url: bool,
@@ -85,11 +82,8 @@ pub(crate) fn normalize_hyperlink_match(
     path_style: PathStyle,
 ) -> HyperlinkMatch {
     if is_url {
-        // Treat "file://" IRIs like file paths to ensure
-        // that line numbers at the end of the path are
-        // handled correctly.
-        // Use Url::to_file_path() to properly handle Windows drive letters
-        // (e.g., file:///C:/path -> C:\path)
+        // treat `file://` IRIs as paths so trailing line numbers work. `Url::to_file_path`
+        // handles Windows drive letters.
         if maybe_url_or_path.starts_with("file://") {
             if let Ok(url) = Url::parse(&maybe_url_or_path) {
                 if let Ok(path) = url.to_file_path_ext(path_style) {
@@ -108,7 +102,7 @@ pub(crate) fn normalize_hyperlink_match(
                     };
                 }
             }
-            // Fallback: strip file:// prefix if URL parsing fails
+            // fallback when URL parsing fails.
             let path = maybe_url_or_path
                 .strip_prefix("file://")
                 .unwrap_or(&maybe_url_or_path);
@@ -133,8 +127,7 @@ pub(crate) fn normalize_hyperlink_match(
     }
 }
 
-// OSC 8 mandates that file:// URIs must be encoded as file://{host}{path}
-// We need to skip the {host} part if it's set
+// OSC 8 encodes file URIs as `file://{host}{path}`, so the host part is skipped.
 fn try_osc8_url_to_path(url: url::Url) -> Option<String> {
     use percent_encoding::percent_decode;
     if url.scheme() != "file" {
@@ -149,16 +142,13 @@ fn try_osc8_url_to_path(url: url::Url) -> Option<String> {
     bytes.try_into().ok()
 }
 
-/// Pure, backend-agnostic core of URL punctuation sanitization: trims
-/// trailing characters that are frequently used in plain text as delimiters
-/// after a URL (rather than being part of it) and returns the trimmed
-/// string plus how many chars were removed from the end, so each backend
-/// can shrink its own range representation by that amount.
+/// Trims trailing delimiter punctuation from a URL.
+///
+/// Returns the trimmed string and the number of characters removed from the end.
 pub(crate) fn trim_url_punctuation(url: &str) -> (String, usize) {
     let mut sanitized_url = url.to_string();
     let mut chars_trimmed = 0;
 
-    // Count parentheses in the URL
     let (open_parens, mut close_parens) =
         sanitized_url
             .chars()
@@ -168,12 +158,9 @@ pub(crate) fn trim_url_punctuation(url: &str) -> (String, usize) {
                 _ => (opens, closes),
             });
 
-    // Remove trailing characters that shouldn't be at the end of URLs
     while let Some(last_char) = sanitized_url.chars().last() {
         let should_remove = match last_char {
-            // These may be part of a URL but not at the end. It's not that the spec
-            // doesn't allow them, but they are frequently used in plain text as delimiters
-            // where they're not meant to be part of the URL.
+            // valid inside a URL, but usually a text delimiter at its end.
             '.' | ',' | ':' | ';' => true,
             '(' => true,
             ')' if close_parens > open_parens => {
@@ -195,9 +182,10 @@ pub(crate) fn trim_url_punctuation(url: &str) -> (String, usize) {
     (sanitized_url, chars_trimmed)
 }
 
-/// Returns the byte offset just past the first unbalanced `(` in `s`, or `None`
-/// if all parentheses are balanced. Used to strip prefixes like `Update(` from
-/// path matches while preserving balanced parens in filenames like `file(copy).txt`.
+/// Returns the byte offset past the first unbalanced `(` in `s`.
+///
+/// Strips prefixes like `Update(` from path matches while keeping balanced parentheses in
+/// file names like `file(copy).txt`.
 pub(crate) fn first_unbalanced_open_paren(s: &str) -> Option<usize> {
     let mut balance: i32 = 0;
     let mut first_unmatched = None;
@@ -222,28 +210,16 @@ pub(crate) fn first_unbalanced_open_paren(s: &str) -> Option<usize> {
     first_unmatched.filter(|_| balance > 0)
 }
 
-/// Pure, backend-agnostic core of path-hyperlink matching. Given a single
-/// line's text and the byte offset of interest within it, tries each user-
-/// configured regex in order (named captures `path`/`line`/`column`/`link`;
-/// see the `terminal.path_hyperlink_regexes` setting's own doc comment
-/// in `default.json` for the exact contract and examples) and returns every
-/// candidate match (in order) whose link range covers `hovered_byte_offset`.
-/// This is almost always 0 or 1 matches in practice; it's returned as a
-/// `Vec` rather than a single `Option` only because a backend may need to
-/// try more than one, since each candidate's byte range must still be
-/// verified after converting it to that backend's own point/coordinate
-/// representation (see `GhosttyTerminal::hyperlink_at`'s use of this).
+/// Returns path hyperlink candidates in `line` whose link range covers `hovered_byte_offset`.
 ///
-/// Each candidate is `(path, link_byte_range)`: `path` is the final path
-/// string with `:line[:column]` appended when captured, and
-/// `link_byte_range` is the byte range in `line` that should become the
-/// clickable extent.
+/// Tries each configured regex in order, using the named captures `path`, `line`, `column`, and
+/// `link` described on the `terminal.path_hyperlink_regexes` setting. Each candidate is a path
+/// with `:line[:column]` appended when captured, plus its clickable byte range in `line`.
+/// Multiple candidates are returned because the caller must verify each range in its own
+/// coordinates.
 ///
-/// Stops scanning entirely (across all remaining regexes) once a regex
-/// produces any captures at all on the line, even if none cover the hover
-/// point. Processing stops at the first regex with a match, even if no
-/// link is produced (also documented on the setting), or once the
-/// configured timeout is exceeded.
+/// Scanning stops at the first regex that matches anywhere on the line, even without covering
+/// the hover point, or once the configured timeout is exceeded.
 pub(crate) fn path_hyperlink_candidates_in_line(
     line: &str,
     hovered_byte_offset: usize,
@@ -286,18 +262,14 @@ pub(crate) fn path_hyperlink_candidates_in_line(
                 .name("link")
                 .map_or_else(|| match_range.clone(), |link| link.range());
 
-            // Strip prefix up to the first unbalanced `(` in the matched path.
-            // This handles delimiter parens like `Update(.claude/SKILL.md)` while
-            // preserving balanced parens in filenames like `file(copy).txt`.
-            // Analogous to `trim_url_punctuation` which strips unbalanced
-            // trailing `)` from URLs.
+            // strip delimiter parentheses like `Update(.claude/SKILL.md)`, the counterpart of
+            // trimming unbalanced trailing `)` from URLs.
             if let Some(trim) = first_unbalanced_open_paren(&line[path_range.clone()]) {
                 path_range.start += trim;
                 link_range.start = link_range.start.max(path_range.start);
             }
 
             if !link_range.contains(&hovered_byte_offset) {
-                // No match, just skip.
                 continue;
             }
 
@@ -395,13 +367,13 @@ mod tests {
     #[test]
     fn test_url_parentheses_sanitization() {
         let test_cases = vec![
-            // Cases that should be sanitized (unbalanced parentheses)
+            // unbalanced parentheses
             ("https://www.google.com/)", "https://www.google.com/"),
             ("https://example.com/path)", "https://example.com/path"),
             ("https://test.com/))", "https://test.com/"),
             ("https://test.com/(((", "https://test.com/"),
             ("https://test.com/(test)(", "https://test.com/(test)"),
-            // Cases that should NOT be sanitized (balanced parentheses)
+            // balanced parentheses
             (
                 "https://en.wikipedia.org/wiki/Example_(disambiguation)",
                 "https://en.wikipedia.org/wiki/Example_(disambiguation)",
@@ -411,7 +383,7 @@ mod tests {
                 "https://example.com/path(1)(2)",
                 "https://example.com/path(1)(2)",
             ),
-            // Edge cases
+            // edge cases
             ("https://test.com/", "https://test.com/"),
             ("https://example.com", "https://example.com"),
         ];
@@ -482,12 +454,8 @@ mod tests {
         }
     }
 
-    /// Regression coverage for `path_hyperlink_candidates_in_line`, ported
-    /// from the pre-Alacritty-removal grid-based `test_path!`/`test_hyperlink!`
-    /// macro suite (which exercised the same matching logic through an
-    /// Alacritty `Term`'s grid) to operate directly on the pure function's
-    /// `&str` + byte-offset signature instead. `(line, hover_byte_offset,
-    /// expected_path, expected_link_range)`.
+    /// Asserts that hovering `hover_byte_offset` in `line` yields `expected_path` over
+    /// `expected_link_range`.
     fn assert_path_match(
         regex: &str,
         line: &str,
@@ -514,7 +482,7 @@ mod tests {
 
     #[test]
     fn path_only() {
-        // "/test/cool.rs", hovering column 1 ('t' in "test").
+        // hovering the `t` of `test`.
         assert_path_match(
             PATH_LINE_COLUMN_REGEX,
             "/test/cool.rs",
@@ -528,13 +496,13 @@ mod tests {
     fn path_and_line() {
         let line = "/test/cool.rs:4";
         assert_path_match(PATH_LINE_COLUMN_REGEX, line, 1, "/test/cool.rs:4", 0..15);
-        // Hovering on the line number itself.
+        // hovering the line number.
         assert_path_match(PATH_LINE_COLUMN_REGEX, line, 14, "/test/cool.rs:4", 0..15);
     }
 
     #[test]
     fn path_line_and_column() {
-        // "/test/cool.rs:4:2" is 17 bytes (0..17), not 18.
+        // the match spans 17 bytes.
         let line = "/test/cool.rs:4:2";
         assert_path_match(PATH_LINE_COLUMN_REGEX, line, 1, "/test/cool.rs:4:2", 0..17);
         assert_path_match(PATH_LINE_COLUMN_REGEX, line, 16, "/test/cool.rs:4:2", 0..17);
@@ -572,7 +540,7 @@ mod tests {
 
     #[test]
     fn no_candidates_when_hover_outside_any_match() {
-        // Hovering well past the end of the only match on the line.
+        // hovering past the end of the only match.
         let line = "/test/cool.rs   ";
         let regexes = vec![Regex::new(PATH_LINE_COLUMN_REGEX).unwrap()];
         let candidates = path_hyperlink_candidates_in_line(
