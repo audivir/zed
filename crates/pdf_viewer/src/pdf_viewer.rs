@@ -945,7 +945,7 @@ impl PdfView {
     }
 
     fn zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
-        log::info!("Clicked zoom in");
+        log::debug!("Clicked zoom in");
         self.set_zoom(self.zoom_level * ZOOM_STEP, None, cx);
     }
 
@@ -1036,7 +1036,7 @@ impl PdfView {
                     self.stale_page_cache.insert(*k, v.clone());
                 }
             }
-            log::info!(
+            log::debug!(
                 "Stale page cache stored (size {:?})",
                 self.stale_page_cache.len()
             );
@@ -1667,7 +1667,7 @@ impl Element for PdfContentElement {
             // positioned by `page_offset_pt` and `covered_height_pt`.
             if let Some(old_data) = &stale_data {
                 if do_log {
-                    log::info!("Drawn stale for page {:?}", page_idx);
+                    log::debug!("Drawn stale for page {:?}", page_idx);
                 }
                 let top = px(old_data.page_offset_pt * zoom_level);
                 let strip_height = px(old_data.covered_height_pt() * zoom_level);
@@ -1690,7 +1690,7 @@ impl Element for PdfContentElement {
                     .is_some_and(|s| Arc::ptr_eq(&s.image, &new_data.image));
                 if !is_same {
                     if do_log {
-                        log::info!("Drawn new for page {:?}", page_idx);
+                        log::debug!("Drawn new for page {:?}", page_idx);
                     }
                     let top = px(new_data.page_offset_pt * zoom_level);
                     let strip_height = px(new_data.covered_height_pt() * zoom_level);
@@ -1778,7 +1778,7 @@ impl Element for PdfContentElement {
                             .cursor_pointer()
                             .hover(|style| style.bg(gpui::rgba(0x0060df22)))
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                                log::info!("Clicked {:?}", action);
+                                log::debug!("Clicked {:?}", action);
                                 match action.clone() {
                                     PdfLinkAction::External(url) => {
                                         cx.open_url(&url);
@@ -1951,7 +1951,7 @@ impl Element for PdfContentElement {
             self.pdf_view.update(cx, |this, _| {
                 if tasks_empty && !need_cache && !this.stale_page_cache.is_empty() {
                     this.stale_page_cache.clear();
-                    log::info!("Cleared stale page cache");
+                    log::debug!("Cleared stale page cache");
                 }
             });
 

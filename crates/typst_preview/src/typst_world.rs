@@ -86,7 +86,7 @@ fn static_fonts() -> &'static (FontBook, Vec<FontSlot>) {
         db.load_system_fonts();
         collect_fontdb_faces(&db, &mut book, &mut fonts);
 
-        log::info!(
+        log::debug!(
             "Scanned {} bundled + system fonts in {:?}",
             fonts.len(),
             start.elapsed()
@@ -139,7 +139,7 @@ impl TypstSystemWorld {
             sources: RwLock::new(Default::default()),
         };
 
-        log::info!("Initialized TypstWorld in {:?}", start.elapsed());
+        log::debug!("Initialized TypstWorld in {:?}", start.elapsed());
 
         world
     }
@@ -219,12 +219,12 @@ impl World for TypstSystemWorld {
         let mut sources = self.sources.write();
         if let Some(source) = sources.get_mut(&id) {
             if source.text() != text {
-                log::info!("Updating source: {:?}", path);
+                log::debug!("Updating source: {:?}", path);
                 source.replace(&text);
             }
             Ok(source.clone())
         } else {
-            log::info!("Adding source: {:?}", path);
+            log::debug!("Adding source: {:?}", path);
             let source = Source::new(id, text);
             sources.insert(id, source.clone());
             Ok(source)

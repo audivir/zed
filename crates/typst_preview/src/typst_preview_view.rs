@@ -44,7 +44,6 @@ pub struct TypstPreviewView {
     pdf_view: Entity<PdfView>,
     world: Option<Arc<Mutex<TypstSystemWorld>>>,
     document: Option<Arc<PagedDocument>>,
-    active_source_index: Option<usize>,
     compile_state: TypstCompileState,
     /// Warnings from the last successful compile, which do not fail compilation.
     compile_warnings: Vec<String>,
@@ -544,7 +543,6 @@ impl TypstPreviewView {
                 pdf_view: pdf_view,
                 world: None,
                 document: None,
-                active_source_index: None,
                 compile_state: TypstCompileState::Uninitialized,
                 compile_warnings: Vec::new(),
                 pending_update_task: None,
@@ -1048,16 +1046,16 @@ impl TypstPreviewView {
                         world.update_main(main_contents.into(), &main_file_path);
                         world.file_overrides = final_overrides;
 
-                        log::info!("Prepared compilation in {:?}", start.elapsed());
+                        log::debug!("Prepared compilation in {:?}", start.elapsed());
                         let start = Instant::now();
 
                         let compiled = typst::compile(&*world);
                         let mut diagnostics = resolve_typst_diagnostics(&world, &compiled.warnings);
                         for diagnostic in &diagnostics {
-                            log::warn!("Typst compile warning: {}", diagnostic.message);
+                            log::debug!("Typst compile warning: {}", diagnostic.message);
                         }
 
-                        log::info!("Compiled in {:?}", start.elapsed());
+                        log::debug!("Compiled in {:?}", start.elapsed());
                         let start = Instant::now();
 
                         let document = match compiled.output {
@@ -1074,7 +1072,7 @@ impl TypstPreviewView {
                             }
                         };
 
-                        log::info!("Generated output in {:?}", start.elapsed());
+                        log::debug!("Generated output in {:?}", start.elapsed());
                         let start = Instant::now();
 
                         let bytes =
@@ -1088,7 +1086,7 @@ impl TypstPreviewView {
                                 }
                             };
 
-                        log::info!("Generated PDF in {:?}", start.elapsed());
+                        log::debug!("Generated PDF in {:?}", start.elapsed());
                         let start = Instant::now();
 
                         let mut max_width = 0.0f32;
@@ -1115,7 +1113,7 @@ impl TypstPreviewView {
                             });
                         }
 
-                        log::info!(
+                        log::debug!(
                             "Page sizes extracted for {} pages in {:?}",
                             document.pages().len(),
                             start.elapsed()
@@ -1196,9 +1194,6 @@ impl TypstPreviewView {
         reveal: bool,
         cx: &mut Context<Self>,
     ) {
-        self.active_source_index = Some(source_index);
-        self.sync_active_root_block(cx);
-
         if reveal {
             if let (Some(document), Some(world)) = (&self.document, &self.world) {
                 let world_lock = world.lock();
@@ -1287,19 +1282,11 @@ impl TypstPreviewView {
                         });
                     }
                     if positions.len() > 1 {
-                        log::warn!("Other positions ignored:");
-                        for position in positions.iter() {
-                            log::warn!("pos: {:?}", position);
-                        }
-                        return;
+                        log::debug!("ignoring {} other preview positions", positions.len() - 1);
                     }
                 }
             }
         }
-    }
-
-    fn sync_active_root_block(&mut self, _cx: &mut Context<Self>) {
-        // TODO: implement forward search by scrolling the PDF to the active source index.
     }
 
     /// Moves the cursor of `editor` to the start of the line containing `source_index`.

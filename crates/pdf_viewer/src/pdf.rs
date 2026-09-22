@@ -240,7 +240,7 @@ impl Pdf {
                             });
                             if should_insert {
                                 cache.insert(page_idx, new_page);
-                                log::info!("Written to cache");
+                                log::debug!("Written to cache");
                             }
                         }
                         Err(e) => {

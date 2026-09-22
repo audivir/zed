@@ -79,7 +79,7 @@ impl PdfItem {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) -> Option<oneshot::Receiver<()>> {
-        log::info!("Creating reload task");
+        log::debug!("Creating reload task");
         let local_file = self.file.as_local()?;
         let (tx, rx) = futures::channel::oneshot::channel();
 
@@ -102,7 +102,7 @@ impl PdfItem {
             }
 
             _ = tx.send(());
-            log::info!("Reload task completed");
+            log::debug!("Reload task completed");
         }));
         Some(rx)
     }
@@ -206,15 +206,15 @@ pub struct PdfStore {
 
 impl PdfStore {
     pub fn local(worktree_store: Entity<WorktreeStore>, cx: &mut Context<Self>) -> Self {
-        log::info!("Local PDF store created");
+        log::debug!("Local PDF store created");
         let this = cx.weak_entity();
         Self {
             state: Box::new(cx.new(|cx| {
                 let subscription =
                     cx.subscribe(&worktree_store, |this: &mut LocalPdfStore, _, event, cx| {
-                        log::info!("trying to subscribe");
+                        log::debug!("trying to subscribe");
                         if let WorktreeStoreEvent::WorktreeAdded(worktree) = event {
-                            log::info!("subscribed to worktree");
+                            log::debug!("subscribed to worktree");
                             this.subscribe_to_worktree(worktree, cx);
                         }
                     });
@@ -229,7 +229,7 @@ impl PdfStore {
                 // catch up on worktrees that were already open.
                 let worktrees = worktree_store.read(cx).worktrees().collect::<Vec<_>>();
                 for worktree in worktrees {
-                    log::info!("Subscribing to existing worktree during init");
+                    log::debug!("Subscribing to existing worktree during init");
                     local_store.subscribe_to_worktree(&worktree, cx);
                 }
 
@@ -323,7 +323,7 @@ impl PdfStore {
         cx: &mut Context<PdfStore>,
     ) -> Task<Result<()>> {
         let location = std::panic::Location::caller();
-        log::info!(
+        log::debug!(
             "Called PdfStore::reload_pdfs from {}:{}",
             location.file(),
             location.line()
@@ -344,7 +344,7 @@ impl PdfStore {
     }
 
     fn on_pdf_event(&mut self, pdf: Entity<PdfItem>, event: &PdfItemEvent, cx: &mut Context<Self>) {
-        log::info!("Got PDF event: {:?}", event);
+        log::debug!("Got PDF event: {:?}", event);
         if let PdfItemEvent::FileHandleChanged = event
             && let Some(local) = self.state.as_local()
         {
@@ -408,7 +408,7 @@ impl PdfStoreImpl for Entity<LocalPdfStore> {
         cx: &mut Context<PdfStore>,
     ) -> Task<Result<()>> {
         let location = std::panic::Location::caller();
-        log::info!(
+        log::debug!(
             "Called LocalPdfStore::reload_pdfs from {}:{}",
             location.file(),
             location.line()
@@ -629,12 +629,6 @@ impl PdfProject {
         project
     }
 
-    /// Whether the project comes from collab, not counting remote servers.
-    #[inline]
-    pub fn is_via_collab(&self) -> bool {
-        false
-    }
-
     fn on_pdf_store_event(
         &mut self,
         _: Entity<PdfStore>,
@@ -658,9 +652,7 @@ impl PdfProject {
         cx: &mut Context<Self>,
     ) -> Option<()> {
         // TODO: handle PDF events from remote.
-        if let PdfItemEvent::ReloadNeeded = event
-            && !self.is_via_collab()
-        {
+        if let PdfItemEvent::ReloadNeeded = event {
             self.reload_pdfs([pdf].into_iter().collect(), cx)
                 .detach_and_log_err(cx);
         }

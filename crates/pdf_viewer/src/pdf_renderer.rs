@@ -368,7 +368,7 @@ impl PdfRenderer {
             Err(e) => return Err(anyhow!("Failed to read PDF bytes: {:?}", e)),
         };
 
-        log::info!("Document parsed in {:?}", start.elapsed());
+        log::debug!("Document parsed in {:?}", start.elapsed());
 
         let (pages, max_width) = pages_max_width.unwrap_or_else(|| {
             let start = Instant::now();
@@ -398,7 +398,7 @@ impl PdfRenderer {
                     }
                 })
                 .collect();
-            log::info!(
+            log::debug!(
                 "Page sizes extracted for {} pages in {:?}",
                 document.pages().len(),
                 start.elapsed()
@@ -417,7 +417,7 @@ impl PdfRenderer {
             }
         }
 
-        log::info!(
+        log::debug!(
             "Chapters extracted for {} pages in {:?}",
             document.pages().len(),
             start.elapsed()
@@ -694,7 +694,7 @@ impl PdfRenderer {
             Self::extract_text_and_links(&page, page_index, &metadata)?
         };
 
-        log::info!(
+        log::debug!(
             "Rendered page {} (scale {}, with text? {:?}) in {:?}",
             page_index + 1,
             scale,
@@ -867,47 +867,9 @@ impl PdfRenderer {
             }
         }
 
-        log::info!("Searched in {:?}", start.elapsed());
+        log::debug!("Searched in {:?}", start.elapsed());
 
         Ok(results)
-    }
-}
-
-impl PdfChapter {
-    /// Formats the chapter and its children as an indented tree.
-    pub fn format_tree(&self, depth: usize, out: &mut String) {
-        let indent = "  ".repeat(depth);
-
-        let title = self.title.as_deref().unwrap_or("<Untitled>");
-        let page = self.target.page_index;
-        let x = self.target.point.x;
-        let y = self.target.point.y;
-
-        out.push_str(&format!(
-            "{}- {} (Page: {}, x: {:.2}, y: {:.2})\n",
-            indent, title, page, x, y
-        ));
-
-        for child in &self.children {
-            child.format_tree(depth + 1, out);
-        }
-    }
-}
-
-impl DocumentMetadata {
-    /// Logs the bookmark tree.
-    pub fn debug_log_bookmarks(&self) {
-        if self.chapters.is_empty() {
-            log::info!("No bookmarks found in this PDF.");
-            return;
-        }
-        let mut output = String::from("\n--- PDF Bookmark Tree ---\n");
-
-        for chapter in self.chapters.iter() {
-            chapter.format_tree(0, &mut output);
-        }
-
-        log::info!("{}", output);
     }
 }
 
