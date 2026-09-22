@@ -40,7 +40,10 @@ pub(super) const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Size of each recycled PTY read buffer.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Maximum bytes the parser thread batches into one write before returning effects.
-const MAX_PTY_PARSE_BATCH_BYTES: usize = 512 * 1024;
+///
+/// Parsing runs at roughly 100 MB/s while holding the terminal lock, so this keeps each hold
+/// near 1 ms and frames never wait long for the lock during output floods.
+const MAX_PTY_PARSE_BATCH_BYTES: usize = 128 * 1024;
 /// Capacity of the reader-to-parser queue, so a slow parser applies backpressure to reads.
 const MAX_QUEUED_PTY_OUTPUT_BUFFERS: usize = 512;
 /// Capacity of the channel recycling buffers back to the reader thread.
