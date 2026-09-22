@@ -472,27 +472,27 @@ impl GhosttyTerminal {
         Ok(modes)
     }
 
-    // Selection. `crate::Point`/`crate::SelectionRange` round-trip through
-    // Ghostty's `Point::Viewport`/`PointSpace::Viewport`, using the same
-    // `line + display_offset = viewport row` convention
-    // `terminal_element.rs`'s `to_highlighted_range_lines` already uses to
-    // map a `Point` onto the currently-rendered grid, so this code only
-    // ever round-trips Ghostty's own addressing and never has to reconcile
-    // it against a different engine's.
+    // selections round-trip through Ghostty's screen space rather than its viewport space, since
+    // a selection extended while scrolling has endpoints outside the current viewport.
+
+    /// Returns the screen row of `crate::Point` line zero, i.e. the top of the active screen.
+    fn screen_line_base(&self) -> Result<i64> {
+        Ok(self.terminal.total_rows()? as i64 - i64::from(self.terminal.rows()?))
+    }
 
     /// Installs `range` as the active selection, or clears it if `None`.
     /// Also updates the cached `current_selection` mirror `selection_range`/
     /// `update_selection` read.
     pub(super) fn set_selection(&mut self, range: Option<crate::SelectionRange>) -> Result<()> {
-        let display_offset = self.alacritty_style_display_offset()?;
+        let line_base = self.screen_line_base()?;
         match range {
             Some(range) => {
                 let start = self
                     .terminal
-                    .grid_ref(ghostty_viewport_point(display_offset, range.start))?;
+                    .grid_ref(ghostty_screen_point(line_base, range.start))?;
                 let end = self
                     .terminal
-                    .grid_ref(ghostty_viewport_point(display_offset, range.end))?;
+                    .grid_ref(ghostty_screen_point(line_base, range.end))?;
                 let selection =
                     libghostty_vt::selection::Selection::new(start, end, range.is_block);
                 self.terminal.set_selection(Some(&selection))?;
@@ -543,17 +543,17 @@ impl GhosttyTerminal {
         &mut self,
         point: crate::Point,
     ) -> Result<Option<crate::SelectionRange>> {
-        let display_offset = self.alacritty_style_display_offset()?;
+        let line_base = self.screen_line_base()?;
         let grid_ref = self
             .terminal
-            .grid_ref(ghostty_viewport_point(display_offset, point))?;
+            .grid_ref(ghostty_screen_point(line_base, point))?;
         let Some(selection) = self
             .terminal
             .select_word(libghostty_vt::selection::SelectWordOptions::new(grid_ref))?
         else {
             return Ok(None);
         };
-        let range = selection_range_from_ghostty(&self.terminal, display_offset, &selection)?;
+        let range = selection_range_from_ghostty(&self.terminal, line_base, &selection)?;
         self.terminal.set_selection(Some(&selection))?;
         self.current_selection = Some(range);
         Ok(Some(range))
@@ -565,17 +565,17 @@ impl GhosttyTerminal {
         &mut self,
         point: crate::Point,
     ) -> Result<Option<crate::SelectionRange>> {
-        let display_offset = self.alacritty_style_display_offset()?;
+        let line_base = self.screen_line_base()?;
         let grid_ref = self
             .terminal
-            .grid_ref(ghostty_viewport_point(display_offset, point))?;
+            .grid_ref(ghostty_screen_point(line_base, point))?;
         let Some(selection) = self
             .terminal
             .select_line(libghostty_vt::selection::SelectLineOptions::new(grid_ref))?
         else {
             return Ok(None);
         };
-        let range = selection_range_from_ghostty(&self.terminal, display_offset, &selection)?;
+        let range = selection_range_from_ghostty(&self.terminal, line_base, &selection)?;
         self.terminal.set_selection(Some(&selection))?;
         self.current_selection = Some(range);
         Ok(Some(range))
@@ -583,11 +583,11 @@ impl GhosttyTerminal {
 
     /// Derives and installs a selection covering all selectable content.
     pub(super) fn select_all(&mut self) -> Result<Option<crate::SelectionRange>> {
-        let display_offset = self.alacritty_style_display_offset()?;
+        let line_base = self.screen_line_base()?;
         let Some(selection) = self.terminal.select_all()? else {
             return Ok(None);
         };
-        let range = selection_range_from_ghostty(&self.terminal, display_offset, &selection)?;
+        let range = selection_range_from_ghostty(&self.terminal, line_base, &selection)?;
         self.terminal.set_selection(Some(&selection))?;
         self.current_selection = Some(range);
         Ok(Some(range))
@@ -607,13 +607,13 @@ impl GhosttyTerminal {
         anchor: crate::Point,
         drag_point: crate::Point,
     ) -> Result<Option<crate::SelectionRange>> {
-        let display_offset = self.alacritty_style_display_offset()?;
+        let line_base = self.screen_line_base()?;
         let anchor_ref = self
             .terminal
-            .grid_ref(ghostty_viewport_point(display_offset, anchor))?;
+            .grid_ref(ghostty_screen_point(line_base, anchor))?;
         let drag_ref = self
             .terminal
-            .grid_ref(ghostty_viewport_point(display_offset, drag_point))?;
+            .grid_ref(ghostty_screen_point(line_base, drag_point))?;
 
         let word_toward_drag = self.terminal.select_word_between(
             libghostty_vt::selection::SelectWordBetweenOptions::new(
@@ -636,9 +636,9 @@ impl GhosttyTerminal {
         // taking the overall min/max instead (same technique
         // `select_line_range` below uses) handles either drag direction.
         let word_toward_drag_range =
-            selection_range_from_ghostty(&self.terminal, display_offset, &word_toward_drag)?;
+            selection_range_from_ghostty(&self.terminal, line_base, &word_toward_drag)?;
         let word_toward_anchor_range =
-            selection_range_from_ghostty(&self.terminal, display_offset, &word_toward_anchor)?;
+            selection_range_from_ghostty(&self.terminal, line_base, &word_toward_anchor)?;
         let start = word_toward_drag_range
             .start
             .min(word_toward_drag_range.end)
@@ -670,13 +670,13 @@ impl GhosttyTerminal {
         anchor: crate::Point,
         drag_point: crate::Point,
     ) -> Result<Option<crate::SelectionRange>> {
-        let display_offset = self.alacritty_style_display_offset()?;
+        let line_base = self.screen_line_base()?;
         let anchor_ref = self
             .terminal
-            .grid_ref(ghostty_viewport_point(display_offset, anchor))?;
+            .grid_ref(ghostty_screen_point(line_base, anchor))?;
         let drag_ref = self
             .terminal
-            .grid_ref(ghostty_viewport_point(display_offset, drag_point))?;
+            .grid_ref(ghostty_screen_point(line_base, drag_point))?;
 
         let anchor_line = self
             .terminal
@@ -687,9 +687,8 @@ impl GhosttyTerminal {
         let (Some(anchor_line), Some(drag_line)) = (anchor_line, drag_line) else {
             return Ok(None);
         };
-        let anchor_range =
-            selection_range_from_ghostty(&self.terminal, display_offset, &anchor_line)?;
-        let drag_range = selection_range_from_ghostty(&self.terminal, display_offset, &drag_line)?;
+        let anchor_range = selection_range_from_ghostty(&self.terminal, line_base, &anchor_line)?;
+        let drag_range = selection_range_from_ghostty(&self.terminal, line_base, &drag_line)?;
         let start = anchor_range
             .start
             .min(anchor_range.end)
@@ -1702,47 +1701,47 @@ fn ghostty_viewport_point(
     })
 }
 
-/// The inverse of `ghostty_viewport_point`: converts a `PointCoordinate`
-/// already known to be in Ghostty's `Viewport` space back into a Zed
-/// `Point`.
-fn zed_point_from_viewport_coordinate(
-    display_offset: usize,
+fn ghostty_screen_point(line_base: i64, point: crate::Point) -> libghostty_vt::terminal::Point {
+    libghostty_vt::terminal::Point::Screen(libghostty_vt::terminal::PointCoordinate {
+        x: point.column.min(u16::MAX as usize) as u16,
+        y: (i64::from(point.line) + line_base).clamp(0, i64::from(u32::MAX)) as u32,
+    })
+}
+
+fn zed_point_from_screen_coordinate(
+    line_base: i64,
     coordinate: libghostty_vt::terminal::PointCoordinate,
 ) -> crate::Point {
     crate::Point::new(
-        coordinate.y as i32 - display_offset as i32,
+        (i64::from(coordinate.y) - line_base) as i32,
         coordinate.x as usize,
     )
 }
 
-/// Converts a freshly-derived `Selection` snapshot (from `select_word`/
-/// `select_line`/`select_all`, or any other selection-deriving call) into a
-/// `crate::SelectionRange`, without installing it or touching any
-/// `GhosttyTerminal` state. It's a free function rather than a
-/// `&mut self` method so callers can hold the `Selection` (which borrows
-/// `terminal`) across the subsequent `terminal.set_selection(...)` call
-/// without the borrow checker treating that as conflicting with a `&mut
-/// self` reborrow.
+/// Converts a derived `Selection` into a `crate::SelectionRange` without installing it.
+///
+/// A free function so callers can hold the `Selection`, which borrows `terminal`, across a
+/// subsequent `terminal.set_selection` call.
 fn selection_range_from_ghostty(
     terminal: &libghostty_vt::Terminal<'static, 'static>,
-    display_offset: usize,
+    line_base: i64,
     selection: &libghostty_vt::selection::Selection<'_>,
 ) -> Result<crate::SelectionRange> {
     let start = terminal
         .point_from_grid_ref(
             &selection.start(),
-            libghostty_vt::terminal::PointSpace::Viewport,
+            libghostty_vt::terminal::PointSpace::Screen,
         )?
-        .context("selection start not representable in viewport space")?;
+        .context("selection start not representable in screen space")?;
     let end = terminal
         .point_from_grid_ref(
             &selection.end(),
-            libghostty_vt::terminal::PointSpace::Viewport,
+            libghostty_vt::terminal::PointSpace::Screen,
         )?
-        .context("selection end not representable in viewport space")?;
+        .context("selection end not representable in screen space")?;
     Ok(crate::SelectionRange {
-        start: zed_point_from_viewport_coordinate(display_offset, start),
-        end: zed_point_from_viewport_coordinate(display_offset, end),
+        start: zed_point_from_screen_coordinate(line_base, start),
+        end: zed_point_from_screen_coordinate(line_base, end),
         is_block: selection.is_rectangle(),
     })
 }
@@ -2997,6 +2996,35 @@ mod tests {
         terminal.set_selection(None).unwrap();
         assert_eq!(terminal.selection_range(), None);
         assert_eq!(terminal.selection_text().unwrap(), None);
+    }
+
+    #[test]
+    fn selection_extended_after_scrolling_keeps_its_offscreen_anchor() {
+        let mut terminal = GhosttyTerminal::new(20, 3, 100).unwrap();
+        terminal.resize(test_bounds(20, 3)).unwrap();
+        for line in 0..10 {
+            terminal.write(format!("line {line}\r\n").as_bytes());
+        }
+
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let top_display_offset = terminal.alacritty_style_display_offset().unwrap() as i32;
+        terminal
+            .set_selection(Some(crate::SelectionRange {
+                start: crate::Point::new(-top_display_offset, 0),
+                end: crate::Point::new(-top_display_offset, 5),
+                is_block: false,
+            }))
+            .unwrap();
+
+        terminal.scroll_viewport(ScrollViewport::Bottom);
+        terminal.update_selection(crate::Point::new(1, 5)).unwrap();
+
+        let text = terminal.selection_text().unwrap().unwrap_or_default();
+        assert!(
+            text.starts_with("line 0"),
+            "lost offscreen anchor: {text:?}"
+        );
+        assert!(text.ends_with("line 9"), "missing drag end: {text:?}");
     }
 
     #[test]
