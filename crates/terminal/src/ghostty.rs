@@ -308,19 +308,27 @@ impl GhosttyTerminal {
     }
 
     /// Builds the viewport cell grid, mode flags, and display offset.
+    ///
+    /// Cell points follow the crate convention where `line + display_offset` is the viewport row.
     pub(super) fn build_content(
         &mut self,
     ) -> Result<(Vec<crate::IndexedCell>, crate::Modes, usize)> {
+        let display_offset = self.alacritty_style_display_offset()?;
+        let first_line = -(display_offset as i32);
         let snapshot = self.render_state.update(&self.terminal)?;
         let mut rows = self.rows.update(&snapshot)?;
         let total_cells = usize::from(self.terminal.rows().unwrap_or(24))
             * usize::from(self.terminal.cols().unwrap_or(80));
         let mut cells = Vec::with_capacity(total_cells);
-        let mut row_index: i32 = 0;
+        let mut line = first_line;
+        // consecutive cells of one link share an allocation.
+        let mut previous_hyperlink: Option<crate::Hyperlink> = None;
         // reused across cells so typical grapheme clusters never allocate.
         let mut grapheme_buf = [' '; 32];
 
         while let Some(row) = rows.next() {
+            // the row flag may report false positives, but skips per-cell checks on plain rows.
+            let row_has_hyperlink = row.raw_row()?.has_hyperlink()?;
             let mut row_cells = self.cells.update(row)?;
             let mut col_index: usize = 0;
 
@@ -344,8 +352,21 @@ impl GhosttyTerminal {
                     (graphemes[0], graphemes[1..].to_vec())
                 };
 
+                let point = crate::Point::new(line, col_index);
+                let hyperlink = if row_has_hyperlink && raw_cell.has_hyperlink()? {
+                    hyperlink_uri_at_point(&self.terminal, display_offset, point)?.map(|uri| {
+                        match &previous_hyperlink {
+                            Some(previous) if previous.uri() == uri => previous.clone(),
+                            _ => crate::Hyperlink::new(None, uri.into()),
+                        }
+                    })
+                } else {
+                    None
+                };
+                previous_hyperlink.clone_from(&hyperlink);
+
                 cells.push(crate::IndexedCell {
-                    point: crate::Point::new(row_index, col_index),
+                    point,
                     cell: crate::Cell {
                         character,
                         zerowidth,
@@ -357,8 +378,7 @@ impl GhosttyTerminal {
                             style.bg_color,
                             vte::ansi::NamedColor::Background,
                         ),
-                        // OSC 8 hyperlinks are resolved on hover instead.
-                        hyperlink: None,
+                        hyperlink,
                         is_bold: style.bold,
                         is_italic: style.italic,
                         is_dim: style.faint,
@@ -371,11 +391,10 @@ impl GhosttyTerminal {
                 });
                 col_index += 1;
             }
-            row_index += 1;
+            line += 1;
         }
 
         let modes = self.modes()?;
-        let display_offset = self.alacritty_style_display_offset()?;
         Ok((cells, modes, display_offset))
     }
 
@@ -3133,6 +3152,48 @@ mod tests {
             "not scrolled (viewing the live bottom) must report Alacritty-style \
              display_offset 0, not Ghostty's raw (inverted-polarity) scrollbar offset"
         );
+    }
+
+    #[test]
+    fn build_content_uses_grid_lines_when_scrolled() {
+        let mut terminal = GhosttyTerminal::new(10, 3, 100).unwrap();
+        terminal.resize(test_bounds(10, 3)).unwrap();
+        for i in 0..20 {
+            terminal.write(format!("line {i}\r\n").as_bytes());
+        }
+        terminal.scroll_viewport(ScrollViewport::Top);
+
+        let (cells, _mode, display_offset) = terminal.build_content().unwrap();
+        assert!(display_offset > 0);
+        let first = cells.first().unwrap();
+        assert_eq!(first.point.line, -(display_offset as i32));
+        let first_row: String = cells
+            .iter()
+            .filter(|cell| cell.point.line == first.point.line)
+            .map(|cell| cell.character())
+            .collect();
+        assert_eq!(first_row.trim(), "line 0");
+    }
+
+    #[test]
+    fn build_content_reports_osc8_hyperlinks() {
+        let mut terminal = GhosttyTerminal::new(20, 2, 100).unwrap();
+        terminal.resize(test_bounds(20, 2)).unwrap();
+        terminal.write(b"a \x1b]8;;https://zed.dev\x1b\\link\x1b]8;;\x1b\\ b");
+
+        let (cells, _mode, _display_offset) = terminal.build_content().unwrap();
+        let uri_at = |column: usize| {
+            cells
+                .iter()
+                .find(|cell| cell.point == crate::Point::new(0, column))
+                .and_then(|cell| cell.hyperlink())
+                .map(|hyperlink| hyperlink.uri().to_string())
+        };
+        assert_eq!(uri_at(0), None);
+        for column in 2..=5 {
+            assert_eq!(uri_at(column).as_deref(), Some("https://zed.dev"));
+        }
+        assert_eq!(uri_at(6), None);
     }
 
     fn base64_encode(data: &[u8]) -> String {

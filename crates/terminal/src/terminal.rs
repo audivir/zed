@@ -4651,6 +4651,20 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_plain_click_opens_osc8_hyperlink(cx: &mut TestAppContext) {
+        let terminal = init_terminal_test(
+            cx,
+            b"Visit \x1b]8;;https://zed.dev/\x1b\\here\x1b]8;;\x1b\\ now\r\n",
+        );
+        terminal.update(cx, |terminal, cx| {
+            let link_position = point(px(70.), px(5.));
+            left_mouse_down_at(terminal, link_position, cx);
+            left_mouse_up_at(terminal, link_position, cx);
+        });
+        assert_eq!(cx.opened_url().as_deref(), Some("https://zed.dev/"));
+    }
+
+    #[gpui::test]
     async fn test_local_selection_scrolls_without_terminal_reports(cx: &mut TestAppContext) {
         let mut output = Vec::new();
         output.extend_from_slice(b"\x1b[?1002h\x1b[?1006h");
@@ -5801,9 +5815,10 @@ mod tests {
                     term.sync(window, cx);
                     let content = &term.last_content;
                     let mut row_of_line = collections::HashMap::default();
-                    for (row, line) in &content.cells.iter().chunk_by(|cell| cell.point.line) {
-                        let text: String = line.map(|cell| cell.character()).collect();
-                        row_of_line.insert(text.trim().to_string(), row);
+                    for (line, cells) in &content.cells.iter().chunk_by(|cell| cell.point.line) {
+                        let text: String = cells.map(|cell| cell.character()).collect();
+                        let viewport_row = line + content.display_offset as i32;
+                        row_of_line.insert(text.trim().to_string(), viewport_row);
                     }
                     (content.images.clone(), content.display_offset, row_of_line)
                 });
