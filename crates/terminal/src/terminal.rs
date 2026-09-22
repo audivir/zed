@@ -2377,25 +2377,16 @@ impl Terminal {
 
     /// Returns the number of lines occupied by scrollback plus used screen content.
     pub fn used_lines(&self) -> usize {
-        if self.last_content.mode.contains(Modes::ALT_SCREEN) {
-            return self.last_content.total_lines;
+        let Some(ghostty) = self.ghostty.as_ref() else {
+            return 0;
+        };
+        match ghostty.lock().used_lines() {
+            Ok(lines) => lines,
+            Err(error) => {
+                log::error!("failed to read ghostty used line count: {error}");
+                0
+            }
         }
-        let screen_lines = self.viewport_lines();
-        let cursor_line = self.last_content.cursor.point.line.max(0) as usize;
-        let last_occupied_line = self
-            .last_content
-            .cells
-            .iter()
-            .filter(|cell| {
-                cell.cell.character != ' '
-                    && (cell.point.line as usize) > cursor_line
-                    && (cell.point.line as usize) < screen_lines
-            })
-            .map(|cell| cell.point.line as usize)
-            .max()
-            .unwrap_or(cursor_line);
-        let history_size = self.last_content.total_lines.saturating_sub(screen_lines);
-        history_size + last_occupied_line + 1
     }
 
     //To test:

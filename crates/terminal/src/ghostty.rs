@@ -217,6 +217,29 @@ impl GhosttyTerminal {
         Ok(self.terminal.rows()?)
     }
 
+    /// Returns the number of rows used by scrollback plus the screen down to the cursor or the
+    /// last non-blank row below it.
+    ///
+    /// Reads the live grid, since callers size embedded terminals between syncs.
+    pub(super) fn used_lines(&self) -> Result<usize> {
+        let total_rows = self.terminal.total_rows()?;
+        if self.modes()?.contains(crate::Modes::ALT_SCREEN) {
+            return Ok(total_rows);
+        }
+        let grid = ViGrid::new(&self.terminal)?;
+        let screen_lines = i64::from(self.terminal.rows()?);
+        let cursor_line = i64::from(self.terminal.cursor_y()?);
+        let mut last_used_line = cursor_line;
+        for line in (cursor_line + 1..screen_lines).rev() {
+            if !grid.is_row_clear(grid.line_base + line)? {
+                last_used_line = line;
+                break;
+            }
+        }
+        let history_rows = total_rows.saturating_sub(screen_lines as usize);
+        Ok(history_rows + last_used_line as usize + 1)
+    }
+
     /// Returns the total number of rows including scrollback.
     pub(super) fn total_lines(&self) -> Result<usize> {
         Ok(self.terminal.total_rows()?)
