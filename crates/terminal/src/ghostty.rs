@@ -110,6 +110,8 @@ pub(super) struct GhosttyTerminal {
     current_vi_cursor: Option<crate::Point>,
     /// Buffer text and point map for search, dropped whenever the grid changes.
     search_text: Option<(String, Vec<crate::Point>)>,
+    /// Formatted selection text, dropped whenever the grid or the selection changes.
+    selection_text: Option<Option<String>>,
 }
 
 // SAFETY: libghostty-vt objects are `!Send` only because they hold raw pointers and callback
@@ -188,21 +190,25 @@ impl GhosttyTerminal {
             current_selection: None,
             current_vi_cursor: None,
             search_text: None,
+            selection_text: None,
         })
     }
 
     pub(super) fn write(&mut self, bytes: &[u8]) {
         self.search_text = None;
+        self.selection_text = None;
         self.terminal.vt_write(bytes);
     }
 
     pub(super) fn clear(&mut self) {
         self.search_text = None;
+        self.selection_text = None;
         self.terminal.vt_write(b"\x1b[3J\x1b[H\x1b[2J");
     }
 
     pub(super) fn resize(&mut self, bounds: TerminalBounds) -> Result<()> {
         self.search_text = None;
+        self.selection_text = None;
         self.terminal.resize(
             bounds.num_columns().max(1) as u16,
             bounds.num_lines().max(1) as u16,
@@ -496,6 +502,7 @@ impl GhosttyTerminal {
             }
         }
         self.current_selection = range;
+        self.selection_text = None;
         Ok(())
     }
 
@@ -518,15 +525,23 @@ impl GhosttyTerminal {
 
     /// Formats the active selection as plain text, joining soft wraps and trimming trailing
     /// whitespace.
-    pub(super) fn selection_text(&self) -> Result<Option<String>> {
+    ///
+    /// The result is cached until the grid or the selection changes, since callers read it on
+    /// every sync.
+    pub(super) fn selection_text(&mut self) -> Result<Option<String>> {
+        if let Some(text) = &self.selection_text {
+            return Ok(text.clone());
+        }
         let options = libghostty_vt::selection::FormatOptions::new()
             .with_emit_format(libghostty_vt::fmt::Format::Plain)
             .with_unwrap(true)
             .with_trim(true);
-        let Some(bytes) = self.terminal.format_selection_alloc(None, options)? else {
-            return Ok(None);
-        };
-        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        let text = self
+            .terminal
+            .format_selection_alloc(None, options)?
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        self.selection_text = Some(text.clone());
+        Ok(text)
     }
 
     /// Selects the word at `point` using the word boundaries of Ghostty.
@@ -547,6 +562,7 @@ impl GhosttyTerminal {
         let range = selection_range_from_ghostty(&self.terminal, line_base, &selection)?;
         self.terminal.set_selection(Some(&selection))?;
         self.current_selection = Some(range);
+        self.selection_text = None;
         Ok(Some(range))
     }
 
@@ -568,6 +584,7 @@ impl GhosttyTerminal {
         let range = selection_range_from_ghostty(&self.terminal, line_base, &selection)?;
         self.terminal.set_selection(Some(&selection))?;
         self.current_selection = Some(range);
+        self.selection_text = None;
         Ok(Some(range))
     }
 
@@ -580,6 +597,7 @@ impl GhosttyTerminal {
         let range = selection_range_from_ghostty(&self.terminal, line_base, &selection)?;
         self.terminal.set_selection(Some(&selection))?;
         self.current_selection = Some(range);
+        self.selection_text = None;
         Ok(Some(range))
     }
 
@@ -800,6 +818,8 @@ impl GhosttyTerminal {
         let viewport_rows = usize::from(self.terminal.rows()?);
         let cols = usize::from(self.terminal.cols()?);
         let line_base = total_rows as i32 - viewport_rows as i32;
+        // one formatter call replaces a lookup per cell, which costs seconds on large scrollback.
+        let formatted = self.format_screen_rows(total_rows, cols)?;
 
         let mut text = String::new();
         let mut points: Vec<crate::Point> = Vec::new();
@@ -807,35 +827,38 @@ impl GhosttyTerminal {
 
         for absolute_row in 0..total_rows {
             let line = absolute_row as i32 - line_base;
-            let mut row_wrapped = false;
+            let row_ref = self.screen_grid_ref(0, absolute_row)?;
+            let row_wrapped = row_ref.row()?.is_wrapped()?;
             let row_start = points.len();
 
-            for column in 0..cols {
-                let grid_ref = self
-                    .terminal
-                    .grid_ref(libghostty_vt::terminal::Point::Screen(
-                        libghostty_vt::terminal::PointCoordinate {
-                            x: column as u16,
-                            y: absolute_row as u32,
-                        },
-                    ))?;
-                if column == 0 {
-                    row_wrapped = grid_ref.row()?.is_wrapped()?;
-                }
-                if grid_ref.cell()?.wide()? == screen::CellWide::SpacerTail {
-                    continue;
-                }
-                let grapheme_count = grid_ref.graphemes(&mut grapheme_buf)?;
-                if grapheme_count == 0 {
-                    text.push(' ');
-                    points.push(crate::Point::new(line, column));
-                } else {
-                    for &character in &grapheme_buf[..grapheme_count.min(grapheme_buf.len())] {
+            match formatted.get(absolute_row) {
+                // printable ASCII cells are single-width without clusters, so characters map to
+                // consecutive columns.
+                Some(row_text)
+                    if row_text.len() <= cols
+                        && row_text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) =>
+                {
+                    for (column, character) in row_text.chars().enumerate() {
                         text.push(character);
                         points.push(crate::Point::new(line, column));
                     }
+                    if row_wrapped {
+                        for column in row_text.len()..cols {
+                            text.push(' ');
+                            points.push(crate::Point::new(line, column));
+                        }
+                    }
                 }
+                _ => self.append_row_cells(
+                    absolute_row,
+                    line,
+                    cols,
+                    &mut grapheme_buf,
+                    &mut text,
+                    &mut points,
+                )?,
             }
+
             if !row_wrapped {
                 // trim trailing blanks of this row, so `$` matches right after real content.
                 // Wrapped rows are full, so only the current row can have trailing blanks.
@@ -848,6 +871,68 @@ impl GhosttyTerminal {
             }
         }
         Ok((text, points))
+    }
+
+    fn screen_grid_ref(&self, column: usize, absolute_row: usize) -> Result<screen::GridRef<'_>> {
+        Ok(self
+            .terminal
+            .grid_ref(libghostty_vt::terminal::Point::Screen(
+                libghostty_vt::terminal::PointCoordinate {
+                    x: column as u16,
+                    y: absolute_row as u32,
+                },
+            ))?)
+    }
+
+    /// Returns the plain text of every screen row, one entry per row.
+    ///
+    /// Trailing blank rows may be missing.
+    fn format_screen_rows(&self, total_rows: usize, cols: usize) -> Result<Vec<String>> {
+        if total_rows == 0 || cols == 0 {
+            return Ok(Vec::new());
+        }
+        let first = self.screen_grid_ref(0, 0)?;
+        let last = self.screen_grid_ref(cols - 1, total_rows - 1)?;
+        let selection = libghostty_vt::selection::Selection::new(first, last, false);
+        let options = libghostty_vt::selection::FormatOptions::new()
+            .with_emit_format(libghostty_vt::fmt::Format::Plain)
+            .with_unwrap(false)
+            .with_trim(false)
+            .with_selection(&selection);
+        let Some(bytes) = self.terminal.format_selection_alloc(None, options)? else {
+            return Ok(Vec::new());
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(text.split('\n').map(str::to_string).collect())
+    }
+
+    /// Appends the cells of one row with exact column positions, one lookup per cell.
+    fn append_row_cells(
+        &self,
+        absolute_row: usize,
+        line: i32,
+        cols: usize,
+        grapheme_buf: &mut [char; 32],
+        text: &mut String,
+        points: &mut Vec<crate::Point>,
+    ) -> Result<()> {
+        for column in 0..cols {
+            let grid_ref = self.screen_grid_ref(column, absolute_row)?;
+            if grid_ref.cell()?.wide()? == screen::CellWide::SpacerTail {
+                continue;
+            }
+            let grapheme_count = grid_ref.graphemes(grapheme_buf)?;
+            if grapheme_count == 0 {
+                text.push(' ');
+                points.push(crate::Point::new(line, column));
+            } else {
+                for &character in &grapheme_buf[..grapheme_count.min(grapheme_buf.len())] {
+                    text.push(character);
+                    points.push(crate::Point::new(line, column));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the scrollback and active screen as text, without a trailing newline.
@@ -2951,6 +3036,63 @@ mod tests {
         assert!(terminal.live_image_ids().unwrap().is_empty());
     }
 
+    // reference extraction that reads every cell individually.
+    fn buffer_text_per_cell(terminal: &GhosttyTerminal) -> (String, Vec<crate::Point>) {
+        let total_rows = terminal.terminal.total_rows().unwrap();
+        let viewport_rows = usize::from(terminal.terminal.rows().unwrap());
+        let cols = usize::from(terminal.terminal.cols().unwrap());
+        let line_base = total_rows as i32 - viewport_rows as i32;
+        let mut text = String::new();
+        let mut points = Vec::new();
+        let mut grapheme_buf = [' '; 32];
+        for absolute_row in 0..total_rows {
+            let line = absolute_row as i32 - line_base;
+            let row_wrapped = terminal
+                .screen_grid_ref(0, absolute_row)
+                .unwrap()
+                .row()
+                .unwrap()
+                .is_wrapped()
+                .unwrap();
+            let row_start = points.len();
+            terminal
+                .append_row_cells(
+                    absolute_row,
+                    line,
+                    cols,
+                    &mut grapheme_buf,
+                    &mut text,
+                    &mut points,
+                )
+                .unwrap();
+            if !row_wrapped {
+                while points.len() > row_start && text.ends_with(' ') {
+                    text.pop();
+                    points.pop();
+                }
+                text.push('\n');
+                points.push(crate::Point::new(line, cols));
+            }
+        }
+        (text, points)
+    }
+
+    #[test]
+    fn buffer_text_matches_per_cell_extraction() {
+        let mut terminal = GhosttyTerminal::new(12, 4, 1000).unwrap();
+        terminal.resize(test_bounds(12, 4)).unwrap();
+        terminal.write(
+            "plain ascii\r\n\r\n  indented  \r\na\tb\ttab\r\n中文 wide\r\ne\u{0301} accent\r\n\
+             \u{1F980} crab\r\n\x1b[31mred\x1b[0m text\r\nthis line is long enough to wrap twice\r\n\
+             trailing   \r\nlast"
+                .as_bytes(),
+        );
+        assert_eq!(
+            terminal.buffer_text_with_point_map().unwrap(),
+            buffer_text_per_cell(&terminal)
+        );
+    }
+
     #[test]
     fn scrollback_keeps_the_configured_number_of_lines() {
         let mut terminal = GhosttyTerminal::new(200, 40, 10_000).unwrap();
@@ -2961,6 +3103,36 @@ mod tests {
         }
         terminal.write(output.as_bytes());
         assert!(terminal.total_lines().unwrap() >= 10_000);
+    }
+
+    #[test]
+    fn selection_text_follows_selection_and_output_changes() {
+        let mut terminal = GhosttyTerminal::new(20, 3, 100).unwrap();
+        terminal.resize(test_bounds(20, 3)).unwrap();
+        terminal.write(b"hello world");
+        let select = |terminal: &mut GhosttyTerminal, end: usize| {
+            terminal
+                .set_selection(Some(crate::SelectionRange {
+                    start: crate::Point::new(0, 0),
+                    end: crate::Point::new(0, end),
+                    is_block: false,
+                }))
+                .unwrap();
+        };
+
+        select(&mut terminal, 4);
+        assert_eq!(terminal.selection_text().unwrap().as_deref(), Some("hello"));
+        select(&mut terminal, 10);
+        assert_eq!(
+            terminal.selection_text().unwrap().as_deref(),
+            Some("hello world")
+        );
+
+        terminal.write(b"\rHELLO");
+        assert_eq!(
+            terminal.selection_text().unwrap().as_deref(),
+            Some("HELLO world")
+        );
     }
 
     #[test]
