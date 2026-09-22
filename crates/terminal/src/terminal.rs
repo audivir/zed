@@ -2866,7 +2866,7 @@ impl Terminal {
         let kitty_encoding = self.ghostty.as_ref().and_then(|ghostty| {
             ghostty
                 .lock()
-                .encode_kitty_key(keystroke, option_as_meta)
+                .encode_kitty_key(keystroke, option_as_meta, libghostty_vt::key::Action::Press)
                 .log_err()
                 .flatten()
         });
@@ -2885,6 +2885,30 @@ impl Terminal {
         } else {
             false
         }
+    }
+
+    /// Reports a key release to programs that requested release events through the Kitty
+    /// keyboard protocol.
+    pub fn try_key_release(&mut self, keystroke: &Keystroke, option_as_meta: bool) -> bool {
+        if self.vi_mode_enabled {
+            return false;
+        }
+        let encoded = self.ghostty.as_ref().and_then(|ghostty| {
+            ghostty
+                .lock()
+                .encode_kitty_key(
+                    keystroke,
+                    option_as_meta,
+                    libghostty_vt::key::Action::Release,
+                )
+                .log_err()
+                .flatten()
+        });
+        let Some(encoded) = encoded else {
+            return false;
+        };
+        self.input(encoded);
+        true
     }
 
     pub fn try_modifiers_change(

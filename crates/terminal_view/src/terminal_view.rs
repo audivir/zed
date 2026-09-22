@@ -11,9 +11,9 @@ use editor::{
 };
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Point as GpuiPoint, Render, RenderImage, ScrollWheelEvent, Styled, Subscription, Task,
-    TaskExt, WeakEntity, actions, anchored, deferred, div,
+    FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton,
+    MouseDownEvent, Pixels, Point as GpuiPoint, Render, RenderImage, ScrollWheelEvent, Styled,
+    Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -1401,6 +1401,19 @@ impl TerminalView {
         }
     }
 
+    fn key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        let option_as_meta = TerminalSettings::get_global(cx).option_as_meta;
+        let handled = self.terminal.update(cx, |term, _| {
+            term.try_key_release(&event.keystroke, option_as_meta)
+        });
+        if handled {
+            cx.stop_propagation();
+        }
+    }
+
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal.update(cx, |terminal, _| {
             terminal.set_cursor_shape(self.cursor_shape);
@@ -1484,6 +1497,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::rerun_task))
             .on_action(cx.listener(TerminalView::rename_terminal))
             .on_key_down(cx.listener(Self::key_down))
+            .on_key_up(cx.listener(Self::key_up))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {

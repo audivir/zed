@@ -319,14 +319,16 @@ impl GhosttyTerminal {
         Ok(result == libghostty_vt::terminal::CompressionResult::Pending)
     }
 
-    /// Encodes a key press with the Kitty keyboard protocol, once a program enabled it.
+    /// Encodes a key event with the Kitty keyboard protocol, once a program enabled it.
     ///
-    /// Returns `None` while the protocol is off, so the legacy encoding applies, and for keys
-    /// that only produce text, which the text input path delivers.
+    /// Returns `None` while the protocol is off, so the legacy encoding applies, for presses
+    /// that only produce text, which the text input path delivers, and for releases the program
+    /// did not ask to receive.
     pub(super) fn encode_kitty_key(
         &mut self,
         keystroke: &gpui::Keystroke,
         option_as_meta: bool,
+        action: key::Action,
     ) -> Result<Option<Vec<u8>>> {
         if self.terminal.kitty_keyboard_flags()?.is_empty() {
             return Ok(None);
@@ -353,7 +355,7 @@ impl GhosttyTerminal {
         }
 
         self.key_event
-            .set_action(key::Action::Press)
+            .set_action(action)
             .set_key(ghostty_key)
             .set_mods(mods)
             .set_consumed_mods(consumed_mods)
@@ -373,7 +375,9 @@ impl GhosttyTerminal {
         let mut encoded = Vec::with_capacity(32);
         self.key_encoder
             .encode_to_vec(&self.key_event, &mut encoded)?;
-        if encoded.is_empty() || text.is_some_and(|text| text.as_bytes() == encoded) {
+        let plain_text_press =
+            action != key::Action::Release && text.is_some_and(|text| text.as_bytes() == encoded);
+        if encoded.is_empty() || plain_text_press {
             return Ok(None);
         }
         Ok(Some(encoded))
@@ -3674,7 +3678,7 @@ mod tests {
                 keystroke.key_char = Some(keystroke.key.clone());
             }
             terminal
-                .encode_kitty_key(&keystroke, false)
+                .encode_kitty_key(&keystroke, false, key::Action::Press)
                 .unwrap()
                 .map(|bytes| String::from_utf8(bytes).unwrap())
         };
@@ -3705,6 +3709,25 @@ mod tests {
         assert_eq!(encode(&mut terminal, "enter").as_deref(), Some("\r"));
         // plain text keeps flowing through the text input path.
         assert_eq!(encode(&mut terminal, "a"), None);
+
+        let release = |terminal: &mut GhosttyTerminal, keystroke: &str| {
+            let keystroke = gpui::Keystroke::parse(keystroke).unwrap();
+            terminal
+                .encode_kitty_key(&keystroke, false, key::Action::Release)
+                .unwrap()
+                .map(|bytes| String::from_utf8(bytes).unwrap())
+        };
+        assert_eq!(release(&mut terminal, "ctrl-c"), None);
+        // report event types as well.
+        terminal.write(b"\x1b[=3u");
+        assert_eq!(
+            release(&mut terminal, "ctrl-c").as_deref(),
+            Some("\x1b[99;5:3u")
+        );
+        assert_eq!(
+            release(&mut terminal, "escape").as_deref(),
+            Some("\x1b[27;1:3u")
+        );
 
         terminal.write(b"\x1b[<u");
         assert_eq!(encode(&mut terminal, "ctrl-c"), None);
