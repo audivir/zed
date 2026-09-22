@@ -118,15 +118,21 @@ pub(super) struct GhosttyTerminal {
 // mutex, which serializes access from the parser thread and the entity thread.
 unsafe impl Send for GhosttyTerminal {}
 
+/// Scrollback bytes budgeted per line of `terminal.max_scroll_history_lines`.
+///
+/// Ghostty limits scrollback in bytes and uses about 9 bytes per cell, so this keeps at least the
+/// configured number of lines for terminals up to 256 columns wide.
+const SCROLLBACK_BYTES_PER_LINE: usize = 256 * 9;
+
 impl GhosttyTerminal {
-    pub(super) fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self> {
+    pub(super) fn new(cols: u16, rows: u16, max_scrollback_lines: usize) -> Result<Self> {
         anyhow::ensure!(cols > 0, "terminal columns must be greater than zero");
         anyhow::ensure!(rows > 0, "terminal rows must be greater than zero");
         let effects = Arc::new(ParkingMutex::new(Vec::new()));
         let mut terminal = Box::new(libghostty_vt::Terminal::new(TerminalOptions {
             cols,
             rows,
-            max_scrollback,
+            max_scrollback: max_scrollback_lines.saturating_mul(SCROLLBACK_BYTES_PER_LINE),
         })?);
 
         terminal.on_pty_write({
@@ -2943,6 +2949,18 @@ mod tests {
 
         terminal.write(b"\x1b_Ga=d,d=A,q=1\x1b\\");
         assert!(terminal.live_image_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scrollback_keeps_the_configured_number_of_lines() {
+        let mut terminal = GhosttyTerminal::new(200, 40, 10_000).unwrap();
+        terminal.resize(test_bounds(200, 40)).unwrap();
+        let mut output = String::new();
+        for line in 0..20_000 {
+            output.push_str(&format!("line {line}\r\n"));
+        }
+        terminal.write(output.as_bytes());
+        assert!(terminal.total_lines().unwrap() >= 10_000);
     }
 
     #[test]
