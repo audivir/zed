@@ -1010,6 +1010,22 @@ impl GhosttyTerminal {
         Ok(())
     }
 
+    /// Returns the IDs of images with at least one placement, visible or not.
+    pub(super) fn live_image_ids(&mut self) -> Result<collections::HashSet<u32>> {
+        let graphics = self.terminal.kitty_graphics()?;
+        let mut iteration = self.placements.update(&graphics)?;
+        let mut ids = collections::HashSet::default();
+        while let Some(placement) = iteration.next() {
+            match placement.image_id() {
+                Ok(image_id) => {
+                    ids.insert(image_id);
+                }
+                Err(error) => log::debug!("failed to read kitty placement image id: {error}"),
+            }
+        }
+        Ok(ids)
+    }
+
     /// Returns the Kitty graphics placements visible in the viewport, decoded to RGBA8.
     pub(super) fn image_placements(&mut self) -> Result<Vec<crate::ImagePlacement>> {
         let graphics = self.terminal.kitty_graphics()?;
@@ -2854,6 +2870,22 @@ mod tests {
     }
 
     // transmits a 1x1 PNG, as in the `kitty::graphics` doctest.
+    #[test]
+    fn live_image_ids_drop_deleted_images() {
+        let mut terminal = GhosttyTerminal::new(8, 4, 100).unwrap();
+        terminal.resize(test_bounds(8, 4)).unwrap();
+        terminal.write(
+            b"\x1b_Ga=T,f=100,i=7,q=1;\
+              iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA\
+              DUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\
+              \x1b\\",
+        );
+        assert!(terminal.live_image_ids().unwrap().contains(&7));
+
+        terminal.write(b"\x1b_Ga=d,d=A,q=1\x1b\\");
+        assert!(terminal.live_image_ids().unwrap().is_empty());
+    }
+
     #[test]
     fn reports_image_placements() {
         let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();

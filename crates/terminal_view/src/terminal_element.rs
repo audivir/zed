@@ -563,13 +563,23 @@ impl TerminalElement {
         window: &mut Window,
         cx: &App,
     ) {
-        let images = terminal.read(cx).last_content.images.clone();
-        if images.is_empty() {
-            return;
-        }
-
+        let content = &terminal.read(cx).last_content;
+        let images = content.images.clone();
         let terminal_view = terminal_view.read(cx);
         let mut image_cache = terminal_view.image_cache.borrow_mut();
+
+        // free atlas textures of images deleted by the program.
+        let deleted_ids: Vec<u32> = image_cache
+            .keys()
+            .filter(|id| !content.live_image_ids.contains(id))
+            .copied()
+            .collect();
+        for id in deleted_ids {
+            if let Some((_, image)) = image_cache.remove(&id) {
+                window.drop_image(image).log_err();
+            }
+        }
+
         for placement in &images {
             let image = match image_cache.get(&placement.image_id) {
                 Some((generation, image)) if *generation == placement.generation => image.clone(),
@@ -578,7 +588,11 @@ impl TerminalElement {
                         continue;
                     };
                     let image = Arc::new(image);
-                    image_cache.insert(placement.image_id, (placement.generation, image.clone()));
+                    if let Some((_, replaced)) = image_cache
+                        .insert(placement.image_id, (placement.generation, image.clone()))
+                    {
+                        window.drop_image(replaced).log_err();
+                    }
                     image
                 }
             };

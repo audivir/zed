@@ -164,8 +164,7 @@ pub struct TerminalView {
     /// An entry is rebuilt only when `ImagePlacement::generation` changes. `RefCell` suffices
     /// since this paint-time cache never needs to trigger a re-render.
     ///
-    /// TODO: entries are never evicted, so deleted Kitty images leak until the view is dropped.
-    /// Prune IDs that stop appearing in `last_content.images`.
+    /// Entries of images without any remaining placement are dropped during paint.
     pub(crate) image_cache: RefCell<HashMap<u32, (u64, Arc<RenderImage>)>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,

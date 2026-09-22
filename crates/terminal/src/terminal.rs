@@ -18,7 +18,7 @@ use mappings::mouse::{
 };
 
 use async_channel::{Receiver, Sender};
-use collections::{HashMap, VecDeque};
+use collections::{HashMap, HashSet, VecDeque};
 use futures::StreamExt;
 use pty_info::{ProcessIdGetter, PtyProcessInfo};
 use serde::{Deserialize, Serialize};
@@ -658,6 +658,8 @@ pub struct Content {
     pub bottom_row_occupied: bool,
     /// Kitty graphics placements visible in the viewport, always empty on Windows.
     pub images: Vec<ImagePlacement>,
+    /// IDs of Kitty images that still have a placement anywhere, including off-screen.
+    pub live_image_ids: HashSet<u32>,
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -697,6 +699,7 @@ impl Default for Content {
             scrolled_to_bottom: false,
             bottom_row_occupied: false,
             images: Vec::new(),
+            live_image_ids: HashSet::default(),
         }
     }
 }
@@ -2902,6 +2905,12 @@ impl Terminal {
             Ok(images) => content.images = images,
             Err(error) => {
                 log::error!("failed to read ghostty image placements: {error}");
+            }
+        }
+        match ghostty.live_image_ids() {
+            Ok(ids) => content.live_image_ids = ids,
+            Err(error) => {
+                log::error!("failed to read ghostty image ids: {error}");
             }
         }
         content.selection = ghostty.selection_range();
