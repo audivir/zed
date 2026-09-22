@@ -1,8 +1,7 @@
 use crate::{
     pdf::Pdf,
     pdf_renderer::{
-        PageData, PageRotation, PdfChapter, PdfLinkAction, PdfSearchResult, PdfTarget,
-        PdfTextSpan,
+        PageData, PageRotation, PdfChapter, PdfLinkAction, PdfSearchResult, PdfTarget, PdfTextSpan,
     },
     pdf_store::{PdfItem, PdfItemEvent, open_pdf},
 };
@@ -193,19 +192,25 @@ fn selected_char_range_for_page(
 /// a selection spanning many characters doesn't need one element per character, roughly one
 /// per line instead. Two spans are treated as the same line when their vertical bounds
 /// overlap by at least half of the shorter one's height.
-fn selection_highlight_rects(text_spans: &[PdfTextSpan], range: std::ops::Range<usize>) -> Vec<Bounds<f32>> {
+fn selection_highlight_rects(
+    text_spans: &[PdfTextSpan],
+    range: std::ops::Range<usize>,
+) -> Vec<Bounds<f32>> {
     let mut rects: Vec<Bounds<f32>> = Vec::new();
     for span in &text_spans[range] {
         let bounds = span.bounds;
         if let Some(last) = rects.last_mut() {
-            let overlap = (last.origin.y + last.size.height).min(bounds.origin.y + bounds.size.height)
+            let overlap = (last.origin.y + last.size.height)
+                .min(bounds.origin.y + bounds.size.height)
                 - last.origin.y.max(bounds.origin.y);
             let shorter_height = last.size.height.min(bounds.size.height);
             if shorter_height > 0.0 && overlap >= shorter_height * 0.5 {
                 let left = last.origin.x.min(bounds.origin.x);
-                let right = (last.origin.x + last.size.width).max(bounds.origin.x + bounds.size.width);
+                let right =
+                    (last.origin.x + last.size.width).max(bounds.origin.x + bounds.size.width);
                 let top = last.origin.y.min(bounds.origin.y);
-                let bottom = (last.origin.y + last.size.height).max(bounds.origin.y + bounds.size.height);
+                let bottom =
+                    (last.origin.y + last.size.height).max(bounds.origin.y + bounds.size.height);
                 last.origin.x = left;
                 last.origin.y = top;
                 last.size.width = right - left;
@@ -307,7 +312,11 @@ fn char_class(c: char) -> CharClass {
 /// (shouldn't happen, but PDFium's `unicode_string()` isn't guaranteed non-empty) is treated
 /// as whitespace rather than panicking on an empty-string index.
 fn span_char_class(span: &PdfTextSpan) -> CharClass {
-    span.text.chars().next().map(char_class).unwrap_or(CharClass::Whitespace)
+    span.text
+        .chars()
+        .next()
+        .map(char_class)
+        .unwrap_or(CharClass::Whitespace)
 }
 
 /// The maximal run of same-class (word / punctuation / whitespace) characters containing
@@ -634,7 +643,8 @@ impl PdfView {
                 let bytes = (*pdf.bytes).clone();
                 self.password_task = Some(cx.spawn(async move |this, cx| {
                     let pdf = Arc::new(Pdf::from_bytes(bytes, None, Some(password)).await);
-                    this.update(cx, |this, cx| this.update_pdf(pdf, cx)).log_err();
+                    this.update(cx, |this, cx| this.update_pdf(pdf, cx))
+                        .log_err();
                 }));
             }
         }
@@ -934,24 +944,27 @@ impl PdfView {
             .py_0p5()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().colors().element_hover))
-            .child(
-                div().w(px(14.0)).flex_none().when(has_children, |this| {
-                    this.child(
-                        div()
-                            .id(("pdf-outline-toggle", path_hash))
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _window, cx| {
+            .child(div().w(px(14.0)).flex_none().when(has_children, |this| {
+                this.child(
+                    div()
+                        .id(("pdf-outline-toggle", path_hash))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _window, cx| {
                                 this.toggle_outline_node(toggle_path.clone(), cx);
-                            }))
-                            .child(Icon::new(if expanded {
+                            }),
+                        )
+                        .child(
+                            Icon::new(if expanded {
                                 IconName::ChevronDown
                             } else {
                                 IconName::ChevronRight
                             })
-                            .size(IconSize::XSmall)),
-                    )
-                }),
-            )
+                            .size(IconSize::XSmall),
+                        ),
+                )
+            }))
             .child(
                 div()
                     .flex_1()
@@ -1159,7 +1172,12 @@ impl PdfView {
     /// called before the view's first `prepaint` for `suppress_initial_fit_to_view` to have
     /// any effect. After that pass, the fit-to-view default it suppresses never runs again
     /// regardless.
-    pub fn restore_view_state(&mut self, zoom_level: f32, page_index: usize, cx: &mut Context<Self>) {
+    pub fn restore_view_state(
+        &mut self,
+        zoom_level: f32,
+        page_index: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.zoom_level = zoom_level.clamp(MIN_ZOOM, MAX_ZOOM);
         self.suppress_initial_fit_to_view = true;
         self.jump_to_page(page_index, cx);
@@ -1642,9 +1660,7 @@ impl Element for PdfContentElement {
             // they're disabled entirely while rotated rather than shown misaligned. See
             // FEATURE_ROADMAP.md's rotate-page entry.
             let interactive_layers_supported = rotation == PageRotation::None;
-            if interactive_layers_supported
-                && let Some(data) = active_data
-            {
+            if interactive_layers_supported && let Some(data) = active_data {
                 selection_hit_regions.push((page_idx, global_page_bounds, data.text_spans.clone()));
             }
             let text_spans_for_selection = interactive_layers_supported
@@ -1766,11 +1782,17 @@ impl Element for PdfContentElement {
                     let top = px(new_data.page_offset_pt * zoom_level);
                     let strip_height = px(new_data.covered_height_pt() * zoom_level);
                     image_container = image_container.child(
-                        div().absolute().top(top).left_0().w_full().h(strip_height).child(
-                            img(new_data.image.clone())
-                                .id(("pdf-viewer-doc", page_idx))
-                                .size_full(),
-                        ),
+                        div()
+                            .absolute()
+                            .top(top)
+                            .left_0()
+                            .w_full()
+                            .h(strip_height)
+                            .child(
+                                img(new_data.image.clone())
+                                    .id(("pdf-viewer-doc", page_idx))
+                                    .size_full(),
+                            ),
                     );
                 }
                 need_cache_page = false;
@@ -1820,9 +1842,7 @@ impl Element for PdfContentElement {
             }
 
             // Interactive Links
-            if interactive_layers_supported
-                && let Some(data) = active_data
-            {
+            if interactive_layers_supported && let Some(data) = active_data {
                 let mut link_layer = div().absolute().top_0().left_0().size_full();
 
                 for link in data.links.iter() {
@@ -1942,7 +1962,8 @@ impl Element for PdfContentElement {
                 // where in the block the cursor actually is. Falls back to jump.point.y (a
                 // zero-height extension, i.e. just line_height) for jump sources with no
                 // block notion: bookmarks, links, search matches.
-                let block_extent = px((jump.block_bottom_y.unwrap_or(jump.point.y) - jump.point.y) * zoom_level);
+                let block_extent =
+                    px((jump.block_bottom_y.unwrap_or(jump.point.y) - jump.point.y) * zoom_level);
                 let h = line_height + block_extent;
 
                 // Matches the Markdown preview's own current-position gutter marker (see
@@ -1989,9 +2010,11 @@ impl Element for PdfContentElement {
                             if !this.is_selecting_text {
                                 return;
                             }
-                            let Some(position) =
-                                hit_test_selection_point(&selection_hit_regions, event.position, zoom_level)
-                            else {
+                            let Some(position) = hit_test_selection_point(
+                                &selection_hit_regions,
+                                event.position,
+                                zoom_level,
+                            ) else {
                                 return;
                             };
                             if let Some(selection) = &mut this.text_selection {
@@ -2004,7 +2027,10 @@ impl Element for PdfContentElement {
                             {
                                 // The drag has actually moved off the click's starting
                                 // character; only now does a selection become visible.
-                                this.text_selection = Some(TextSelection { anchor, head: position });
+                                this.text_selection = Some(TextSelection {
+                                    anchor,
+                                    head: position,
+                                });
                                 cx.notify();
                             }
                         });
@@ -2265,7 +2291,11 @@ impl SerializableItem for PdfView {
                 Ok(cx.new(|cx| {
                     let mut view = PdfView::new(pdf_item, project, window, cx);
                     if let Some((zoom_level, current_page)) = view_state {
-                        view.restore_view_state(zoom_level as f32, current_page.max(0) as usize, cx);
+                        view.restore_view_state(
+                            zoom_level as f32,
+                            current_page.max(0) as usize,
+                            cx,
+                        );
                     }
                     view
                 }))
@@ -2288,7 +2318,6 @@ impl SerializableItem for PdfView {
         workspace: &mut Workspace,
         item_id: ItemId,
         _closing: bool,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let PdfSource::Item(pdf_item) = &self.source else {
@@ -2429,7 +2458,10 @@ impl Render for PdfView {
                     .custom_scrollbars(
                         ui::Scrollbars::new(ScrollAxes::Both)
                             .tracked_scroll_handle(&self.scroll_handle)
-                            .with_track_along(ScrollAxes::Both, cx.theme().colors().panel_background),
+                            .with_track_along(
+                                ScrollAxes::Both,
+                                cx.theme().colors().panel_background,
+                            ),
                         window,
                         cx,
                     );
@@ -2639,11 +2671,11 @@ impl SearchableItem for PdfView {
                         pdf.password.clone(),
                     )
                     .search_document(&search_string_bg, match_case, pdf.metadata.clone())
-                        .await
-                        .unwrap_or_else(|e| {
-                            log::error!("PDF search failed: {:?}", e);
-                            Vec::new()
-                        })
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::error!("PDF search failed: {:?}", e);
+                        Vec::new()
+                    })
                 })
                 .await;
 
@@ -2806,7 +2838,9 @@ impl Render for PdfViewToolbarControls {
                 IconButton::new("toggle-outline", IconName::ListTree)
                     .icon_size(IconSize::Small)
                     .toggle_state(show_outline)
-                    .tooltip(|_window, cx| Tooltip::for_action("Toggle Outline", &ToggleOutline, cx))
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action("Toggle Outline", &ToggleOutline, cx)
+                    })
                     .on_click({
                         let pdf_view = pdf_view.downgrade();
                         move |_, window, cx| {
@@ -3115,11 +3149,26 @@ mod tests {
         let spans = two_line_fixture();
 
         // Dead center of the 'e' in "Hello" (index 1, bounds x:[10,20) y:[0,10)).
-        assert_eq!(nearest_char_index(&spans, Point { x: 15.0, y: 5.0 }), Some(1));
+        assert_eq!(
+            nearest_char_index(&spans, Point { x: 15.0, y: 5.0 }),
+            Some(1)
+        );
         // Dead center of the 'o' in "World" (index 9, second line, last char).
-        assert_eq!(nearest_char_index(&spans, Point { x: 45.0, y: 15.0 }), Some(9));
+        assert_eq!(
+            nearest_char_index(&spans, Point { x: 45.0, y: 15.0 }),
+            Some(9)
+        );
         // Far outside the page entirely, still resolves to *something* close, not None.
-        assert_eq!(nearest_char_index(&spans, Point { x: -1000.0, y: -1000.0 }), Some(0));
+        assert_eq!(
+            nearest_char_index(
+                &spans,
+                Point {
+                    x: -1000.0,
+                    y: -1000.0
+                }
+            ),
+            Some(0)
+        );
 
         assert_eq!(nearest_char_index(&[], Point { x: 0.0, y: 0.0 }), None);
     }
@@ -3337,7 +3386,14 @@ mod tests {
         assert!(below.is_some());
 
         assert_eq!(
-            hit_test_selection_point(&[], Point { x: px(0.0), y: px(0.0) }, 1.0),
+            hit_test_selection_point(
+                &[],
+                Point {
+                    x: px(0.0),
+                    y: px(0.0)
+                },
+                1.0
+            ),
             None
         );
     }
@@ -3403,8 +3459,7 @@ mod tests {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
 
-        let (view, cx) =
-            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf, window, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| PdfView::from_pdf(pdf, window, cx));
 
         view.update(cx, |view, cx| {
             assert!(!view.suppress_initial_fit_to_view);
@@ -3469,8 +3524,14 @@ mod tests {
             // in-progress selection must be dropped rather than left anchored to
             // coordinates that no longer match what's on screen post-rotation.
             view.text_selection = Some(TextSelection {
-                anchor: TextPosition { page_index: 0, char_index: 0 },
-                head: TextPosition { page_index: 0, char_index: 0 },
+                anchor: TextPosition {
+                    page_index: 0,
+                    char_index: 0,
+                },
+                head: TextPosition {
+                    page_index: 0,
+                    char_index: 0,
+                },
             });
             view.is_selecting_text = true;
 
@@ -3509,7 +3570,8 @@ mod tests {
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
         assert_eq!(pdf.metadata.page_count, 2);
 
-        let (view, cx) = cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
 
         let task = view.update_in(cx, |view, window, cx| {
             view.select_all(&SelectAll, window, cx);
@@ -3519,7 +3581,8 @@ mod tests {
 
         for page_index in 0..pdf.metadata.page_count {
             assert!(
-                pdf.text_spans_for_page(page_index).is_some_and(|spans| !spans.is_empty()),
+                pdf.text_spans_for_page(page_index)
+                    .is_some_and(|spans| !spans.is_empty()),
                 "expected select_all to have extracted real text for page {page_index}"
             );
         }
@@ -3557,7 +3620,8 @@ mod tests {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
 
-        let (view, cx) = cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
         // Give the fire-and-forget render task kicked off by the first prepaint time to
         // actually rasterize page 0 (real PDFium FFI work on a background thread), then let
         // its on_rendered callback's cx.notify() drive a second paint that picks the now-
@@ -3646,7 +3710,8 @@ mod tests {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
 
-        let (view, cx) = cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
         cx.run_until_parked();
         cx.run_until_parked();
 
@@ -3716,8 +3781,10 @@ mod tests {
             // actually matters for this test.
             let target_y_in_page = target_center.y * zoom;
             view.update_in(cx, |view, _window, cx| {
-                view.scroll_handle
-                    .set_offset(Point { x: px(0.0), y: -px((target_y_in_page - 100.0).max(0.0)) });
+                view.scroll_handle.set_offset(Point {
+                    x: px(0.0),
+                    y: -px((target_y_in_page - 100.0).max(0.0)),
+                });
                 cx.notify();
             });
             cx.run_until_parked();
@@ -3746,10 +3813,9 @@ mod tests {
             });
 
             view.update(cx, |view, _cx| {
-                let selection = view
-                    .text_selection
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("double-click on {expected_range:?} should select a word"));
+                let selection = view.text_selection.as_ref().unwrap_or_else(|| {
+                    panic!("double-click on {expected_range:?} should select a word")
+                });
                 let (start, end) = selection.ordered();
                 let selected_text: String = text_spans[start.char_index..=end.char_index]
                     .iter()
@@ -3787,7 +3853,8 @@ mod tests {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
 
-        let (view, cx) = cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
         cx.run_until_parked();
         cx.run_until_parked();
 
@@ -3892,10 +3959,9 @@ mod tests {
             });
 
             view.update(cx, |view, _cx| {
-                let selection = view
-                    .text_selection
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("double-click on {expected_range:?} should select a word"));
+                let selection = view.text_selection.as_ref().unwrap_or_else(|| {
+                    panic!("double-click on {expected_range:?} should select a word")
+                });
                 let (start, end) = selection.ordered();
                 let selected_text: String = text_spans[start.char_index..=end.char_index]
                     .iter()
@@ -3933,7 +3999,8 @@ mod tests {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
 
-        let (view, cx) = cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
         cx.run_until_parked();
         cx.run_until_parked();
 

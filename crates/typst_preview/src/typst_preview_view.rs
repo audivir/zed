@@ -6,14 +6,13 @@ use crate::{
 use anyhow::Result;
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
-use text::Point as BufferPoint;
 use gpui::{
     AnyEntity, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Font,
     IntoElement, Point, Render, Size, Subscription, Task, WeakEntity, Window, div,
 };
 use language::{
-    Diagnostic, DiagnosticEntry, DiagnosticSet, DiagnosticSeverity, HighlightedText,
-    LanguageServerId,
+    Diagnostic, DiagnosticEntry, DiagnosticMessage, DiagnosticSet, DiagnosticSeverity,
+    HighlightedText, LanguageServerId,
 };
 use parking_lot::Mutex;
 use pdf_viewer::pdf::Pdf;
@@ -25,9 +24,10 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use text::Point as BufferPoint;
+use typst::World;
 use typst::layout::{Abs, Frame, FrameItem, Point as TypstPoint};
 use typst::syntax::{LinkedNode, RootedPath, Side, Source, Span, SyntaxKind, VirtualRoot};
-use typst::World;
 use typst_layout::PagedDocument;
 use ui::prelude::*;
 use workspace::item::{Item, ItemBufferKind, ItemHandle};
@@ -156,7 +156,7 @@ fn publish_editor_diagnostics(
                 Diagnostic {
                     source: Some("Typst".to_string()),
                     severity: d.severity,
-                    message: d.message.clone(),
+                    message: DiagnosticMessage::plain(d.message.clone()),
                     is_primary: true,
                     ..Default::default()
                 },
@@ -968,9 +968,8 @@ impl TypstPreviewView {
                     });
 
                 let Some(active_path) = file_path else {
-                    view.compile_state = TypstCompileState::Failed(
-                        "Save this file to preview it".to_string(),
-                    );
+                    view.compile_state =
+                        TypstCompileState::Failed("Save this file to preview it".to_string());
                     cx.notify();
                     return None;
                 };
@@ -1015,8 +1014,13 @@ impl TypstPreviewView {
                 ))
             })?;
 
-            if let Some((selection_start, active_path, project_resolution, final_overrides, current_world)) =
-                update
+            if let Some((
+                selection_start,
+                active_path,
+                project_resolution,
+                final_overrides,
+                current_world,
+            )) = update
             {
                 let active_path_sync = active_path.clone();
                 let workspace_weak = view.update(cx, |v, _| v.workspace.clone())?;
@@ -1103,16 +1107,16 @@ impl TypstPreviewView {
                         let start = Instant::now();
 
                         // Export to PDF bytes
-                        let bytes = match typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default())
-                        {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                return CompileOutcome {
-                                    diagnostics,
-                                    result: Err(anyhow::anyhow!("PDF export failed:\n{:?}", e)),
-                                };
-                            }
-                        };
+                        let bytes =
+                            match typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default()) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    return CompileOutcome {
+                                        diagnostics,
+                                        result: Err(anyhow::anyhow!("PDF export failed:\n{:?}", e)),
+                                    };
+                                }
+                            };
 
                         log::info!("Generated PDF in {:?}", start.elapsed());
                         let start = Instant::now();
@@ -1150,14 +1154,24 @@ impl TypstPreviewView {
                         let world_arc_ret = world_arc.clone();
                         CompileOutcome {
                             diagnostics,
-                            result: Ok((bytes, Arc::new(document), world_arc_ret, pages, max_width)),
+                            result: Ok((
+                                bytes,
+                                Arc::new(document),
+                                world_arc_ret,
+                                pages,
+                                max_width,
+                            )),
                         }
                     })
                     .await;
 
                 view.update(cx, move |view, cx| {
                     view.compile_state = TypstCompileState::Rendering;
-                    publish_editor_diagnostics(active_editor.as_ref(), &compile_outcome.diagnostics, cx);
+                    publish_editor_diagnostics(
+                        active_editor.as_ref(),
+                        &compile_outcome.diagnostics,
+                        cx,
+                    );
                     match compile_outcome.result {
                         Ok((bytes, document, new_world_arc, pages, max_width)) => {
                             let warnings = compile_outcome
@@ -1262,16 +1276,17 @@ impl TypstPreviewView {
                         // which side of the bold word was clicked, inconsistent for what's
                         // visually one paragraph. Recompute both the anchor point and the
                         // block's bottom from every leaf in the whole paragraph instead.
-                        let paragraph_hits: Vec<(TypstPoint, Abs)> = paragraph_leaf_spans(&source, safe_index)
-                            .and_then(|spans| {
-                                let page = document.pages().get(page_index)?;
-                                let mut hits = Vec::new();
-                                for span in spans {
-                                    find_all_in_frame(&page.frame, span, &mut hits);
-                                }
-                                Some(hits)
-                            })
-                            .unwrap_or_default();
+                        let paragraph_hits: Vec<(TypstPoint, Abs)> =
+                            paragraph_leaf_spans(&source, safe_index)
+                                .and_then(|spans| {
+                                    let page = document.pages().get(page_index)?;
+                                    let mut hits = Vec::new();
+                                    for span in spans {
+                                        find_all_in_frame(&page.frame, span, &mut hits);
+                                    }
+                                    Some(hits)
+                                })
+                                .unwrap_or_default();
 
                         let point = paragraph_hits
                             .iter()
@@ -1448,11 +1463,8 @@ impl Render for TypstPreviewView {
                         .size_full()
                         .child(self.pdf_view.clone())
                         .when(warning_count > 0, |this| {
-                            let message = self
-                                .compile_warnings
-                                .first()
-                                .cloned()
-                                .unwrap_or_default();
+                            let message =
+                                self.compile_warnings.first().cloned().unwrap_or_default();
                             let label = if warning_count > 1 {
                                 format!("{} ({} more warning(s))", message, warning_count - 1)
                             } else {
@@ -1535,8 +1547,7 @@ mod tests {
         let active_path = root.join("src/chapters/intro.typ");
         std::fs::write(&active_path, "").unwrap();
 
-        let (resolved_root, main_file) =
-            TypstPreviewView::resolve_project(true, &active_path);
+        let (resolved_root, main_file) = TypstPreviewView::resolve_project(true, &active_path);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, root.join("main.typ"));
@@ -1556,8 +1567,7 @@ mod tests {
         std::fs::write(root.join("main.typ"), "").unwrap();
         let active_path = root.join("src/entry.typ");
 
-        let (resolved_root, main_file) =
-            TypstPreviewView::resolve_project(true, &active_path);
+        let (resolved_root, main_file) = TypstPreviewView::resolve_project(true, &active_path);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, root.join("src/entry.typ"));
@@ -1571,8 +1581,7 @@ mod tests {
         let active_path = root.join("standalone.typ");
         std::fs::write(&active_path, "").unwrap();
 
-        let (resolved_root, main_file) =
-            TypstPreviewView::resolve_project(true, &active_path);
+        let (resolved_root, main_file) = TypstPreviewView::resolve_project(true, &active_path);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, active_path);
@@ -1587,8 +1596,7 @@ mod tests {
 
         // Even though a main.typ exists right there, project_resolution: false must not
         // walk the filesystem at all and should just treat the file as standalone.
-        let (resolved_root, main_file) =
-            TypstPreviewView::resolve_project(false, &active_path);
+        let (resolved_root, main_file) = TypstPreviewView::resolve_project(false, &active_path);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, active_path);
@@ -1677,7 +1685,11 @@ mod tests {
 
         let spans = paragraph_leaf_spans(&typst_source, cursor)
             .expect("cursor sits inside the sentence's plain-text leaf");
-        assert_eq!(spans.len(), 1, "one plain sentence with no *bold*/_italic_ splits is one leaf");
+        assert_eq!(
+            spans.len(),
+            1,
+            "one plain sentence with no *bold*/_italic_ splits is one leaf"
+        );
 
         let page = document.pages().first().expect("fixture has one page");
         let mut points = Vec::new();
@@ -1746,7 +1758,11 @@ mod tests {
         // text before "*Typst*", the bold word itself, and the plain text after it): three
         // leaves merged into one paragraph's worth of spans, not a single trivial leaf that
         // would make this fixture unable to exercise the bug being fixed at all.
-        assert_eq!(before_spans.len(), 3, "expected text/Typst/text as three merged leaves");
+        assert_eq!(
+            before_spans.len(),
+            3,
+            "expected text/Typst/text as three merged leaves"
+        );
 
         let before_set: std::collections::HashSet<_> = before_spans.iter().copied().collect();
         let after_set: std::collections::HashSet<_> = after_spans.iter().copied().collect();
@@ -1760,8 +1776,14 @@ mod tests {
             for &span in spans {
                 find_all_in_frame(&page.frame, span, &mut points);
             }
-            let min_y = points.iter().map(|(p, _)| p.y.to_pt()).fold(f64::MAX, f64::min);
-            let max_y = points.iter().map(|(p, _)| p.y.to_pt()).fold(f64::MIN, f64::max);
+            let min_y = points
+                .iter()
+                .map(|(p, _)| p.y.to_pt())
+                .fold(f64::MAX, f64::min);
+            let max_y = points
+                .iter()
+                .map(|(p, _)| p.y.to_pt())
+                .fold(f64::MIN, f64::max);
             (min_y, max_y)
         };
         let before_bounds = bounds(&before_spans);
@@ -1817,7 +1839,9 @@ mod tests {
             for span in spans {
                 find_all_in_frame(&page.frame, span, &mut hits);
             }
-            let (_, size) = hits.first().expect("expected at least one rendered glyph run");
+            let (_, size) = hits
+                .first()
+                .expect("expected at least one rendered glyph run");
             line_height_for_font_size(*size)
         };
 

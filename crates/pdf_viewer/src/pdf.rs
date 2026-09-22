@@ -255,9 +255,9 @@ impl Pdf {
                             // Overwrite only if the new render is better than what snuck into
                             // the cache, or that cached render is now stale because it's at a
                             // different rotation.
-                            let should_insert = cache
-                                .get(&page_idx)
-                                .is_none_or(|c| c.scale <= requested_scale || c.rotation != rotation);
+                            let should_insert = cache.get(&page_idx).is_none_or(|c| {
+                                c.scale <= requested_scale || c.rotation != rotation
+                            });
                             if should_insert {
                                 cache.insert(page_idx, new_page);
                                 log::info!("Written to cache");
@@ -479,8 +479,15 @@ mod tests {
 
         let task = cx
             .update(|cx| {
-                pdf.clone()
-                    .request_page(cx, 0, 1.0, 0.0, PageRotation::None, gpui::Priority::High, |_| {})
+                pdf.clone().request_page(
+                    cx,
+                    0,
+                    1.0,
+                    0.0,
+                    PageRotation::None,
+                    gpui::Priority::High,
+                    |_| {},
+                )
             })
             .expect("first request for an uncached page should return a task");
         task.await;
@@ -539,8 +546,15 @@ mod tests {
         // than spawn another render (this is what makes it safe for callers like search's
         // adjacent-match prefetch to call request_page speculatively on every match).
         let second = cx.update(|cx| {
-            pdf.clone()
-                .request_page(cx, 0, 1.0, 0.0, PageRotation::None, gpui::Priority::Low, |_| {})
+            pdf.clone().request_page(
+                cx,
+                0,
+                1.0,
+                0.0,
+                PageRotation::None,
+                gpui::Priority::Low,
+                |_| {},
+            )
         });
         assert!(
             second.is_none(),
@@ -631,8 +645,9 @@ mod tests {
         let rendered = Arc::new(AtomicBool::new(false));
         let rendered_in_callback = rendered.clone();
         let task = cx.update(|cx| {
-            pdf.clone()
-                .request_thumbnail(cx, 0, move |_| rendered_in_callback.store(true, Ordering::SeqCst))
+            pdf.clone().request_thumbnail(cx, 0, move |_| {
+                rendered_in_callback.store(true, Ordering::SeqCst)
+            })
         });
         let task = task.expect("first thumbnail request for an uncached page should return a task");
         task.await;
@@ -667,8 +682,15 @@ mod tests {
         // than just asserting on manually-populated state.
         let task = cx
             .update(|cx| {
-                pdf.clone()
-                    .request_page(cx, 5, 1.0, 0.0, PageRotation::None, gpui::Priority::High, |_| {})
+                pdf.clone().request_page(
+                    cx,
+                    5,
+                    1.0,
+                    0.0,
+                    PageRotation::None,
+                    gpui::Priority::High,
+                    |_| {},
+                )
             })
             .expect("a page never rendered before should still return a task, even a doomed one");
         task.await;
@@ -682,8 +704,15 @@ mod tests {
         // A second request for the same page at the same scale must short-circuit instead of
         // re-attempting (and re-failing) the same render on every subsequent frame.
         let second = cx.update(|cx| {
-            pdf.clone()
-                .request_page(cx, 5, 1.0, 0.0, PageRotation::None, gpui::Priority::High, |_| {})
+            pdf.clone().request_page(
+                cx,
+                5,
+                1.0,
+                0.0,
+                PageRotation::None,
+                gpui::Priority::High,
+                |_| {},
+            )
         });
         assert!(
             second.is_none(),

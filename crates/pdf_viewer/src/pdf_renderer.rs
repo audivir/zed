@@ -6,8 +6,8 @@ use once_cell::sync::OnceCell;
 use pdfium_render::prelude::{
     PdfBitmap, PdfBitmapFormat, PdfBookmark, PdfColor, PdfDestination, PdfDocument,
     PdfLink as PdfiumLink, PdfPage, PdfPageAnnotation, PdfPageAnnotationCommon,
-    PdfPageRenderRotation, PdfRect, PdfRenderConfig, PdfSearchDirection, PdfSearchOptions,
-    Pdfium, PdfiumError, PdfiumInternalError, PdfiumLibraryBindings,
+    PdfPageRenderRotation, PdfRect, PdfRenderConfig, PdfSearchDirection, PdfSearchOptions, Pdfium,
+    PdfiumError, PdfiumInternalError, PdfiumLibraryBindings,
 };
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -392,9 +392,7 @@ impl PdfRenderer {
         ) {
             Ok(document) => document,
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
-                return Ok(DocumentMetadata::password_required(
-                    self.password.is_some(),
-                ));
+                return Ok(DocumentMetadata::password_required(self.password.is_some()));
             }
             Err(e) => return Err(anyhow!("Failed to read PDF bytes: {:?}", e)),
         };
@@ -593,7 +591,10 @@ impl PdfRenderer {
     ) -> Option<(usize, Point<f32>)> {
         let page_index = destination.page_index().ok()? as usize;
         let page_metadata = pages.get(page_index)?;
-        Some((page_index, Self::get_point(destination, &page_metadata.bounds)))
+        Some((
+            page_index,
+            Self::get_point(destination, &page_metadata.bounds),
+        ))
     }
 
     fn get_link(
@@ -706,8 +707,7 @@ impl PdfRenderer {
         let (target_height, page_offset_pt) = if full_height_px > MAX_RENDER_HEIGHT {
             let strip_height_pt = MAX_RENDER_HEIGHT / effective_scale;
             let max_offset_pt = (source_height_pt - strip_height_pt).max(0.0);
-            let offset_pt =
-                (visible_center_y - strip_height_pt / 2.0).clamp(0.0, max_offset_pt);
+            let offset_pt = (visible_center_y - strip_height_pt / 2.0).clamp(0.0, max_offset_pt);
             (MAX_RENDER_HEIGHT.round() as i32, offset_pt)
         } else {
             (full_height_px.round() as i32, 0.0)
@@ -818,7 +818,9 @@ impl PdfRenderer {
         let mut links_vec = Vec::new();
 
         for (annot, link_action) in link_annotations.zip(page_links) {
-            if let Some(link) = PdfRenderer::get_link(&annot, &link_action, &page_bounds, &metadata.pages) {
+            if let Some(link) =
+                PdfRenderer::get_link(&annot, &link_action, &page_bounds, &metadata.pages)
+            {
                 links_vec.push(link)
             }
         }
@@ -1112,9 +1114,14 @@ mod tests {
         let metadata = futures::executor::block_on(renderer.get_metadata(None)).unwrap();
         assert_eq!(metadata.page_count, 1);
 
-        let page = futures::executor::block_on(
-            renderer.process_page(0, 1.0, 0.0, PageRotation::None, None, Arc::new(metadata)),
-        )
+        let page = futures::executor::block_on(renderer.process_page(
+            0,
+            1.0,
+            0.0,
+            PageRotation::None,
+            None,
+            Arc::new(metadata),
+        ))
         .unwrap();
 
         let size = page.image.size(0);
@@ -1309,7 +1316,13 @@ mod tests {
         let renderer = PdfRenderer::new(id, bytes, None);
 
         let metadata = futures::executor::block_on(renderer.get_metadata(None)).unwrap();
-        assert_eq!(metadata.pages[0].size, Size { width: 200.0, height: 100.0 });
+        assert_eq!(
+            metadata.pages[0].size,
+            Size {
+                width: 200.0,
+                height: 100.0
+            }
+        );
 
         let page = futures::executor::block_on(renderer.process_page(
             0,

@@ -357,7 +357,6 @@ impl PdfStore {
             })
         }
     }
-
 }
 
 impl PdfStoreImpl for Entity<LocalPdfStore> {
