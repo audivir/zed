@@ -21,7 +21,7 @@ use project::{Project, ProjectPath, search::SearchQuery};
 use settings::{SeedQuerySetting, Settings};
 use std::{path::Path, sync::Arc, time::Duration};
 use theme_settings::ThemeSettings;
-use ui::{FluentBuilder as _, ScrollAxes, Tooltip, WithScrollbar, prelude::*};
+use ui::{Banner, FluentBuilder as _, ScrollAxes, Severity, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
 use util::paths::PathExt;
 use workspace::{
@@ -416,6 +416,8 @@ pub struct PdfView {
     stale_pdf: Option<Arc<Pdf>>,
     stale_page_cache: HashMap<usize, PageData>,
     last_search_query: Option<(SharedString, bool, Vec<PdfSearchResult>)>,
+    /// Error of the last failed search, shown until the next search succeeds or is cleared.
+    search_error: Option<SharedString>,
     project: Option<Entity<Project>>,
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
@@ -469,6 +471,7 @@ impl PdfView {
             stale_pdf: None,
             stale_page_cache: Default::default(),
             last_search_query: None,
+            search_error: None,
             project: Some(project),
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::default(),
@@ -521,6 +524,7 @@ impl PdfView {
             stale_pdf: None,
             stale_page_cache: Default::default(),
             last_search_query: None,
+            search_error: None,
             project: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::default(),
@@ -2084,6 +2088,7 @@ impl Item for PdfView {
             stale_pdf: None,
             stale_page_cache: Default::default(),
             last_search_query: None,
+            search_error: None,
             project: self.project.clone(),
             focus_handle: cx.focus_handle(),
             scroll_handle: self.scroll_handle.clone(),
@@ -2345,11 +2350,22 @@ impl Render for PdfView {
             .when(!has_load_error && !needs_password, |this| {
                 let show_outline = self.show_outline;
                 let show_thumbnails = self.show_thumbnails;
+                let search_error = self.search_error.clone();
                 let content = div()
                     .id("pdf-content-scroll-area")
+                    .relative()
                     .flex_1()
                     .h_full()
                     .child(PdfContentElement::new(cx.entity()))
+                    .when_some(search_error, |content, error| {
+                        content.child(
+                            div().absolute().top_2().left_2().right_2().child(
+                                Banner::new()
+                                    .severity(Severity::Error)
+                                    .child(Label::new(error)),
+                            ),
+                        )
+                    })
                     .custom_scrollbars(
                         ui::Scrollbars::new(ScrollAxes::Both)
                             .tracked_scroll_handle(&self.scroll_handle)
@@ -2432,6 +2448,9 @@ impl SearchableItem for PdfView {
         let had_matches = !self.search_matches.is_empty();
         self.search_matches.clear();
         self.active_match_index = None;
+        if self.search_error.take().is_some() {
+            cx.notify();
+        }
         if had_matches {
             cx.emit(SearchEvent::MatchesInvalidated);
             cx.notify();
@@ -2550,7 +2569,7 @@ impl SearchableItem for PdfView {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
 
             let search_string_bg = search_string.to_string();
-            let matches = cx
+            let result = cx
                 .background_executor()
                 .spawn(async move {
                     crate::pdf_renderer::PdfRenderer::new(
@@ -2560,18 +2579,25 @@ impl SearchableItem for PdfView {
                     )
                     .search_document(&search_string_bg, match_case, pdf.metadata.clone())
                     .await
-                    .unwrap_or_else(|e| {
-                        log::error!("PDF search failed: {:?}", e);
-                        Vec::new()
-                    })
                 })
                 .await;
 
-            _ = this.update(cx, |view, _| {
-                view.last_search_query = Some((search_string, match_case, matches.clone()));
-            });
-
-            matches
+            this.update(cx, |view, cx| match result {
+                Ok(matches) => {
+                    view.search_error = None;
+                    view.last_search_query = Some((search_string, match_case, matches.clone()));
+                    cx.notify();
+                    matches
+                }
+                Err(error) => {
+                    log::error!("PDF search failed: {error:?}");
+                    // failures are not cached, so repeating the query retries the search.
+                    view.search_error = Some(format!("Search failed: {error}").into());
+                    cx.notify();
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default()
         })
     }
 
