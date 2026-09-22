@@ -1161,9 +1161,8 @@ impl PdfView {
         let zoom = self.zoom_level;
 
         // sum the heights and gaps of all pages before the target page.
-        for i in 0..target.page_index {
-            let size = pdf.get_page_size(i).unwrap();
-            total_y_offset += size.height * zoom + PAGE_GAP;
+        for page in pdf.metadata.pages.iter().take(target.page_index) {
+            total_y_offset += page.size.height * zoom + PAGE_GAP;
         }
 
         // add the offset within the target page.
@@ -1225,8 +1224,8 @@ impl PdfView {
 
         let zoom = self.zoom_level;
         let mut target_y = 0.0;
-        for i in 0..target.page_index {
-            target_y += pdf.get_page_size(i).unwrap().height * zoom + PAGE_GAP;
+        for page in pdf.metadata.pages.iter().take(target.page_index) {
+            target_y += page.size.height * zoom + PAGE_GAP;
         }
         target_y += target.point.y * zoom;
         let target_x = target.point.x * zoom;
@@ -1344,9 +1343,7 @@ impl Element for PdfContentElement {
         };
 
         let page_count = pdf.metadata.page_count;
-        if page_count == 0 {
-            return None;
-        }
+        let first_page = pdf.metadata.pages.first()?;
 
         // a quarter turn swaps the on-screen page box so the rotated image fills it.
         let display_page_size = |size: Size<f32>| {
@@ -1361,12 +1358,8 @@ impl Element for PdfContentElement {
         };
 
         // a restored zoom takes priority over the initial fit-to-view.
-        let initial_zoom_level = (first_layout && !suppress_initial_fit_to_view).then(|| {
-            PdfView::compute_fit_to_view_zoom(
-                bounds,
-                display_page_size(pdf.get_page_size(0).unwrap()),
-            )
-        });
+        let initial_zoom_level = (first_layout && !suppress_initial_fit_to_view)
+            .then(|| PdfView::compute_fit_to_view_zoom(bounds, display_page_size(first_page.size)));
 
         let zoom_level = initial_zoom_level.unwrap_or(current_zoom_level);
 
@@ -1391,8 +1384,8 @@ impl Element for PdfContentElement {
         let mut page_dimensions = Vec::with_capacity(page_count);
         let mut page_tops = Vec::with_capacity(page_count);
 
-        for page_idx in 0..page_count {
-            let page_size = display_page_size(pdf.get_page_size(page_idx).unwrap());
+        for (page_idx, page) in pdf.metadata.pages.iter().enumerate() {
+            let page_size = display_page_size(page.size);
             let width = px(page_size.width * zoom_level);
             let height = px(page_size.height * zoom_level);
 
@@ -2634,6 +2627,9 @@ impl Render for PdfViewToolbarControls {
         let Some(pdf_view) = self.pdf_view.as_ref().and_then(|v| v.upgrade()) else {
             return div().into_any_element();
         };
+        let Some(page_input) = self.page_input.clone() else {
+            return div().into_any_element();
+        };
 
         let (zoom_level, current_page, page_count) = {
             let view = pdf_view.read(cx);
@@ -2655,11 +2651,9 @@ impl Render for PdfViewToolbarControls {
             format!("{}%", (zoom_level * 100.0).round() as i32).into();
         let page_text: SharedString = format!(" / {}", page_count).into();
 
-        if let Some(input) = &self.page_input
-            && !input.focus_handle(cx).is_focused(window)
-        {
+        if !page_input.focus_handle(cx).is_focused(window) {
             let current_page_str = format!("{}", current_page + 1);
-            input.update(cx, |editor, cx| {
+            page_input.update(cx, |editor, cx| {
                 if editor.text(cx) != current_page_str {
                     editor.set_text(current_page_str, window, cx);
                 }
@@ -2773,7 +2767,7 @@ impl Render for PdfViewToolbarControls {
                             .flex()
                             .justify_end()
                             .text_size(px(12.0))
-                            .track_focus(&self.page_input.as_ref().unwrap().focus_handle(cx))
+                            .track_focus(&page_input.focus_handle(cx))
                             .bg(cx.theme().colors().editor_background)
                             .border_1()
                             .border_color(cx.theme().colors().border)
@@ -2795,7 +2789,7 @@ impl Render for PdfViewToolbarControls {
                                     }
                                 }
                             }))
-                            .child(self.page_input.as_ref().unwrap().clone()),
+                            .child(page_input),
                     )
                     .child(
                         Label::new(page_text), //.size(LabelSize::Small)

@@ -679,7 +679,7 @@ impl PdfRenderer {
         let width = bitmap.width() as u32;
         let height = bitmap.height() as u32;
         let mut bgra_bytes = bitmap.as_rgba_bytes();
-        for pixel in bgra_bytes.chunks_exact_mut(4) {
+        for pixel in bgra_bytes.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
 
