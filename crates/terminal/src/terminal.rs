@@ -2808,7 +2808,18 @@ impl Terminal {
             return true;
         }
 
-        // Keep default terminal behavior
+        let kitty_encoding = self.ghostty.as_ref().and_then(|ghostty| {
+            ghostty
+                .lock()
+                .encode_kitty_key(keystroke, option_as_meta)
+                .log_err()
+                .flatten()
+        });
+        if let Some(encoded) = kitty_encoding {
+            self.input(encoded);
+            return true;
+        }
+
         let esc = to_esc_str(keystroke, self.last_content.mode, option_as_meta);
         if let Some(esc) = esc {
             match esc {

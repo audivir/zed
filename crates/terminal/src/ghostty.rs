@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use libghostty_vt::{
-    TerminalOptions,
+    TerminalOptions, key,
     kitty::graphics::{self, Compression, ImageFormat, PlacementIterator},
     render::{CellIterator, CursorVisualStyle, RowIterator},
     screen,
@@ -138,6 +138,8 @@ pub(super) struct GhosttyTerminal {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     placements: PlacementIterator<'static>,
+    key_encoder: key::Encoder<'static>,
+    key_event: key::Event<'static>,
     effects: Arc<ParkingMutex<Vec<GhosttyEffect>>>,
     host_state: Arc<ParkingMutex<HostState>>,
     /// Progress of the current synchronized update (mode 2026).
@@ -247,6 +249,8 @@ impl GhosttyTerminal {
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
             placements: PlacementIterator::new()?,
+            key_encoder: key::Encoder::new()?,
+            key_event: key::Event::new()?,
             effects,
             host_state,
             synchronized_output: SynchronizedOutput::Idle,
@@ -290,6 +294,66 @@ impl GhosttyTerminal {
             cell_height,
         )?;
         Ok(())
+    }
+
+    /// Encodes a key press with the Kitty keyboard protocol, once a program enabled it.
+    ///
+    /// Returns `None` while the protocol is off, so the legacy encoding applies, and for keys
+    /// that only produce text, which the text input path delivers.
+    pub(super) fn encode_kitty_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        option_as_meta: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.terminal.kitty_keyboard_flags()?.is_empty() {
+            return Ok(None);
+        }
+        let (ghostty_key, unshifted) = ghostty_key(&keystroke.key);
+
+        let modifiers = keystroke.modifiers;
+        let mut mods = key::Mods::empty();
+        mods.set(key::Mods::SHIFT, modifiers.shift);
+        mods.set(key::Mods::ALT, modifiers.alt);
+        mods.set(key::Mods::CTRL, modifiers.control);
+        mods.set(key::Mods::SUPER, modifiers.platform);
+
+        // the layout consumed a modifier when it changed the produced character, as shift does
+        // for letters and option does on macOS unless it acts as meta.
+        let text = keystroke
+            .key_char
+            .clone()
+            .filter(|text| !text.chars().any(char::is_control));
+        let mut consumed_mods = key::Mods::empty();
+        if text.as_deref().is_some_and(|text| text != keystroke.key) {
+            consumed_mods.set(key::Mods::SHIFT, modifiers.shift);
+            consumed_mods.set(key::Mods::ALT, modifiers.alt && !option_as_meta);
+        }
+
+        self.key_event
+            .set_action(key::Action::Press)
+            .set_key(ghostty_key)
+            .set_mods(mods)
+            .set_consumed_mods(consumed_mods)
+            .set_composing(false)
+            .set_utf8(text.clone());
+        if let Some(unshifted) = unshifted {
+            self.key_event.set_unshifted_codepoint(unshifted);
+        }
+        self.key_encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_macos_option_as_alt(if option_as_meta {
+                key::OptionAsAlt::True
+            } else {
+                key::OptionAsAlt::False
+            });
+
+        let mut encoded = Vec::with_capacity(32);
+        self.key_encoder
+            .encode_to_vec(&self.key_event, &mut encoded)?;
+        if encoded.is_empty() || text.is_some_and(|text| text.as_bytes() == encoded) {
+            return Ok(None);
+        }
+        Ok(Some(encoded))
     }
 
     /// Sets the color scheme reported to programs, and notifies those that subscribed to
@@ -1735,6 +1799,94 @@ fn portable_pty_exit_status(status: portable_pty::ExitStatus) -> std::process::E
 #[cfg(windows)]
 fn portable_pty_exit_status(status: portable_pty::ExitStatus) -> std::process::ExitStatus {
     std::os::windows::process::ExitStatusExt::from_raw(status.exit_code())
+}
+
+/// Maps a GPUI key name to the Ghostty key on a US layout, with its unshifted character.
+fn ghostty_key(name: &str) -> (key::Key, Option<char>) {
+    use key::Key;
+    let named = match name {
+        "enter" => Some(Key::Enter),
+        "tab" => Some(Key::Tab),
+        "space" => Some(Key::Space),
+        "backspace" => Some(Key::Backspace),
+        "escape" => Some(Key::Escape),
+        "delete" => Some(Key::Delete),
+        "insert" => Some(Key::Insert),
+        "home" => Some(Key::Home),
+        "end" => Some(Key::End),
+        "pageup" => Some(Key::PageUp),
+        "pagedown" => Some(Key::PageDown),
+        "up" => Some(Key::ArrowUp),
+        "down" => Some(Key::ArrowDown),
+        "left" => Some(Key::ArrowLeft),
+        "right" => Some(Key::ArrowRight),
+        _ => None,
+    };
+    if let Some(named) = named {
+        let unshifted = match named {
+            Key::Enter => Some('\r'),
+            Key::Tab => Some('\t'),
+            Key::Space => Some(' '),
+            _ => None,
+        };
+        return (named, unshifted);
+    }
+    if let Some(number) = name
+        .strip_prefix('f')
+        .and_then(|number| number.parse::<u32>().ok())
+        && (1..=25).contains(&number)
+    {
+        let key = u32::from(Key::F1) + number - 1;
+        return (Key::try_from(key).unwrap_or(Key::Unidentified), None);
+    }
+
+    let mut characters = name.chars();
+    let (Some(character), None) = (characters.next(), characters.next()) else {
+        return (Key::Unidentified, None);
+    };
+    let unshifted = match character {
+        '~' => '`',
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        other => other.to_ascii_lowercase(),
+    };
+    let key = match unshifted {
+        'a'..='z' => Key::try_from(u32::from(Key::A) + (unshifted as u32 - 'a' as u32))
+            .unwrap_or(Key::Unidentified),
+        '0'..='9' => Key::try_from(u32::from(Key::Digit0) + (unshifted as u32 - '0' as u32))
+            .unwrap_or(Key::Unidentified),
+        '`' => Key::Backquote,
+        '-' => Key::Minus,
+        '=' => Key::Equal,
+        '[' => Key::BracketLeft,
+        ']' => Key::BracketRight,
+        '\\' => Key::Backslash,
+        ';' => Key::Semicolon,
+        '\'' => Key::Quote,
+        ',' => Key::Comma,
+        '.' => Key::Period,
+        '/' => Key::Slash,
+        _ => Key::Unidentified,
+    };
+    (key, Some(unshifted))
 }
 
 fn ghostty_cursor_shape(style: CursorVisualStyle) -> CursorShape {
@@ -3447,6 +3599,51 @@ mod tests {
     }
 
     // colors must stay `Named`, `Indexed`, or `Spec`, since only the first two follow the theme.
+    #[test]
+    fn kitty_keyboard_protocol_encodes_keys_once_enabled() {
+        let mut terminal = GhosttyTerminal::new(80, 24, 100).unwrap();
+        let encode = |terminal: &mut GhosttyTerminal, keystroke: &str| {
+            let mut keystroke = gpui::Keystroke::parse(keystroke).unwrap();
+            if keystroke.modifiers.number_of_modifiers() == 0 && keystroke.key.len() == 1 {
+                keystroke.key_char = Some(keystroke.key.clone());
+            }
+            terminal
+                .encode_kitty_key(&keystroke, false)
+                .unwrap()
+                .map(|bytes| String::from_utf8(bytes).unwrap())
+        };
+
+        assert_eq!(encode(&mut terminal, "ctrl-enter"), None);
+
+        // disambiguate escape codes, as fish, Neovim, and Helix request.
+        terminal.write(b"\x1b[>1u");
+        assert_eq!(
+            encode(&mut terminal, "ctrl-c").as_deref(),
+            Some("\x1b[99;5u")
+        );
+        assert_eq!(
+            encode(&mut terminal, "ctrl-enter").as_deref(),
+            Some("\x1b[13;5u")
+        );
+        assert_eq!(
+            encode(&mut terminal, "shift-space").as_deref(),
+            Some("\x1b[32;2u")
+        );
+        assert_eq!(encode(&mut terminal, "escape").as_deref(), Some("\x1b[27u"));
+        assert_eq!(
+            encode(&mut terminal, "alt-shift-x").as_deref(),
+            Some("\x1b[120;4u")
+        );
+        assert_eq!(encode(&mut terminal, "up").as_deref(), Some("\x1b[A"));
+        assert_eq!(encode(&mut terminal, "f5").as_deref(), Some("\x1b[15~"));
+        assert_eq!(encode(&mut terminal, "enter").as_deref(), Some("\r"));
+        // plain text keeps flowing through the text input path.
+        assert_eq!(encode(&mut terminal, "a"), None);
+
+        terminal.write(b"\x1b[<u");
+        assert_eq!(encode(&mut terminal, "ctrl-c"), None);
+    }
+
     #[test]
     fn host_queries_report_color_scheme_and_size() {
         let mut terminal = GhosttyTerminal::new(80, 24, 100).unwrap();
