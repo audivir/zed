@@ -28,20 +28,16 @@ use crate::{
     pty_info::{ProcessIdGetter, PtyProcessInfo},
 };
 
-/// Maximum bytes of decoded Kitty graphics image data libghostty-vt will
-/// retain per terminal, matching Ghostty's own default
-/// `--kitty-image-storage-limit`.
+/// Maximum bytes of decoded Kitty image data retained per terminal, the Ghostty default.
 const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 320 * 1024 * 1024;
 
 /// Size of each recycled PTY read buffer.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
-/// Upper bound on how many bytes the parser thread batches into a single
-/// `libghostty-vt` write before handing effects back to the UI thread.
+/// Maximum bytes the parser thread batches into one write before returning effects.
 const MAX_PTY_PARSE_BATCH_BYTES: usize = 512 * 1024;
-/// Bound on the reader-to-parser queue, so a slow parser applies backpressure
-/// to PTY reads instead of buffering unboundedly.
+/// Capacity of the reader-to-parser queue, so a slow parser applies backpressure to reads.
 const MAX_QUEUED_PTY_OUTPUT_BUFFERS: usize = 512;
-/// Bound on the buffer-recycling channel back to the reader thread.
+/// Capacity of the channel recycling buffers back to the reader thread.
 const MAX_RECYCLED_PTY_BUFFERS: usize = 64;
 
 pub(super) struct GhosttyContentMetadata {
@@ -57,8 +53,7 @@ pub(super) enum GhosttyEffect {
     PtyWrite(Vec<u8>),
     Bell,
     TitleChanged(String),
-    /// An OSC 52 (or iTerm2 OSC 1337 Copy) clipboard write, already
-    /// normalized to plain text.
+    /// OSC 52 or iTerm2 OSC 1337 clipboard write, normalized to plain text.
     ClipboardStore(String),
 }
 
@@ -97,37 +92,28 @@ impl PtySender {
     }
 }
 
-/// A `libghostty-vt` terminal instance driven in parallel with the PTY, used
-/// only for the metadata (cursor position/glyph, scroll position) it computes
-/// more accurately than the Alacritty shadow terminal. See the field doc on
-/// [`crate::Terminal::ghostty`].
+/// Wrapper around a `libghostty-vt` terminal that parses PTY output and drives rendering.
 ///
-/// Shared as `Arc<parking_lot::Mutex<GhosttyTerminal>>` between the PTY
-/// parser thread (which writes PTY output into it) and the terminal entity's
-/// owning thread (which reads cursor/scroll metadata during `sync`).
+/// Shared as `Arc<parking_lot::Mutex<GhosttyTerminal>>` between the PTY parser thread and the
+/// thread owning the terminal entity.
 pub(super) struct GhosttyTerminal {
-    // libghostty-vt stores callback userdata as a raw pointer into its Terminal.
+    // boxed because libghostty-vt stores callback userdata as a raw pointer into it.
     terminal: Box<libghostty_vt::Terminal<'static, 'static>>,
     render_state: libghostty_vt::RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     placements: PlacementIterator<'static>,
     effects: Arc<ParkingMutex<Vec<GhosttyEffect>>>,
-    /// Cached, Zed-point-space mirror of whatever `Selection` is currently
-    /// installed via `self.terminal.set_selection`.
+    /// Active selection in Zed point space, mirroring the one installed in Ghostty.
     current_selection: Option<crate::SelectionRange>,
-    /// The vi-mode cursor position, or `None` when vi mode is disabled.
+    /// Vi-mode cursor position, or `None` when vi mode is disabled.
     current_vi_cursor: Option<crate::Point>,
 }
 
-// libghostty-vt's objects are otherwise `!Send` only because they hold raw
-// pointers and C callback state; the underlying library documents terminal
-// IO and rendering as safe to hand off between threads as long as access is
-// never concurrent. `GhosttyTerminal` upholds that itself: every method that
-// touches the FFI state takes `&mut self`, and it is only ever reachable
-// through `Arc<parking_lot::Mutex<GhosttyTerminal>>`, so the mutex serializes
-// all cross-thread access (PTY parser thread vs. the terminal entity's
-// owning thread) into non-concurrent, single-threaded-at-a-time use.
+// SAFETY: libghostty-vt objects are `!Send` only because they hold raw pointers and callback
+// state, and the library allows moving them between threads as long as access is never
+// concurrent. Every FFI method takes `&mut self`, and the value is only reachable through a
+// mutex, which serializes access from the parser thread and the entity thread.
 unsafe impl Send for GhosttyTerminal {}
 
 impl GhosttyTerminal {
@@ -167,13 +153,8 @@ impl GhosttyTerminal {
             }
         })?;
 
-        // Handles OSC 52 SET (clipboard write). OSC 52 GET ("read", i.e.
-        // `\x1b]52;c;?\x1b\\`) has no equivalent to wire up at all:
-        // `libghostty-vt` always ignores clipboard read requests by design
-        // (see this callback's own doc comment), an intentional
-        // security-conscious default shared by many terminals. Multipart/
-        // multi-MIME writes are flattened to their first representation's
-        // text.
+        // handles OSC 52 writes. libghostty-vt always ignores clipboard reads by design.
+        // Multi-MIME writes are flattened to the text of their first representation.
         terminal.on_clipboard_write({
             let effects = effects.clone();
             move |_terminal, write| {
@@ -213,16 +194,8 @@ impl GhosttyTerminal {
         self.terminal.resize(
             bounds.num_columns().max(1) as u16,
             bounds.num_lines().max(1) as u16,
-            // Rounded, not truncated: cell dimensions are rarely whole
-            // pixels (fractional line heights are the common case), and
-            // libghostty-vt's Kitty image row math (`gridSize`'s
-            // `divCeil(image_height_px, t.height_px / t.rows)`) recovers
-            // this exact per-cell value from `t.height_px = cell_height_px
-            // * rows`. Truncating always biases the recovered cell size
-            // down, which always biases `divCeil` up, systematically
-            // undercounting by one extra row per ~20px of image height.
-            // This is invisible for small images but grows without bound
-            // for tall ones (e.g. a `red_square 4000` sender).
+            // round instead of truncating: libghostty-vt recovers the cell size from the total
+            // height, and truncation undercounts Kitty image rows by one per ~20px of height.
             f32::from(bounds.cell_width()).max(1.0).round() as u32,
             f32::from(bounds.line_height()).max(1.0).round() as u32,
         )?;
@@ -233,17 +206,12 @@ impl GhosttyTerminal {
         self.terminal.scroll_viewport(scroll);
     }
 
-    /// The number of rows in the viewport (screen lines), for callers
-    /// outside this module that need it without reaching into
-    /// `libghostty_vt::Terminal` directly (e.g. `Terminal::sync`'s
-    /// `bottom_row_occupied` computation, `Terminal::viewport_lines`).
+    /// Returns the number of viewport rows.
     pub(super) fn rows(&self) -> Result<u16> {
         Ok(self.terminal.rows()?)
     }
 
-    /// The total number of rows including scrollback history, for
-    /// `Terminal::total_lines`, which the terminal scrollbar (thumb size)
-    /// and various scroll-bound checks use.
+    /// Returns the total number of rows including scrollback.
     pub(super) fn total_lines(&self) -> Result<usize> {
         Ok(self.terminal.total_rows()?)
     }
@@ -252,26 +220,12 @@ impl GhosttyTerminal {
         self.effects.lock().drain(..).collect()
     }
 
-    /// Converts `Terminal::scrollbar().offset` into the `display_offset`
-    /// convention the rest of this crate (and `terminal_element.rs`, e.g.
-    /// `to_highlighted_range_lines`'s
-    /// `range.start().line.saturating_add(display_offset)`) expects
-    /// wherever a `crate::Point`/`crate::Range` is converted to or from a
-    /// viewport-relative row: `line + display_offset = viewport_row`. Named
-    /// after Alacritty since that convention predates the Ghostty backend
-    /// and the rest of the crate still speaks it.
+    /// Returns the scroll position as a `display_offset`, where `line + display_offset` is the
+    /// viewport row.
     ///
-    /// Ghostty's `Scrollbar.offset` uses the opposite polarity: it's a
-    /// conventional GUI-scrollbar-style position where `0` means the
-    /// viewport is scrolled all the way to the *top* of history (oldest
-    /// content visible), and `total - len` means scrolled to the *bottom*
-    /// (newest/live content, i.e. "not scrolled" in terminal terms).
-    /// `display_offset` is the opposite: `0` means "not scrolled" (viewing
-    /// the live bottom), and it *increases* as you scroll up into history.
-    /// Treating `scrollbar().offset` as if it already were `display_offset`
-    /// silently produces `Point`s off by exactly `scrollback_rows` whenever
-    /// the viewport isn't at the live bottom, so always convert through
-    /// this function rather than reading `scrollbar().offset` directly.
+    /// Ghostty uses the opposite polarity: `Scrollbar.offset` is `0` at the top of history,
+    /// while `display_offset` is `0` at the live bottom and grows when scrolling up. Always
+    /// convert through this function.
     pub(super) fn alacritty_style_display_offset(&self) -> Result<usize> {
         let scrollbar = self.terminal.scrollbar()?;
         Ok(
@@ -287,12 +241,7 @@ impl GhosttyTerminal {
     ) -> Result<GhosttyContentMetadata> {
         let scrollbar = self.terminal.scrollbar()?;
 
-        // In vi mode, the rendered cursor is the vi cursor, not the real
-        // terminal cursor (`if vi_mode { vi_mode_cursor.point } else {
-        // grid.cursor.point }`). It's always shown regardless of DECTCEM
-        // visibility, since vi mode is a terminal-emulator-level UI
-        // feature, not something the PTY controls: vi mode always bypasses
-        // the hidden check.
+        // the vi cursor replaces the terminal cursor and is shown regardless of DECTCEM.
         if let Some(point) = vi_cursor {
             let snapshot = self.render_state.update(&self.terminal)?;
             let cursor_style = snapshot.cursor_visual_style()?;
@@ -335,8 +284,7 @@ impl GhosttyTerminal {
             }
         }
 
-        // `cursor_viewport` is `None` when the cursor has scrolled out of
-        // view; hide it instead of falling back to a fake (0, 0) position.
+        // hide a cursor scrolled out of view instead of faking a (0, 0) position.
         let cursor = crate::Cursor {
             shape: if cursor_visible && cursor_viewport.is_some() {
                 ghostty_cursor_shape(cursor_style)
@@ -359,9 +307,7 @@ impl GhosttyTerminal {
         })
     }
 
-    /// Builds the terminal's viewport-relative cell grid, mode flags, and
-    /// scroll offset directly from Ghostty. `Terminal::refresh_last_content_from_ghostty`
-    /// calls this on every `sync()`.
+    /// Builds the viewport cell grid, mode flags, and display offset.
     pub(super) fn build_content(
         &mut self,
     ) -> Result<(Vec<crate::IndexedCell>, crate::Modes, usize)> {
@@ -371,9 +317,7 @@ impl GhosttyTerminal {
             * usize::from(self.terminal.cols().unwrap_or(80));
         let mut cells = Vec::with_capacity(total_cells);
         let mut row_index: i32 = 0;
-        // Reused across cells so the common case (no combining/zero-width marks, well
-        // under this size) never allocates just to read a cell's grapheme cluster; only
-        // clusters longer than this fall back to a per-cell Vec.
+        // reused across cells so typical grapheme clusters never allocate.
         let mut grapheme_buf = [' '; 32];
 
         while let Some(row) = rows.next() {
@@ -413,7 +357,7 @@ impl GhosttyTerminal {
                             style.bg_color,
                             vte::ansi::NamedColor::Background,
                         ),
-                        // OSC 8 hyperlinks aren't populated here.
+                        // OSC 8 hyperlinks are resolved on hover instead.
                         hyperlink: None,
                         is_bold: style.bold,
                         is_italic: style.italic,
@@ -460,9 +404,7 @@ impl GhosttyTerminal {
         set(crate::Modes::MOUSE_REPORT_CLICK, Mode::NORMAL_MOUSE)?;
         set(crate::Modes::MOUSE_DRAG, Mode::BUTTON_MOUSE)?;
         set(crate::Modes::MOUSE_MOTION, Mode::ANY_MOUSE)?;
-        // Alacritty's `TermMode::ALT_SCREEN` is set by any of the legacy
-        // (47), and modern save/restore (1047/1049) alternate-screen
-        // sequences; check all three since senders vary in which they use.
+        // senders use legacy (47) or save/restore (1047/1049) alternate screen modes.
         if self.terminal.mode(Mode::ALT_SCREEN_LEGACY)?
             || self.terminal.mode(Mode::ALT_SCREEN)?
             || self.terminal.mode(Mode::ALT_SCREEN_SAVE)?
@@ -472,17 +414,15 @@ impl GhosttyTerminal {
         Ok(modes)
     }
 
-    // selections round-trip through Ghostty's screen space rather than its viewport space, since
-    // a selection extended while scrolling has endpoints outside the current viewport.
+    // selections use the screen space of Ghostty rather than its viewport space, since a
+    // selection extended while scrolling has endpoints outside the current viewport.
 
-    /// Returns the screen row of `crate::Point` line zero, i.e. the top of the active screen.
+    /// Returns the screen row of `crate::Point` line zero, the top of the active screen.
     fn screen_line_base(&self) -> Result<i64> {
         Ok(self.terminal.total_rows()? as i64 - i64::from(self.terminal.rows()?))
     }
 
     /// Installs `range` as the active selection, or clears it if `None`.
-    /// Also updates the cached `current_selection` mirror `selection_range`/
-    /// `update_selection` read.
     pub(super) fn set_selection(&mut self, range: Option<crate::SelectionRange>) -> Result<()> {
         let line_base = self.screen_line_base()?;
         match range {
@@ -505,9 +445,9 @@ impl GhosttyTerminal {
         Ok(())
     }
 
-    /// Moves the active selection's end point to `point`, keeping its start
-    /// (anchor) and `is_block` fixed. Returns `false` if there is no active
-    /// selection to extend, mirroring `alacritty::update_selection`'s shape.
+    /// Moves the end of the active selection to `point`.
+    ///
+    /// Returns `false` if there is no active selection.
     pub(super) fn update_selection(&mut self, point: crate::Point) -> Result<bool> {
         let Some(mut range) = self.current_selection else {
             return Ok(false);
@@ -517,15 +457,13 @@ impl GhosttyTerminal {
         Ok(true)
     }
 
-    /// The cached, Zed-point-space mirror of the active selection.
+    /// Returns the active selection in Zed point space.
     pub(super) fn selection_range(&self) -> Option<crate::SelectionRange> {
         self.current_selection
     }
 
-    /// Formats the active selection as plain text, joining soft-wrapped
-    /// lines and trimming trailing whitespace, matching Ghostty's own
-    /// `Screen.selectionString()` semantics per this option combination's
-    /// doc comment in `libghostty_vt::selection`.
+    /// Formats the active selection as plain text, joining soft wraps and trimming trailing
+    /// whitespace.
     pub(super) fn selection_text(&self) -> Result<Option<String>> {
         let options = libghostty_vt::selection::FormatOptions::new()
             .with_emit_format(libghostty_vt::fmt::Format::Plain)
@@ -537,8 +475,7 @@ impl GhosttyTerminal {
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
-    /// Derives and installs a word selection at `point`, using Ghostty's own
-    /// word-boundary rules (`Terminal::select_word`).
+    /// Selects the word at `point` using the word boundaries of Ghostty.
     pub(super) fn select_word_at(
         &mut self,
         point: crate::Point,
@@ -559,8 +496,7 @@ impl GhosttyTerminal {
         Ok(Some(range))
     }
 
-    /// Derives and installs a line selection at `point`, using Ghostty's own
-    /// line semantics (`Terminal::select_line`; joins soft-wrapped rows).
+    /// Selects the line at `point`, joining soft-wrapped rows.
     pub(super) fn select_line_at(
         &mut self,
         point: crate::Point,
@@ -581,7 +517,7 @@ impl GhosttyTerminal {
         Ok(Some(range))
     }
 
-    /// Derives and installs a selection covering all selectable content.
+    /// Selects all selectable content.
     pub(super) fn select_all(&mut self) -> Result<Option<crate::SelectionRange>> {
         let line_base = self.screen_line_base()?;
         let Some(selection) = self.terminal.select_all()? else {
@@ -593,15 +529,10 @@ impl GhosttyTerminal {
         Ok(Some(range))
     }
 
-    /// Extends a word-granularity selection anchored at `anchor` to also
-    /// include the word under `drag_point`, using `select_word_between` for
-    /// boundary snapping in both directions. This is the exact technique
-    /// `Terminal::select_word_between`'s own doc comment recommends for
-    /// double-click-and-drag selection, so a double-click-drag doesn't
-    /// flicker/collapse when the pointer passes over whitespace between
-    /// words. Installs the resulting selection and updates the cache.
-    /// Returns `None` if either endpoint has no nearby word (e.g. an
-    /// entirely blank buffer).
+    /// Extends a word selection from `anchor` to the word under `drag_point`.
+    ///
+    /// Snaps in both directions with `select_word_between`, so dragging across whitespace does
+    /// not collapse the selection. Returns `None` if either endpoint has no nearby word.
     pub(super) fn select_word_range(
         &mut self,
         anchor: crate::Point,
@@ -629,12 +560,7 @@ impl GhosttyTerminal {
         else {
             return Ok(None);
         };
-        // Don't assume drag direction: `select_word_between`'s own doctest
-        // uses `start_word.start()`/`end_word.end()` directly, which only
-        // gives the right bounds when the anchor is left of the drag
-        // point. Converting both derived words to `Point` ranges first and
-        // taking the overall min/max instead (same technique
-        // `select_line_range` below uses) handles either drag direction.
+        // take the overall bounds of both words, since the drag can run in either direction.
         let word_toward_drag_range =
             selection_range_from_ghostty(&self.terminal, line_base, &word_toward_drag)?;
         let word_toward_anchor_range =
@@ -657,14 +583,9 @@ impl GhosttyTerminal {
         Ok(self.current_selection)
     }
 
-    /// Extends a line-granularity selection anchored at `anchor` to also
-    /// include the whole line(s) containing `drag_point`, by unioning the
-    /// full-line ranges `select_line_at` derives for each endpoint. The
-    /// selection always covers every complete line between the two points
-    /// regardless of drag direction. Installs the resulting selection and
-    /// updates the cache. Returns `None` if either endpoint has no
-    /// selectable line (shouldn't normally happen; `select_line` only
-    /// fails to find a line on a fully empty screen).
+    /// Extends a line selection from `anchor` to the lines containing `drag_point`.
+    ///
+    /// Returns `None` if either endpoint has no selectable line.
     pub(super) fn select_line_range(
         &mut self,
         anchor: crate::Point,
@@ -707,18 +628,11 @@ impl GhosttyTerminal {
         Ok(self.current_selection)
     }
 
-    // Hyperlinks. Given a point, this walks outward and returns an answer
-    // immediately. Unlike selection, there's no persistent cross-call state
-    // to keep in sync with anything else.
-
-    /// Finds the hyperlink or path at `point`: first an OSC 8 native
-    /// hyperlink (walking outward from `point` while the hyperlink URI
-    /// stays the same), then a bare URL matched by `url_regex`, then
-    /// the first `path_hyperlink_regexes` entry that produces a match on
-    /// the line (Alacritty's own "processing stops at the first regex with
-    /// a match, even if no link is produced" rule, preserved exactly since
-    /// both backends share `path_hyperlink_candidates_in_line`). Returns
-    /// `(text, is_url, range)`, or `None` if nothing matches.
+    /// Finds the hyperlink or path at `point`.
+    ///
+    /// Checks OSC 8 hyperlinks first, then bare URLs matching `url_regex`, then
+    /// `path_hyperlink_regexes`, where the first regex matching the line ends the search. Returns
+    /// `(text, is_url, range)`.
     pub(super) fn hyperlink_at(
         &mut self,
         point: crate::Point,
@@ -744,11 +658,7 @@ impl GhosttyTerminal {
             .map(|(byte_offset, _)| byte_offset)
             .unwrap_or(line.len());
 
-        // Converts a byte range in `line` back into an inclusive `Range` via
-        // `points` (char-indexed), the same byte->char conversion
-        // `search_matches` uses. `None` only if the range is somehow out of
-        // bounds for `points`, which byte ranges derived from `line`
-        // itself should never produce.
+        // converts a byte range in `line` into an inclusive `Range` via the char-indexed `points`.
         let point_range_for_bytes = |byte_range: std::ops::Range<usize>| -> Option<crate::Range> {
             let start_char = line[..byte_range.start].chars().count();
             let end_char = line[..byte_range.end].chars().count();
@@ -766,10 +676,7 @@ impl GhosttyTerminal {
             .find_iter(&line)
             .find(|m| m.start() <= hovered_byte_offset && hovered_byte_offset < m.end())
         {
-            // `trim_url_punctuation` only ever removes trailing ASCII
-            // punctuation (`.` `,` `:` `;` `(` `)`, each one byte), so the
-            // trimmed string's byte length maps directly onto a new end
-            // byte offset relative to the match's start.
+            // trimming removes single-byte ASCII punctuation, so byte lengths map directly.
             let (trimmed, _chars_trimmed) = trim_url_punctuation(found.as_str());
             let end_byte = found.start() + trimmed.len();
             if let Some(range) = point_range_for_bytes(found.start()..end_byte) {
@@ -791,36 +698,14 @@ impl GhosttyTerminal {
         Ok(None)
     }
 
-    // Search. `libghostty-vt` has no built-in grid-wide search API at all
-    // (real Ghostty's own search, `src/terminal/search/*.zig` in the
-    // vendored source, is a literal-substring incremental sliding-window
-    // search over its `PageList`, not regex, and not exposed through the
-    // Rust bindings regardless). Zed's search is regex (`crate::Search`
-    // compiles a pattern), so this extracts the full history and active
-    // buffer as plain text with a per-character `Point` map, and runs the
-    // `regex` crate over that text directly, mapping byte-range matches
-    // back to `Point`s via the map.
-    //
-    // This reads every cell in the entire scrollback via FFI on every
-    // call, with no incremental or windowed search, so it can be slow on
-    // very large scrollback (tens of thousands of lines). An incremental
-    // search would need Ghostty's own sliding-window technique adapted for
-    // regex.
+    // libghostty-vt has no grid-wide regex search, so search extracts the whole buffer as text with
+    // a point per character. This reads all scrollback on every call and can be slow for very
+    // large histories.
 
-    /// Runs `regex` over the terminal's full history + active screen text,
-    /// returning matches as `crate::Range`s in the same `line +
-    /// display_offset = viewport row` coordinate convention
-    /// `terminal_element.rs`'s `to_highlighted_range_lines` and this
-    /// module's selection/hyperlink code already use. A match found deep in
-    /// scrollback can later be scrolled into view the same way any other
-    /// off-screen `Point` can.
+    /// Returns all matches of `regex` in the scrollback and active screen.
     ///
-    /// Soft-wrapped rows are joined into one logical line for matching
-    /// (mirroring `alacritty::search_matches`'s behavior, since Alacritty's
-    /// own grid addressing has no separate concept of "physical row" vs.
-    /// "wrapped line" either); hard line breaks insert a literal `\n` so
-    /// `^`/`$`-anchored patterns still match per hard line, not per
-    /// soft-wrapped screen row.
+    /// Soft-wrapped rows form one logical line, and hard line breaks become `\n`, so anchored
+    /// patterns match per hard line.
     pub(super) fn search_matches(&mut self, regex: &regex::Regex) -> Result<Vec<crate::Range>> {
         let (text, points) = self.buffer_text_with_point_map()?;
 
@@ -842,14 +727,7 @@ impl GhosttyTerminal {
         Ok(matches)
     }
 
-    /// Extracts the terminal's full history and active screen as plain
-    /// text, alongside a parallel `Point` for every `char` in that text
-    /// (indexed by char count, not byte offset, so multi-byte UTF-8
-    /// doesn't need to be reasoned about when mapping a match back to a
-    /// point). This is the shared core of `search_matches` and, in the
-    /// future, "select all"/whole-buffer text extraction that needs full
-    /// scrollback rather than just the current viewport (`build_content`
-    /// only covers the viewport).
+    /// Extracts the scrollback and active screen as text with a `Point` for every `char`.
     fn buffer_text_with_point_map(&self) -> Result<(String, Vec<crate::Point>)> {
         let total_rows = self.terminal.total_rows()?;
         let viewport_rows = usize::from(self.terminal.rows()?);
@@ -892,14 +770,8 @@ impl GhosttyTerminal {
                 }
             }
             if !row_wrapped {
-                // Trim this row's own trailing blank cells before the hard
-                // newline, so `$`-anchored patterns match right after real
-                // content instead of after a whole row's worth of trailing
-                // padding. Only the current physical row's contribution is
-                // trimmed, since a row can only wrap when filled
-                // edge-to-edge, so a wrapped predecessor row in the same
-                // logical line should never have trailing blanks to begin
-                // with.
+                // trim trailing blanks of this row, so `$` matches right after real content.
+                // Wrapped rows are full, so only the current row can have trailing blanks.
                 while points.len() > row_start && text.ends_with(' ') {
                     text.pop();
                     points.pop();
@@ -911,12 +783,7 @@ impl GhosttyTerminal {
         Ok((text, points))
     }
 
-    /// The terminal's full history and active screen as plain text, for
-    /// `Terminal::get_content`. Unlike `buffer_text_with_point_map`, which
-    /// appends a trailing `\n` after every logical line including the last
-    /// (so char-index-to-`Point` mapping stays simple for
-    /// `search_matches`/`hyperlink_at`), this trims a spurious final
-    /// trailing newline.
+    /// Returns the scrollback and active screen as text, without a trailing newline.
     pub(super) fn buffer_text(&self) -> Result<String> {
         let (mut text, _) = self.buffer_text_with_point_map()?;
         if text.ends_with('\n') {
@@ -925,14 +792,7 @@ impl GhosttyTerminal {
         Ok(text)
     }
 
-    /// The last (up to) `line_count` non-blank logical lines of the
-    /// terminal's full history and active screen, in top-to-bottom order.
-    /// Used for init-command shell-startup marker detection
-    /// (`Terminal::detect_init_command_startup_marker`) and
-    /// `Terminal::last_n_non_empty_lines`. `buffer_text_with_point_map`
-    /// already trims each logical line's own trailing blanks and joins on
-    /// `\n`, so this only needs to split, drop the blank lines, and take
-    /// the last `line_count`.
+    /// Returns up to `line_count` of the last non-blank logical lines, top to bottom.
     pub(super) fn last_non_empty_lines(&self, line_count: usize) -> Result<Vec<String>> {
         let (text, _) = self.buffer_text_with_point_map()?;
         let mut lines: Vec<String> = text
@@ -946,36 +806,14 @@ impl GhosttyTerminal {
         Ok(lines)
     }
 
-    // Vi mode. `libghostty-vt` has no vi-mode/vi-cursor concept at all, so
-    // this hand-implements cursor motion against Ghostty's cell/row grid,
-    // using the same absolute (`Point::Screen`) row addressing
-    // `search_matches`/`hyperlink_at` already use, via the small `ViGrid`
-    // helper below.
-    //
-    // Known simplification, not full parity: normalizing a point that
-    // lands on a wide-character spacer cell back onto the actual wide
-    // character is only partially handled. Same-row spacer-tail correction
-    // is implemented; the cross-row case for a wide character split across
-    // a soft wrap is not. This affects vi-motion cursor placement
-    // immediately around wide (e.g. CJK) characters only; plain ASCII/Latin
-    // text (the common case) is unaffected.
-    //
-    // Zed's own `ViMotion` (this crate's `enum ViMotion` in `terminal.rs`)
-    // only exposes whitespace-word motions (`WordLeft`/`WordRight`/
-    // `WordRightEnd`, vi's `W`/`B`/`E`), not "semantic" (punctuation-aware)
-    // word motions, so `ghostty_word_motion` below only needs to implement
-    // that one case.
-    //
-    // `Bracket` has no `libghostty-vt` equivalent either;
-    // `ghostty_bracket_motion` below is a small hand-rolled depth-counting
-    // scan for `()`/`[]`/`{}` pairs.
+    // libghostty-vt has no vi mode, so cursor motion is implemented against the screen grid via
+    // `ViGrid`. Wide characters split across a soft wrap are not normalized. Only whitespace word
+    // motions and a depth-counting bracket motion are needed.
 
-    /// Toggles vi mode. Returns the new vi cursor position (`Some` when vi
-    /// mode is now enabled, `None` when it was just disabled). On enabling,
-    /// the vi cursor starts at the real terminal cursor's position if it's
-    /// currently within the
-    /// visible viewport, or at the top-left of the viewport otherwise (the
-    /// terminal cursor scrolled out of view).
+    /// Toggles vi mode and returns the new vi cursor, or `None` when disabled.
+    ///
+    /// The vi cursor starts at the terminal cursor if visible, otherwise at the top-left of the
+    /// viewport.
     pub(super) fn toggle_vi_mode(&mut self) -> Result<Option<crate::Point>> {
         if self.current_vi_cursor.is_some() {
             self.current_vi_cursor = None;
@@ -988,28 +826,22 @@ impl GhosttyTerminal {
             .update(&self.terminal)?
             .cursor_viewport()?;
         let point = match cursor_viewport {
-            // `cursor_viewport` is already viewport-relative (0,0 = the
-            // viewport's top-left), so this is the same `line = row -
-            // display_offset` conversion `content_metadata` uses for the
-            // real rendered cursor.
             Some(cursor) => crate::Point::new(cursor.y as i32 - display_offset, cursor.x as usize),
-            // Terminal cursor isn't in the visible viewport at all right
-            // now (e.g. mid-command output scrolled it away): start at the
-            // top-left of the viewport instead, matching Alacritty.
+            // start at the top-left of the viewport when the terminal cursor is scrolled away.
             None => grid.to_point(grid.line_base - i64::from(display_offset), 0),
         };
         self.current_vi_cursor = Some(point);
         Ok(Some(point))
     }
 
-    /// The current vi cursor position, or `None` when vi mode is disabled.
+    /// Returns the vi cursor, or `None` when vi mode is disabled.
     pub(super) fn vi_cursor(&self) -> Option<crate::Point> {
         self.current_vi_cursor
     }
 
-    /// Moves the vi cursor directly to `point` (e.g. for search-match
-    /// activation while in vi mode), and extends the active selection to
-    /// follow if one is present. No-ops if vi mode isn't enabled.
+    /// Moves the vi cursor to `point` and extends an active selection to follow.
+    ///
+    /// Does nothing unless vi mode is enabled.
     pub(super) fn vi_goto_point(&mut self, point: crate::Point) -> Result<()> {
         if self.current_vi_cursor.is_none() {
             return Ok(());
@@ -1020,12 +852,7 @@ impl GhosttyTerminal {
         Ok(())
     }
 
-    /// Scrolls the viewport by the minimum amount needed to bring `point`
-    /// into view (as the top row if it's above the viewport, or the bottom
-    /// row if below; a no-op if already visible). `vi_goto_point` calls this
-    /// before moving the vi cursor, and
-    /// `Terminal::process_terminal_event`'s `InternalEvent::ScrollToPoint`
-    /// handler calls it directly.
+    /// Scrolls the viewport by the minimum amount that brings `point` into view.
     pub(super) fn scroll_viewport_to_reveal(&mut self, point: crate::Point) -> Result<()> {
         let display_offset = self.alacritty_style_display_offset()? as i32;
         let viewport_rows = i32::from(self.terminal.rows()?);
@@ -1045,10 +872,9 @@ impl GhosttyTerminal {
         Ok(())
     }
 
-    /// Moves the vi cursor to follow a plain (non vi-motion) scroll, such
-    /// as the mouse wheel or `Scroll::PageUp`/`PageDown`/`Top`/`Bottom`, so
-    /// it roughly stays in the same relative viewport position instead of
-    /// scrolling out from under the user. No-ops if vi mode isn't enabled.
+    /// Moves the vi cursor along with a plain scroll so it keeps its relative viewport position.
+    ///
+    /// Does nothing unless vi mode is enabled.
     pub(super) fn update_vi_cursor_for_scroll(
         &mut self,
         scroll: Scroll,
@@ -1079,10 +905,7 @@ impl GhosttyTerminal {
         Ok(Some(point))
     }
 
-    /// Shared by `update_vi_cursor_for_scroll`'s `Delta`/`PageUp`/`PageDown`
-    /// cases: move `lines` rows from `current`, clamped to the grid's
-    /// absolute bounds (Alacritty's `Boundary::Grid`), landing on the first
-    /// occupied cell in the resulting row (or column 0 if the row is blank).
+    /// Moves `lines` rows from `current`, clamped to the grid, onto the first occupied cell.
     fn vi_cursor_scroll(
         &self,
         grid: &ViGrid<'_>,
@@ -1095,8 +918,9 @@ impl GhosttyTerminal {
         Ok(grid.to_point(clamped_row, column))
     }
 
-    /// Moves the vi cursor by `motion`, and extends the active selection to
-    /// follow if one is present. No-ops if vi mode isn't enabled.
+    /// Moves the vi cursor by `motion` and extends an active selection to follow.
+    ///
+    /// Does nothing unless vi mode is enabled.
     pub(super) fn vi_motion(&mut self, motion: ViMotion) -> Result<Option<crate::Point>> {
         let Some(current) = self.current_vi_cursor else {
             return Ok(None);
@@ -1104,31 +928,17 @@ impl GhosttyTerminal {
         let grid = ViGrid::new(&self.terminal)?;
         let display_offset = self.alacritty_style_display_offset()? as i64;
         let point = ghostty_vi_motion(&grid, current, motion, display_offset)?;
-        // Alacritty's own `ViModeCursor::motion` scrolls to reveal the new
-        // cursor position at the end of every motion (e.g. `G`/`gg`-style
-        // High/Low jumps, or repeated Up/Down walking off the current
-        // screen); mirrored here for the same reason.
+        // reveal the new cursor after every motion, such as jumps or walking off screen.
         self.scroll_viewport_to_reveal(point)?;
         self.current_vi_cursor = Some(point);
         self.update_selection(point)?;
         Ok(Some(point))
     }
 
-    /// Configures Ghostty's *default* foreground/background/cursor colors
-    /// and 256-color palette from Zed's active theme
-    /// (`Terminal::sync_ghostty_theme_colors` computes these via the same
-    /// `get_color_at_index` mapping the OSC 10/11 theme-fallback and
-    /// `Color::Indexed` rendering already used, see `terminal.rs`). An OSC
-    /// 4/10/11/12 SET from the running program still overrides these on
-    /// top, same as before.
+    /// Sets the default foreground, background, cursor, and palette colors from the theme.
     ///
-    /// Once every terminal calls this, Ghostty's "effective color" getters
-    /// (`fg_color`/`bg_color`/`cursor_color`/`color_palette`) always
-    /// resolve to a real value instead of `None`/a built-in placeholder,
-    /// so Ghostty always answers OSC 4/10/11/12 queries independently on
-    /// its own PTY-write path, and `Terminal::process_event`'s
-    /// `ColorRequest` handler can trust that unconditionally instead of
-    /// needing to distinguish "overridden" from "not" itself.
+    /// OSC 4/10/11/12 overrides from programs still apply on top. With defaults configured,
+    /// Ghostty answers color queries itself, so Zed never needs to.
     pub(super) fn set_default_theme_colors(
         &mut self,
         foreground: vte::ansi::Rgb,
@@ -1157,15 +967,10 @@ impl GhosttyTerminal {
         Ok(())
     }
 
-    /// Configures Ghostty's default cursor shape from Zed's
-    /// `terminal.cursor_shape` setting, mirroring
-    /// `alacritty::set_default_cursor_style`. A program that sets its own
-    /// shape via DECSCUSR still overrides this, same as the color
-    /// defaults above. `CursorShape::Hidden` has no `CursorStyle`
-    /// equivalent and is unreachable from a settings-sourced shape (see
-    /// `From<SettingsCursorShape> for CursorShape`); falls back to
-    /// `Block` defensively rather than needing a fallible signature for
-    /// an input this method's only caller never produces.
+    /// Sets the default cursor shape from the `terminal.cursor_shape` setting.
+    ///
+    /// DECSCUSR still overrides it. `CursorShape::Hidden` never comes from settings and falls
+    /// back to `Block`.
     pub(super) fn set_default_cursor_shape(&mut self, shape: CursorShape) -> Result<()> {
         let style = match shape {
             CursorShape::Bar => CursorStyle::Bar,
@@ -1177,22 +982,16 @@ impl GhosttyTerminal {
         Ok(())
     }
 
-    /// Disables the "alternate scroll" mode (scroll wheel sends arrow keys
-    /// to full-screen apps in the alternate screen, e.g. `less`/`vim`) at
-    /// construction time, mirroring `alacritty::new_term`'s
-    /// `unset_private_mode(NamedPrivateMode::AlternateScroll)` for
-    /// `terminal.alternate_scroll: Off`. Ghostty already tracks this mode
-    /// nakedly (`build_content` reports it as `Modes::ALTERNATE_SCROLL` via
-    /// `Mode::ALT_SCROLL`) and defaults it on, so there's nothing to do for
-    /// the `On` case. Only `Off` needs an explicit call.
+    /// Disables alternate scroll mode for `terminal.alternate_scroll: Off`.
+    ///
+    /// Ghostty enables the mode by default, so `On` needs no call.
     pub(super) fn disable_alternate_scroll(&mut self) -> Result<()> {
         use libghostty_vt::terminal::Mode;
         self.terminal.set_mode(Mode::ALT_SCROLL, false)?;
         Ok(())
     }
 
-    /// Returns the Kitty graphics placements currently visible in the
-    /// viewport, with their pixel data already decoded to RGBA8.
+    /// Returns the Kitty graphics placements visible in the viewport, decoded to RGBA8.
     pub(super) fn image_placements(&mut self) -> Result<Vec<crate::ImagePlacement>> {
         let graphics = self.terminal.kitty_graphics()?;
         let mut iteration = self.placements.update(&graphics)?;
@@ -1255,9 +1054,9 @@ impl GhosttyTerminal {
     }
 }
 
-/// Decodes a Kitty graphics image's stored pixel data to RGBA8, inflating it
-/// first if the sender compressed it. Returns `Ok(None)` for formats/sizes
-/// that can't be decoded (logged by the caller as a decode failure).
+/// Decodes the pixel data of a Kitty graphics image to RGBA8, inflating it if compressed.
+///
+/// Returns `Ok(None)` for undecodable formats or sizes.
 fn decode_image_rgba(image: &graphics::Image<'_>) -> Result<Option<Arc<[u8]>>> {
     let width = image.width()? as usize;
     let height = image.height()? as usize;
@@ -1273,8 +1072,7 @@ fn decode_image_rgba(image: &graphics::Image<'_>) -> Result<Option<Arc<[u8]>>> {
             inflated = buffer;
             &inflated
         }
-        // `Compression::None` and any future variants the library adds:
-        // nothing to inflate.
+        // uncompressed, or a future variant with nothing to inflate.
         _ => raw,
     };
 
@@ -1307,9 +1105,7 @@ fn decode_image_rgba(image: &graphics::Image<'_>) -> Result<Option<Arc<[u8]>>> {
             }
             rgba
         }
-        // PNG payloads are decoded to RGBA8 by `RustPngDecoder` before
-        // libghostty-vt stores them, so a stored image should never report
-        // this format; treated as undecodable defensively.
+        // PNG payloads are decoded before storage, so this format should never be stored.
         ImageFormat::Png => return Ok(None),
         _ => return Ok(None),
     };
@@ -1317,18 +1113,11 @@ fn decode_image_rgba(image: &graphics::Image<'_>) -> Result<Option<Arc<[u8]>>> {
     Ok(Some(Arc::from(rgba)))
 }
 
-/// Installs a PNG decoder so the Kitty graphics protocol can accept
-/// PNG-transmitted images, once per process. `set_png_decoder` stores the
-/// callback in thread-local state and documents that it "must only be
-/// called on the same thread as the terminal", which is safe here since
-/// every `GhosttyTerminal` (and thus every call to this function) lives on
-/// Zed's single foreground thread.
+/// Installs a PNG decoder for Kitty graphics on the current thread.
 ///
-/// `libghostty-vt` ships a `RustPngDecoder` for exactly this purpose, but
-/// its only field is private with no constructor, so it can't actually be
-/// instantiated from outside the crate as of 0.2.1 (a bug in that release,
-/// visible in its own doctest, which doesn't compile as written either).
-/// `ZedPngDecoder` below reimplements the same logic directly.
+/// The decoder is stored in thread-local state of the library. `RustPngDecoder` from
+/// `libghostty-vt` 0.2.1 cannot be constructed outside its crate, so `ZedPngDecoder`
+/// reimplements it.
 fn install_png_decoder() -> Result<()> {
     thread_local! {
         static INSTALLED: Cell<bool> = const { Cell::new(false) };
@@ -1357,8 +1146,7 @@ impl graphics::DecodePng for ZedPngDecoder {
         use png::Transformations;
 
         let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
-        // libghostty only accepts RGBA8 data, so expand palette/grayscale
-        // colors to RGBA8 and strip 16-bit depth back down to 8-bit.
+        // libghostty-vt only accepts RGBA8, so expand palette and grayscale and strip 16-bit depth.
         decoder.set_transformations(Transformations::ALPHA | Transformations::STRIP_16);
 
         let mut reader = decoder.read_info().ok()?;
@@ -1399,17 +1187,11 @@ pub(super) fn spawn_pty(
     let (recycle_tx, recycle_rx) =
         std::sync::mpsc::sync_channel::<Vec<u8>>(MAX_RECYCLED_PTY_BUFFERS);
 
-    // Parses queued PTY output off the reader thread, batching consecutive
-    // chunks so libghostty-vt isn't re-entered on every single `read()`
-    // during high-throughput output.
+    // parses queued PTY output, batching chunks so libghostty-vt is not re-entered per read.
     let parser_thread = thread::Builder::new()
         .name("Ghostty PTY parser".to_string())
         .spawn(move || {
-            // `set_png_decoder`'s callback is stored in the library's own
-            // thread-local state, so it must be (re-)installed on this
-            // specific thread: PTY output, and therefore any PNG-format
-            // Kitty graphics data, is always written to the terminal here,
-            // not on whichever thread originally constructed it.
+            // the decoder is thread-local, and PNG data is written on this thread.
             if let Err(error) = install_png_decoder() {
                 log::error!("failed to install PNG decoder on ghostty parser thread: {error}");
             }
@@ -1543,9 +1325,7 @@ pub(super) fn spawn_pty(
     Ok((PtySender { command_tx }, info))
 }
 
-/// Builds the command used when no explicit shell was requested, mirroring
-/// the login-shell semantics of the terminal Zed would otherwise open via
-/// `alacritty_terminal`'s system-shell handling.
+/// Builds the login shell command used when no explicit shell was requested.
 #[cfg(target_os = "macos")]
 pub(super) fn system_command() -> portable_pty::CommandBuilder {
     let Some(user) = std::env::var("USER").ok().filter(|user| !user.is_empty()) else {
@@ -1571,8 +1351,7 @@ pub(super) fn system_command() -> portable_pty::CommandBuilder {
     portable_pty::CommandBuilder::new_default_prog()
 }
 
-/// Converts the crate's backend-agnostic scroll request into libghostty-vt's
-/// viewport scroll command.
+/// Converts a scroll request into a libghostty-vt viewport scroll command.
 pub(super) fn ghostty_scroll(scroll: Scroll, screen_lines: usize) -> ScrollViewport {
     match scroll {
         Scroll::Delta(delta) => ScrollViewport::Delta(-(delta as isize)),
@@ -1583,8 +1362,7 @@ pub(super) fn ghostty_scroll(scroll: Scroll, screen_lines: usize) -> ScrollViewp
     }
 }
 
-/// Takes a recycled buffer if one is available, otherwise allocates a fresh
-/// one, and (re)sizes it to the fixed PTY read chunk size.
+/// Returns a recycled or newly allocated buffer sized to the PTY read chunk size.
 fn next_pty_read_buffer(recycle_rx: &Receiver<Vec<u8>>) -> Vec<u8> {
     let mut buffer = recycle_rx
         .try_recv()
@@ -1595,9 +1373,9 @@ fn next_pty_read_buffer(recycle_rx: &Receiver<Vec<u8>>) -> Vec<u8> {
     buffer
 }
 
-/// Returns a drained buffer to the reader thread for reuse, dropping it
-/// instead if the recycling channel is full/disconnected or the buffer grew
-/// unusually large (e.g. from batching) and isn't worth keeping around.
+/// Returns a drained buffer to the reader thread for reuse.
+///
+/// Drops it instead when the channel is full or disconnected, or the buffer grew unusually large.
 fn recycle_pty_buffer(buffer: Vec<u8>, recycle_tx: &SyncSender<Vec<u8>>) {
     if buffer.capacity() > MAX_PTY_PARSE_BATCH_BYTES {
         return;
@@ -1607,11 +1385,10 @@ fn recycle_pty_buffer(buffer: Vec<u8>, recycle_tx: &SyncSender<Vec<u8>>) {
     }
 }
 
-/// Writes a batch of PTY output into the shared Ghostty terminal and
-/// forwards its effects to the UI thread. Returns whether the parser
-/// thread should keep running (i.e. the terminal entity hasn't been
-/// dropped). Also used directly by `spawn_task_subprocess` (the `no_pty`
-/// headless-host path, which has no real PTY/parser thread of its own).
+/// Writes a batch of PTY output into the Ghostty terminal and forwards its effects.
+///
+/// Returns whether the parser thread should keep running. Also used by the headless subprocess
+/// path, which has no PTY.
 pub(super) fn write_pty_output_to_ghostty(
     output: &[u8],
     terminal: &ParkingMutex<GhosttyTerminal>,
@@ -1670,12 +1447,9 @@ fn ghostty_cursor_shape(style: CursorVisualStyle) -> CursorShape {
     }
 }
 
-/// Converts a resolved cell style color to Zed's `vte::ansi::Color`,
-/// preserving the none/palette/RGB distinction (rather than resolving
-/// palette indices to a fixed RGB up front) so terminal theme colors keep
-/// applying at paint time (`terminal_element::convert_color` matches on
-/// `Color::Named`/`Color::Indexed` to look up the active theme's palette,
-/// and only bypasses it for `Color::Spec`, an app-chosen exact RGB).
+/// Converts a resolved cell style color to `vte::ansi::Color`.
+///
+/// Keeps palette indices unresolved so theme colors apply at paint time.
 fn color_from_style_color(color: StyleColor, default: vte::ansi::NamedColor) -> vte::ansi::Color {
     match color {
         StyleColor::None => vte::ansi::Color::Named(default),
@@ -1688,9 +1462,7 @@ fn color_from_style_color(color: StyleColor, default: vte::ansi::NamedColor) -> 
     }
 }
 
-/// Converts a Zed `Point` (viewport-relative once `display_offset` is added,
-/// per `terminal_element.rs`'s `to_highlighted_range_lines` convention) into
-/// Ghostty's `Point::Viewport` space.
+/// Converts a Zed `Point` into the viewport space of Ghostty.
 fn ghostty_viewport_point(
     display_offset: usize,
     point: crate::Point,
@@ -1746,10 +1518,7 @@ fn selection_range_from_ghostty(
     })
 }
 
-/// Reads the hyperlink URI (if any) of the cell at `point`. Treats any
-/// error looking up `point` (e.g. out of range) the same as "no hyperlink
-/// there", a safe default for hyperlink detection, where an unreadable
-/// point simply isn't part of a hyperlink.
+/// Returns the hyperlink URI of the cell at `point`, treating lookup errors as no hyperlink.
 fn hyperlink_uri_at_point(
     terminal: &libghostty_vt::Terminal<'static, 'static>,
     display_offset: usize,
@@ -1758,9 +1527,7 @@ fn hyperlink_uri_at_point(
     let Ok(grid_ref) = terminal.grid_ref(ghostty_viewport_point(display_offset, point)) else {
         return Ok(None);
     };
-    // Comfortably longer than any real-world URI; hyperlink_uri truncates
-    // rather than erroring if a URI somehow exceeds this, which is an
-    // acceptable degradation for hyperlink detection.
+    // longer than any real-world URI; longer URIs are truncated.
     let mut buf = [0u8; 4096];
     let Ok(len) = grid_ref.hyperlink_uri(&mut buf) else {
         return Ok(None);
@@ -1773,10 +1540,9 @@ fn hyperlink_uri_at_point(
     ))
 }
 
-/// Walks from `point` by one column at a time in `direction` (`-1` or `1`),
-/// wrapping to the previous/next row at row boundaries, for as long as the
-/// cell's hyperlink URI stays equal to `uri`. Returns the furthest point
-/// reached (inclusive) that still has the same hyperlink.
+/// Walks from `point` in `direction` while the cell hyperlink stays `uri`.
+///
+/// Wraps across rows and returns the furthest point with the same hyperlink.
 fn walk_hyperlink_run(
     terminal: &libghostty_vt::Terminal<'static, 'static>,
     display_offset: usize,
@@ -1805,19 +1571,12 @@ fn walk_hyperlink_run(
     Ok(current)
 }
 
-/// Small facade over `Terminal::grid_ref(Point::Screen(...))` queries,
-/// exposing the absolute-row primitives `ghostty_vi_motion`/
-/// `ghostty_word_motion`/`ghostty_bracket_motion` need, in the terms
-/// Alacritty's own `alacritty_terminal::vi_mode` module uses them (grid-edge
-/// clamped advance/boundary checks, first/last occupied cell in a row,
-/// whether a row is entirely blank). Built fresh per call, mirroring
-/// `buffer_text_with_point_map`.
+/// Facade over screen-space grid queries needed by the vi motions.
 struct ViGrid<'a> {
     terminal: &'a libghostty_vt::Terminal<'static, 'static>,
     total_rows: i64,
     cols: i64,
-    /// `absolute_row = crate::Point::line + line_base`; see
-    /// `buffer_text_with_point_map`'s doc for the same convention.
+    /// Offset such that `absolute_row = crate::Point::line + line_base`.
     line_base: i64,
 }
 
@@ -1883,9 +1642,7 @@ impl<'a> ViGrid<'a> {
         Ok(character == ' ' || character == '\t')
     }
 
-    /// Whether this row wraps into the next (soft-wrapped), i.e.
-    /// Alacritty's per-cell `WRAPLINE` flag, but queried as the row-level
-    /// property `libghostty-vt` exposes it as.
+    /// Whether the row soft-wraps into the next.
     fn is_wrap(&self, absolute_row: i64) -> Result<bool> {
         if absolute_row < self.topmost_row() || absolute_row > self.bottommost_row() {
             return Ok(false);
@@ -1920,9 +1677,7 @@ impl<'a> ViGrid<'a> {
         Ok(None)
     }
 
-    /// Advances one cell in `direction` (`-1` left, `1` right), clamped at
-    /// the grid's absolute edges (Alacritty's `Boundary::Grid`: no-op at
-    /// the very first/last cell, wraps at row boundaries otherwise).
+    /// Advances one cell in `direction`, wrapping at row ends and stopping at the grid edges.
     fn advance(&self, absolute_row: i64, column: i64, direction: i64) -> (i64, i64) {
         if direction < 0 {
             if column == 0 {
@@ -1953,9 +1708,7 @@ impl<'a> ViGrid<'a> {
         }
     }
 
-    /// Same-row-only simplification of Alacritty's `Term::expand_wide`; see
-    /// the "Known simplification" note on the vi-mode section of
-    /// `GhosttyTerminal`'s `impl` block.
+    /// Moves off a wide character spacer within the same row.
     fn expand_wide(&self, absolute_row: i64, column: i64, direction: i64) -> Result<(i64, i64)> {
         if direction < 0 && self.is_wide_spacer(absolute_row, column)? && column > 0 {
             return Ok((absolute_row, column - 1));
@@ -1964,10 +1717,7 @@ impl<'a> ViGrid<'a> {
     }
 }
 
-/// Hand-port of `alacritty_terminal::vi_mode::ViModeCursor::motion`
-/// (`vi_mode.rs` in the vendored `alacritty_terminal` source) against
-/// `ViGrid`. See the "Vi mode" section doc on `GhosttyTerminal`'s `impl`
-/// block for scope/parity notes.
+/// Applies a vi motion on `ViGrid`, ported from the vi mode of Alacritty.
 fn ghostty_vi_motion(
     grid: &ViGrid<'_>,
     point: crate::Point,
@@ -2116,13 +1866,9 @@ fn ghostty_vi_motion(
     Ok(grid.to_point(row, col))
 }
 
-/// Whitespace-word motion (vi's `W`/`B`/`E`; Zed doesn't expose
-/// punctuation-aware "semantic" word motions). `direction`/`side` are
-/// `-1`/`1`, matching `Direction::Left`/`Right` and `Side::Left`/`Right`
-/// from Alacritty's original `vi_mode` implementation, since the exact
-/// `(direction, side)` pairs `ghostty_vi_motion`'s call sites above pass
-/// for `WordLeft`/`WordRight`/`WordRightEnd` were preserved from that
-/// convention verbatim.
+/// Applies a whitespace word motion (`W`, `B`, or `E`).
+///
+/// `direction` and `side` are `-1` for left and `1` for right.
 fn ghostty_word_motion(
     grid: &ViGrid<'_>,
     row: i64,
@@ -2154,10 +1900,9 @@ fn ghostty_word_motion(
     Ok((row, col))
 }
 
-/// Small hand-rolled depth-counting bracket matcher for `()`/`[]`/`{}`
-/// pairs, since `libghostty-vt` has no equivalent. Returns the unchanged
-/// point if it isn't on a bracket character, or if no match is found
-/// before hitting a grid edge.
+/// Returns the bracket matching the one at the given point for `()`, `[]`, and `{}`.
+///
+/// Returns the unchanged point if it is not on a bracket or no match exists.
 fn ghostty_bracket_motion(grid: &ViGrid<'_>, row: i64, col: i64) -> Result<(i64, i64)> {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let character = grid.char_at(row, col)?;
@@ -2196,30 +1941,10 @@ fn ghostty_bracket_motion(grid: &ViGrid<'_>, row: i64, col: i64) -> Result<(i64,
     }
 }
 
-/// Extracts the wrap-joined logical line containing `point` (walking
-/// across soft-wrap boundaries in both directions via `ViGrid::is_wrap`),
-/// with a per-char `Point` map (indexed by char count, same convention
-/// `buffer_text_with_point_map`/`search_matches` use) and the char-index of
-/// `point` within that text. This is the shared foundation for both the
-/// bare-URL and path-hyperlink regex fallbacks in
-/// `GhosttyTerminal::hyperlink_at`.
+/// Extracts the wrap-joined logical line containing `point` with a `Point` per `char`.
 ///
-/// Unlike `buffer_text_with_point_map`, trailing blank cells are NOT
-/// trimmed here: hyperlink regexes (especially user-configured path
-/// patterns) may legitimately need to see trailing whitespace as a
-/// separator, and the caller only ever indexes by explicit byte/char
-/// ranges a regex matched, never relies on the string's own length as a
-/// line-content boundary the way `search_matches`'s `$`-anchor handling
-/// does.
-///
-/// Returns `None` if `point` isn't covered by the extracted text at all.
-/// This is only possible for a wide-character spacer cell with no map
-/// entry of its own, in which case the caller should retry at `point`'s
-/// column minus one
-/// (the wide character's own cell) if it wants spacer-hover support; none
-/// of this module's callers currently do, since a mouse hover naturally
-/// lands on the wide character's own (wider, so more likely to be under
-/// the cursor) cell in the vast majority of cases.
+/// Also returns the char index of `point`. Trailing blanks are kept, since path regexes may rely
+/// on whitespace separators. Returns `None` if `point` is not covered by the text.
 fn single_line_text_with_point_map(
     grid: &ViGrid<'_>,
     point: crate::Point,
@@ -2241,11 +1966,8 @@ fn single_line_text_with_point_map(
     let mut grapheme_buf = [' '; 32];
 
     for absolute_row in first_row..=last_row {
-        // A row that wraps into the next necessarily fills its full width
-        // (that's what wrapping means), but a row that doesn't should stop
-        // at its last occupied column. Otherwise trailing blank cells
-        // pad `text` with spaces that regexes anchored on "rest of line"
-        // (e.g. `(?<path>.+)$`) would greedily swallow into the match.
+        // only wrapped rows span the full width; others stop at their last occupied column, so
+        // rest-of-line regexes do not swallow padding.
         let last_column = if grid.is_wrap(absolute_row)? {
             grid.last_column()
         } else {
@@ -2255,22 +1977,14 @@ fn single_line_text_with_point_map(
             let grid_ref = grid.grid_ref(absolute_row, column)?;
             let wide = grid_ref.cell()?.wide()?;
             if wide == screen::CellWide::SpacerTail {
-                // Hovering the spacer cell of a wide character is hovering
-                // that character, so attribute it to the entry just pushed
-                // for the wide char's own column instead of dropping it,
-                // since this loop never emits a `text`/`points` entry for
-                // spacer columns themselves.
+                // hovering the spacer of a wide character hovers the character itself.
                 if hovered_index.is_none() && grid.to_point(absolute_row, column) == point {
                     hovered_index = Some(points.len().saturating_sub(1));
                 }
                 continue;
             }
             if wide == screen::CellWide::SpacerHead {
-                // Placeholder for a wide character that didn't fit at the
-                // end of a soft-wrapped row: empty, not real content, so
-                // (unlike `SpacerTail`) there's no preceding entry in
-                // `points` to attribute a hover to; the wide char itself
-                // starts the next row instead.
+                // placeholder for a wide character moved to the next row, not content.
                 continue;
             }
             let this_point = grid.to_point(absolute_row, column);
@@ -2293,9 +2007,7 @@ fn single_line_text_with_point_map(
     Ok(hovered_index.map(|index| (text, points, index)))
 }
 
-/// Maps a 0-255 palette index to Zed's `Color`, using `Color::Named` for
-/// the 16 standard ANSI slots (0-15) to match how Alacritty's own VTE
-/// parser resolves SGR 30-37/90-97, and `Color::Indexed` for the rest.
+/// Maps a palette index to `Color::Named` for the 16 ANSI slots and `Color::Indexed` otherwise.
 fn color_from_palette_index(index: style::PaletteIndex) -> vte::ansi::Color {
     use vte::ansi::NamedColor;
 
@@ -2336,10 +2048,6 @@ mod tests {
         assert_eq!(content.cursor.point, crate::Point::new(0, 0));
     }
 
-    /// `toggle_vi_mode` should enable vi mode with a cursor, and disabling
-    /// should clear it. Values are checked against
-    /// `alacritty_terminal::vi_mode`'s own `motion_simple` test (same
-    /// terminal dimensions, same expected positions) as a parity baseline.
     #[test]
     fn toggle_vi_mode_and_simple_motions_match_alacritty_parity() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2364,8 +2072,6 @@ mod tests {
         assert_eq!(terminal.vi_cursor(), None);
     }
 
-    /// `vi_motion`/`vi_goto_point` must no-op (not panic, not silently
-    /// enable vi mode) when vi mode isn't currently active.
     #[test]
     fn vi_motion_is_a_noop_when_vi_mode_is_disabled() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2377,12 +2083,7 @@ mod tests {
         assert_eq!(terminal.vi_cursor(), None);
     }
 
-    /// `vi_goto_point`/`vi_motion` must scroll the viewport to reveal the
-    /// new vi cursor position when it's off-screen. This matters
-    /// specifically because `activate_match`'s vi-mode branch pushes
-    /// `MoveViCursorToPoint` with no companion `ScrollToPoint` for the
-    /// same jump (the two are mutually exclusive), so revealing the target
-    /// is entirely this function's job.
+    // search activation in vi mode relies on `vi_goto_point` alone to reveal the target.
     #[test]
     fn vi_goto_point_scrolls_to_reveal_an_off_screen_point() {
         let mut terminal = GhosttyTerminal::new(10, 3, 100).unwrap();
@@ -2392,7 +2093,7 @@ mod tests {
         }
         terminal.toggle_vi_mode().unwrap();
 
-        // Deep in scrollback, well above the current (live-bottom) viewport.
+        // deep in scrollback, above the live viewport.
         let target = crate::Point::new(-15, 0);
         terminal.vi_goto_point(target).unwrap();
         assert_eq!(terminal.vi_cursor(), Some(target));
@@ -2406,9 +2107,6 @@ mod tests {
         );
     }
 
-    /// A plain (non-vi-motion) scroll, such as the mouse wheel or page
-    /// up/down, must move the vi cursor along with it so it doesn't stay
-    /// pinned to a row that's scrolled out of view.
     #[test]
     fn update_vi_cursor_for_scroll_moves_cursor_with_the_viewport() {
         let mut terminal = GhosttyTerminal::new(10, 3, 100).unwrap();
@@ -2450,9 +2148,6 @@ mod tests {
         );
     }
 
-    /// Parity baseline: `alacritty_terminal::vi_mode`'s `motion_start_end`
-    /// test. On a blank row, `Last` goes to the final column (nothing
-    /// occupied to stop at), `First` returns to column 0.
     #[test]
     fn vi_motion_first_and_last_on_a_blank_row() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2465,19 +2160,12 @@ mod tests {
         assert_eq!(point, crate::Point::new(0, 0));
     }
 
-    /// Parity baseline: `alacritty_terminal::vi_mode`'s
-    /// `motion_first_occupied` test. First non-blank cell in a row, with a
-    /// second invocation from that exact cell walking backward across
-    /// soft-wrapped rows to the first occupied cell of the whole logical
-    /// (wrap-joined) line.
     #[test]
     fn vi_motion_first_occupied_walks_back_across_wrapped_lines() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
         terminal.resize(test_bounds(20, 20)).unwrap();
 
-        // Row 0 (20 chars, wraps into row 1): " x y" + 16 filler chars.
-        // Row 1 (20 chars, wraps into row 2): all filler, no content.
-        // Row 2: "z " (2 chars), not written as part of a wrap.
+        // row 0 wraps with ` x y` plus filler, row 1 is filler, and row 2 is `z `.
         let mut payload = String::new();
         payload.push_str(" x y");
         payload.push_str(&"a".repeat(16));
@@ -2510,8 +2198,6 @@ mod tests {
         );
     }
 
-    /// Parity baseline: `alacritty_terminal::vi_mode`'s
-    /// `motion_high_middle_low` test.
     #[test]
     fn vi_motion_high_middle_low() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2526,8 +2212,6 @@ mod tests {
         assert_eq!(point, crate::Point::new(19, 0));
     }
 
-    /// Parity baseline: `alacritty_terminal::vi_mode`'s `motion_bracket`
-    /// test.
     #[test]
     fn vi_motion_bracket() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2542,7 +2226,6 @@ mod tests {
         assert_eq!(point, crate::Point::new(0, 0));
     }
 
-    /// A point that isn't on a bracket character must be left unchanged.
     #[test]
     fn vi_motion_bracket_on_non_bracket_is_a_noop() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2555,9 +2238,6 @@ mod tests {
         assert_eq!(point, crate::Point::new(0, 1));
     }
 
-    /// Parity baseline: `alacritty_terminal::vi_mode`'s `motion_word` test
-    /// (the `WordRightEnd`/`WordLeft`/`WordRight` portion; Zed has no
-    /// `WordLeftEnd` motion).
     #[test]
     fn vi_motion_word_right_end_and_left() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2578,10 +2258,6 @@ mod tests {
         assert_eq!(point, crate::Point::new(0, 4));
     }
 
-    /// Moving the vi cursor while a selection is active should extend the
-    /// selection to follow it, mirroring Alacritty's
-    /// `vi_mode_recompute_selection` ("update only if non-empty selection
-    /// is present").
     #[test]
     fn vi_motion_extends_an_active_selection() {
         let mut terminal = GhosttyTerminal::new(20, 20, 100).unwrap();
@@ -2609,9 +2285,6 @@ mod tests {
         );
     }
 
-    /// A simple pattern should be found on the currently-active
-    /// (non-scrollback) screen, with the reported range resolving to the
-    /// exact matched columns.
     #[test]
     fn search_matches_finds_a_simple_pattern_on_the_active_screen() {
         let mut terminal = GhosttyTerminal::new(20, 4, 100).unwrap();
@@ -2629,14 +2302,11 @@ mod tests {
         assert_eq!(matches[1].end(), crate::Point::new(1, 12));
     }
 
-    /// A match must be findable in scrollback, not just the visible
-    /// viewport. This is the whole point of extracting the full history and
-    /// active buffer rather than reusing the viewport-scoped `RenderState`.
     #[test]
     fn search_matches_finds_a_pattern_in_scrollback() {
         let mut terminal = GhosttyTerminal::new(20, 3, 100).unwrap();
         terminal.resize(test_bounds(20, 3)).unwrap();
-        // Push "NEEDLE" (row 0) far above the viewport with plain filler rows.
+        // push `NEEDLE` far above the viewport with filler rows.
         terminal.write(b"NEEDLE\r\n");
         for i in 0..30 {
             terminal.write(format!("filler {i}\r\n").as_bytes());
@@ -2648,20 +2318,15 @@ mod tests {
         assert_eq!(matches.len(), 1, "expected exactly one match in scrollback");
         assert_eq!(matches[0].start().column, 0);
         assert_eq!(matches[0].end().column, 5);
-        // The matched line should currently be scrolled well above the
-        // active screen (a large negative `line`, viewport row 0 is at
-        // display_offset 0 by default).
+        // the match lies above the active screen.
         assert!(matches[0].start().line < 0);
     }
 
-    /// A pattern spanning a soft-wrapped line boundary must still match,
-    /// since soft-wrapped rows are joined into one logical line.
     #[test]
     fn search_matches_spans_a_soft_wrapped_line_boundary() {
         let mut terminal = GhosttyTerminal::new(10, 3, 100).unwrap();
         terminal.resize(test_bounds(10, 3)).unwrap();
-        // 15 chars ("wrapped_needle.") on a 10-column terminal: wraps across
-        // two physical rows with no explicit newline in between.
+        // 15 characters wrap across two rows of a 10-column terminal.
         terminal.write(b"wrapped_needle.");
 
         let regex = regex::Regex::new("needle").unwrap();
@@ -2676,8 +2341,6 @@ mod tests {
         assert_eq!(matches[0].end(), crate::Point::new(1, 3));
     }
 
-    /// A hard newline must still act as a boundary for `^`/`$` anchors, as
-    /// opposed to a soft wrap (previous test) which must not.
     #[test]
     fn search_matches_respects_hard_newlines_for_anchors() {
         let mut terminal = GhosttyTerminal::new(20, 3, 100).unwrap();
@@ -2692,8 +2355,7 @@ mod tests {
         assert_eq!(matches[0].end(), crate::Point::new(1, 5));
     }
 
-    /// No URL/path regex matching at all, for tests that only care about
-    /// the OSC 8 native path of `hyperlink_at`.
+    // disables URL and path matching for tests of the OSC 8 path.
     fn no_regex_fallback() -> (regex::Regex, Vec<regex::Regex>, std::time::Duration) {
         (
             regex::Regex::new("$^").unwrap(), // never matches anything
@@ -2710,14 +2372,11 @@ mod tests {
         )
     }
 
-    /// `hyperlink_at` should find the OSC 8 hyperlink's URI and its full
-    /// contiguous cell range, whether queried from the middle, start, or
-    /// end of the linked text.
     #[test]
     fn hyperlink_at_finds_osc8_hyperlink_and_its_full_range() {
         let mut terminal = GhosttyTerminal::new(40, 2, 100).unwrap();
         terminal.resize(test_bounds(40, 2)).unwrap();
-        // "click " (columns 0-5, plain) + OSC 8 "here" (columns 6-9) + " end" (plain).
+        // `click ` is plain, `here` in columns 6 to 9 is linked, and ` end` is plain.
         terminal.write(b"click \x1b]8;;https://example.com\x1b\\here\x1b]8;;\x1b\\ end");
         let (url_regex, path_regexes, timeout) = no_regex_fallback();
 
@@ -2763,8 +2422,7 @@ mod tests {
     fn hyperlink_at_distinguishes_adjacent_hyperlinks_with_different_uris() {
         let mut terminal = GhosttyTerminal::new(40, 2, 100).unwrap();
         terminal.resize(test_bounds(40, 2)).unwrap();
-        // Two adjacent OSC 8 hyperlinks with no plain text between them:
-        // "one" (columns 0-2, uri A) immediately followed by "two" (columns 3-5, uri B).
+        // `one` (URI A) directly followed by `two` (URI B).
         terminal.write(
             b"\x1b]8;;https://a.example\x1b\\one\x1b]8;;\x1b\\\x1b]8;;https://b.example\x1b\\two\x1b]8;;\x1b\\",
         );
@@ -2787,8 +2445,6 @@ mod tests {
         assert_eq!(range_b.end(), crate::Point::new(0, 5));
     }
 
-    /// A bare URL (not wrapped in OSC 8) should be found via `url_regex`,
-    /// with trailing punctuation trimmed.
     #[test]
     fn hyperlink_at_finds_bare_url_and_trims_trailing_punctuation() {
         let mut terminal = GhosttyTerminal::new(40, 2, 100).unwrap();
@@ -2796,7 +2452,7 @@ mod tests {
         terminal.write(b"visit https://example.com/page, thanks");
         let (url_regex, path_regexes, timeout) = url_regex_fallback();
 
-        // Column 10 is inside "https://example.com/page".
+        // column 10 lies inside the URL.
         let (text, is_url, range) = terminal
             .hyperlink_at(crate::Point::new(0, 10), &url_regex, &path_regexes, timeout)
             .unwrap()
@@ -2804,14 +2460,10 @@ mod tests {
         assert_eq!(text, "https://example.com/page");
         assert!(is_url);
         assert_eq!(range.start(), crate::Point::new(0, 6));
-        // "visit " is 6 cols, URL is 24 chars, so it spans columns 6..=29;
-        // the trailing "," must NOT be included.
+        // the URL spans columns 6 to 29, excluding the trailing comma.
         assert_eq!(range.end(), crate::Point::new(0, 29));
     }
 
-    /// A user-configured path-hyperlink regex (named captures
-    /// `path`/`line`/`column`) should be found via `path_hyperlink_regexes`,
-    /// with the line/column suffix appended to the returned text.
     #[test]
     fn hyperlink_at_finds_path_with_line_and_column_via_user_regex() {
         let mut terminal = GhosttyTerminal::new(60, 2, 100).unwrap();
@@ -2821,7 +2473,7 @@ mod tests {
         let path_regexes =
             vec![regex::Regex::new(r"(?<path>\S+\.rs):(?<line>[0-9]+):(?<column>[0-9]+)").unwrap()];
 
-        // Column 15 is inside "src/main.rs".
+        // column 15 lies inside `src/main.rs`.
         let (text, is_url, range) = terminal
             .hyperlink_at(
                 crate::Point::new(0, 15),
@@ -2836,16 +2488,13 @@ mod tests {
         assert_eq!(range.start(), crate::Point::new(0, 9));
     }
 
-    /// `select_word_at` should find exactly the word under the given point,
-    /// matching Ghostty's own word-boundary rules (whitespace-delimited by
-    /// default).
     #[test]
     fn select_word_at_selects_the_word_under_the_point() {
         let mut terminal = GhosttyTerminal::new(20, 2, 100).unwrap();
         terminal.resize(test_bounds(20, 2)).unwrap();
         terminal.write(b"hello world");
 
-        // Column 7 is inside "world" (h-e-l-l-o-space-w=6,o=7).
+        // column 7 lies inside `world`.
         let range = terminal
             .select_word_at(crate::Point::new(0, 7))
             .unwrap()
@@ -2891,18 +2540,13 @@ mod tests {
         assert!(text.contains("second line"));
     }
 
-    /// Dragging after a double-click should extend the word selection to
-    /// cover every word (and the whitespace between them) from the anchor
-    /// to the drag point, in either direction. This is the
-    /// double-click-and-drag scenario `select_word_between`'s own doc
-    /// comment describes.
     #[test]
     fn select_word_range_extends_across_multiple_words() {
         let mut terminal = GhosttyTerminal::new(30, 2, 100).unwrap();
         terminal.resize(test_bounds(30, 2)).unwrap();
         terminal.write(b"git commit --amend now");
 
-        // Double-click "commit" (anchor), drag right onto "amend".
+        // anchor on `commit` and drag right onto `amend`.
         let range = terminal
             .select_word_range(crate::Point::new(0, 4), crate::Point::new(0, 15))
             .unwrap()
@@ -2913,8 +2557,7 @@ mod tests {
         );
         assert_eq!(terminal.selection_range(), Some(range));
 
-        // Same anchor, drag left onto "git": selection should flip to
-        // cover "git" through "commit", not just extend further right.
+        // dragging left onto `git` flips the selection instead of extending it.
         let range = terminal
             .select_word_range(crate::Point::new(0, 4), crate::Point::new(0, 1))
             .unwrap()
@@ -2926,16 +2569,13 @@ mod tests {
         assert_eq!(terminal.selection_range(), Some(range));
     }
 
-    /// Dragging after a triple-click should extend the selection by whole
-    /// lines, covering every complete line between the anchor and the drag
-    /// point regardless of direction.
     #[test]
     fn select_line_range_extends_across_multiple_lines() {
         let mut terminal = GhosttyTerminal::new(20, 5, 100).unwrap();
         terminal.resize(test_bounds(20, 5)).unwrap();
         terminal.write(b"first\r\nsecond\r\nthird\r\nfourth");
 
-        // Triple-click line 1 ("second"), drag down onto line 2 ("third").
+        // anchor on line 1 and drag down onto line 2.
         terminal
             .select_line_range(crate::Point::new(1, 2), crate::Point::new(2, 3))
             .unwrap()
@@ -2946,8 +2586,7 @@ mod tests {
         assert!(!text.contains("first"));
         assert!(!text.contains("fourth"));
 
-        // Same anchor, drag up onto line 0 ("first"): selection should
-        // flip to cover line 0 through line 1, not line 1 through line 2.
+        // dragging up onto line 0 flips the selection to lines 0 and 1.
         terminal
             .select_line_range(crate::Point::new(1, 2), crate::Point::new(0, 0))
             .unwrap()
@@ -2958,11 +2597,6 @@ mod tests {
         assert!(!text.contains("third"));
     }
 
-    /// Covers `set_selection`/`update_selection`'s explicit-point-range
-    /// path (as opposed to `select_word_at`/`select_line_at`'s
-    /// Ghostty-derived path). This is what `Terminal::mouse_drag` calls on
-    /// every drag-move event, extending an anchored selection to an
-    /// arbitrary point.
     #[test]
     fn set_selection_then_update_selection_extends_the_range() {
         let mut terminal = GhosttyTerminal::new(20, 2, 100).unwrap();
@@ -3036,11 +2670,7 @@ mod tests {
         assert!(!extended);
     }
 
-    /// Before any color has been configured, Ghostty stays silent on OSC
-    /// 4/10/11/12 queries (unlike XTVERSION or DA1/DA2/cursor position,
-    /// which it always answers): no default is set (Zed hadn't yet called
-    /// `set_default_bg_color`/`set_default_theme_colors`) and no OSC SET
-    /// override has landed either.
+    // unlike XTVERSION or DA1/DA2, Ghostty ignores color queries until a color is configured.
     #[test]
     fn does_not_answer_color_queries_independently_before_any_color_is_configured() {
         let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();
@@ -3057,14 +2687,7 @@ mod tests {
         );
     }
 
-    /// Once `set_default_theme_colors` has configured Ghostty's defaults
-    /// (as `Terminal::sync_ghostty_theme_colors` does for every real
-    /// terminal, not just this direct unit test), Ghostty answers OSC 4
-    /// (any palette index), OSC 10, OSC 11, and OSC 12 queries
-    /// independently. A query immediately after an OSC 11 SET, driven
-    /// through `Terminal::write_output`, used to produce two identical PTY
-    /// responses; this pins that down as the same double-answer bug class
-    /// `3dfd8ee4b5` fixed for DA1/DA2/cursor-position responses.
+    // a query right after an OSC 11 SET used to be answered twice.
     #[test]
     fn answers_all_color_queries_independently_once_theme_colors_are_configured() {
         let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();
@@ -3108,11 +2731,7 @@ mod tests {
         }
     }
 
-    /// `set_default_theme_colors` must actually change what Ghostty
-    /// reports, and an explicit OSC SET override must still win over the
-    /// theme default afterwards (an embedder-configured default is a
-    /// separate, lower-priority layer from a program's own override, per
-    /// `libghostty_vt::Terminal`'s own "color theme" documentation).
+    // program overrides take precedence over configured defaults.
     #[test]
     fn set_default_theme_colors_updates_effective_colors_and_survives_being_overridden() {
         let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();
@@ -3168,9 +2787,6 @@ mod tests {
         );
     }
 
-    /// An OSC 52 SET should be detected via the `on_clipboard_write`
-    /// callback registered in `GhosttyTerminal::new`, with its base64
-    /// payload already decoded to plain text.
     #[test]
     fn detects_osc52_clipboard_write() {
         let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();
@@ -3187,12 +2803,7 @@ mod tests {
         );
     }
 
-    /// OSC 52 clipboard *read* requests ("?") must never produce a
-    /// `ClipboardStore` effect or any PTY response at all. `libghostty-vt`
-    /// always ignores them by design (security-conscious default, see
-    /// `on_clipboard_write`'s doc comment), which this pins down explicitly
-    /// so a future library upgrade changing that behavior doesn't go
-    /// unnoticed.
+    // guards against a library upgrade starting to answer clipboard reads.
     #[test]
     fn ignores_osc52_clipboard_read_request() {
         let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();
@@ -3223,8 +2834,7 @@ mod tests {
         );
     }
 
-    /// Mirrors the crate's own doctest example (`kitty::graphics` module
-    /// docs): a Kitty graphics APC transmitting a hardcoded 1x1 PNG.
+    // transmits a 1x1 PNG, as in the `kitty::graphics` doctest.
     #[test]
     fn reports_image_placements() {
         let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();
@@ -3244,9 +2854,7 @@ mod tests {
             "expected one image placement, got {placements:?}"
         );
         let placement = &placements[0];
-        // No `c=`/`r=` columns/rows were specified in the APC command, so
-        // the placement renders at the image's native 1x1 pixel size rather
-        // than being scaled to fill a cell.
+        // without `c=` or `r=`, the placement keeps its native pixel size.
         assert_eq!(placement.pixel_width, 1);
         assert_eq!(placement.pixel_height, 1);
         assert_eq!(
@@ -3257,16 +2865,8 @@ mod tests {
         );
     }
 
-    /// Regression test for a Kitty graphics bug report ("images render at
-    /// the wrong height and aren't square"): transmits raw-RGBA square
-    /// images with no explicit `r=`/`c=`, so `grid_rows` is auto-computed
-    /// from `pixel_height / cell_height` the same way real senders like
-    /// `kitty +kitten icat -H` do (`reports_image_placements` above always
-    /// omits rows/cols too, but only exercises a 1px image, too small to
-    /// catch a rounding bug). Confirms libghostty-vt's own row math matches
-    /// the pixel heights in the bug report (32/33/64/65px at a 32px cell
-    /// height rounding up to 1/2/2/3 rows), pinning down that this half of
-    /// the pipeline is correct.
+    // square RGBA images without explicit rows, like `kitty +kitten icat -H`, must round 32, 33,
+    // 64, and 65px at a 32px cell height up to 1, 2, 2, and 3 rows.
     #[test]
     fn computes_grid_rows_from_pixel_height_without_explicit_rows() {
         let cell_width = gpui::px(16.);
@@ -3306,19 +2906,8 @@ mod tests {
         }
     }
 
-    /// Regression test for a bug report ("`red_square 400`/`4000` renders
-    /// with one or more extra blank lines below it, `kv -H` resize-to-fit
-    /// too"): with a *fractional* cell height (the common case for real
-    /// fonts, unlike the previous test above which only ever used
-    /// whole-pixel 32px cells), `GhosttyTerminal::resize` used to
-    /// truncate `cell_height`/`cell_width` toward zero (`as u32`) before
-    /// passing them to `libghostty_vt::Terminal::resize`. Truncation always
-    /// recovers a too-small cell height inside `gridSize`'s
-    /// `divCeil(image_height_px, t.height_px / t.rows)`, which always
-    /// biases the row count up. This is invisible for small images
-    /// (rounding error smaller than one row) but grows without bound as
-    /// image height increases, exactly matching "worse for a bigger
-    /// image". Fixed by rounding instead of truncating.
+    // truncating a fractional cell height biased the recovered row count up, adding blank lines
+    // below tall images.
     #[test]
     fn rounds_fractional_cell_height_for_grid_row_computation() {
         let cell_width = gpui::px(9.4);
@@ -3398,14 +2987,7 @@ mod tests {
         );
     }
 
-    /// `build_content` is the highest-risk piece here, since a wrong
-    /// style/color mapping would visibly break every terminal session.
-    /// Covers plain text, bold/italic/underline/undercurl/strikeout, and
-    /// the three color kinds (`Color::Named`, `Indexed`, `Spec`) that
-    /// `terminal_element::convert_color` treats differently
-    /// (`Named`/`Indexed` resolve against the active theme, `Spec` is an
-    /// app-chosen exact RGB). This is why colors must round-trip through
-    /// `StyleColor` rather than being flattened to a fixed RGB up front.
+    // colors must stay `Named`, `Indexed`, or `Spec`, since only the first two follow the theme.
     #[test]
     fn build_content_reports_text_and_styles() {
         let mut terminal = GhosttyTerminal::new(20, 3, 100).unwrap();
@@ -3414,8 +2996,7 @@ mod tests {
         terminal.write(
             b"\x1b[1mB\x1b[22m\x1b[3mI\x1b[23m\x1b[4mU\x1b[24m\x1b[4:3mC\x1b[24m\x1b[9mS\x1b[29m",
         );
-        // Named (SGR 31 = red), 256-indexed (SGR 38;5;99), and true-color
-        // (SGR 38;2;r;g;b) foreground colors, one cell each.
+        // named, 256-indexed, and true-color foregrounds, one cell each.
         terminal.write(b"\x1b[31mN\x1b[39m\x1b[38;5;99mP\x1b[39m\x1b[38;2;10;20;30mR\x1b[39m");
 
         let (cells, _mode, _display_offset) = terminal.build_content().unwrap();
@@ -3456,8 +3037,7 @@ mod tests {
             })
         );
 
-        // A cell that never had anything written to it keeps the terminal's
-        // default (unstyled) foreground/background so themes still apply.
+        // untouched cells keep the default colors so themes still apply.
         assert_eq!(
             cell(10).foreground(),
             vte::ansi::Color::Named(vte::ansi::NamedColor::Foreground)
@@ -3473,9 +3053,7 @@ mod tests {
         let mut terminal = GhosttyTerminal::new(10, 2, 100).unwrap();
         terminal.resize(test_bounds(10, 2)).unwrap();
 
-        // "e" followed by a combining acute accent (U+0301): one grapheme cluster,
-        // two codepoints. Exercises build_content's stack-buffered path (well under
-        // its 32-char inline capacity).
+        // `e` plus a combining accent fits the inline grapheme buffer.
         terminal.write("e\u{0301}".as_bytes());
 
         let (cells, _mode, _display_offset) = terminal.build_content().unwrap();
@@ -3493,9 +3071,7 @@ mod tests {
         let mut terminal = GhosttyTerminal::new(10, 2, 100).unwrap();
         terminal.resize(test_bounds(10, 2)).unwrap();
 
-        // A base character followed by 40 combining marks, more than
-        // build_content's 32-char inline stack buffer, forcing its heap
-        // fallback path.
+        // 40 combining marks exceed the inline buffer and use the heap fallback.
         let mut cluster = String::from("e");
         for _ in 0..40 {
             cluster.push('\u{0301}');
@@ -3521,7 +3097,7 @@ mod tests {
         let mut terminal = GhosttyTerminal::new(10, 2, 100).unwrap();
         terminal.resize(test_bounds(10, 2)).unwrap();
 
-        // U+4E2D ("中") is a double-width CJK character.
+        // `中` is a double-width character.
         terminal.write("中".as_bytes());
 
         let (cells, _mode, _display_offset) = terminal.build_content().unwrap();
@@ -3539,22 +3115,14 @@ mod tests {
         assert!(second.is_wide_char_spacer());
     }
 
-    /// `Terminal::scrollbar().offset` and `display_offset` use *opposite*
-    /// polarity (Ghostty: `0` means scrolled to the top of history;
-    /// `display_offset`: `0` means not scrolled, at the live bottom).
-    /// Treating the raw `scrollbar().offset` value directly as if it
-    /// already were `display_offset` happens to pass on small terminals
-    /// with no scrollback (where `scrollbar().offset` is always `0` either
-    /// way); the bug only surfaces once the viewport is actually scrolled
-    /// into history, exactly what this test forces by writing far more
-    /// content than the viewport can hold and never scrolling back down.
+    // the Ghostty scrollbar offset has the opposite polarity of `display_offset`, which only
+    // shows once scrollback exists.
     #[test]
     fn build_content_reports_alacritty_style_display_offset_when_scrolled() {
         let mut terminal = GhosttyTerminal::new(10, 3, 100).unwrap();
         terminal.resize(test_bounds(10, 3)).unwrap();
 
-        // 20 lines into a 3-row viewport: 17 rows of scrollback, viewport
-        // sitting at the live bottom (not manually scrolled at all).
+        // 20 lines in a 3-row viewport leave 17 rows of scrollback.
         for i in 0..20 {
             terminal.write(format!("line {i}\r\n").as_bytes());
         }
@@ -3606,14 +3174,8 @@ mod tests {
         )
     }
 
-    /// Regression suite for `GhosttyTerminal::hyperlink_at`'s path/IRI
-    /// matching, using `test_path!`/`test_iri!`/`test_file_iri!` macros.
-    /// These drive a real `GhosttyTerminal` through actual VT bytes
-    /// (`write`) and track positions via `Terminal::cursor_x`/`cursor_y`/
-    /// `is_cursor_pending_wrap`. Failures report the plain expected/actual
-    /// values; see `hyperlinks.rs`'s own module for its separate
-    /// algorithmic performance benchmarks
-    /// (`path_hyperlink_candidates_in_line`) and regression tests.
+    // drives a real `GhosttyTerminal` through VT bytes to test path and IRI matching of
+    // `hyperlink_at`.
     mod hyperlink_regressions {
         use super::*;
         use crate::hyperlinks::RegexSearches;
@@ -3640,7 +3202,7 @@ mod tests {
         fn line_cells_count(line: &str) -> usize {
             fn width(c: char) -> usize {
                 match c {
-                    // Fullwidth unicode characters used in tests
+                    // full-width characters used in tests
                     '例' | '🏃' | '🦀' | '🔥' => 2,
                     '\t' => 8, // it's really 0-8, use the max always
                     _ => 1,
@@ -3653,14 +3215,10 @@ mod tests {
                 .sum::<usize>()
         }
 
-        /// The cursor's position in absolute (scrollback-inclusive) grid
-        /// coordinates, rather than `crate::Point`'s viewport-relative
-        /// `line`. While the test's terminal keeps growing scrollback as
-        /// later lines are written, `line_base` (and thus what a given
-        /// `crate::Point` means) shifts with it, so positions captured
-        /// while writing must stay in this absolute space until everything
-        /// is written and a single final `ViGrid` can convert them all
-        /// consistently (see `build_terminal_from_test_lines`'s last step).
+        /// Returns the cursor position in screen space.
+        ///
+        /// `line_base` shifts while scrollback grows, so positions stay absolute until all
+        /// lines are written.
         fn cursor_point(
             terminal: &libghostty_vt::Terminal<'static, 'static>,
         ) -> Result<(i64, i64)> {
@@ -3672,10 +3230,8 @@ mod tests {
             Ok(grid.to_absolute(point))
         }
 
-        /// Mirrors Alacritty's `prev_input_point_from_term`: the grid point
-        /// of the last character actually written, accounting for pending
-        /// wrap (the cursor hasn't visually advanced past it yet) and
-        /// wide-char spacer cells.
+        /// Returns the grid point of the last written character, accounting for pending wrap and
+        /// wide character spacers.
         fn prev_input_point(terminal: &libghostty_vt::Terminal<'static, 'static>) -> (i64, i64) {
             let Ok(mut point) = cursor_point(terminal) else {
                 return (0, 0);
@@ -3692,9 +3248,7 @@ mod tests {
             point
         }
 
-        /// The point one cell past `point` (Alacritty's `Boundary::Grid`
-        /// `.add(term, Boundary::Grid, 1)`), for the 👈 ("hovered on the
-        /// wide-char spacer of the previous char") marker.
+        /// Returns the point one cell past `point`, for the wide character spacer marker.
         fn next_point(
             terminal: &libghostty_vt::Terminal<'static, 'static>,
             point: (i64, i64),
@@ -3735,8 +3289,7 @@ mod tests {
             Done,
         }
 
-        /// Converts to Windows-style paths on Windows, like `path!()`, but
-        /// at runtime for improved test readability.
+        /// Builds a terminal from annotated test lines and returns the expected hyperlink.
         fn build_terminal_from_test_lines<'a>(
             hyperlink_kind: HyperlinkKind,
             columns: usize,
@@ -3823,8 +3376,7 @@ mod tests {
                                 && chars.peek().is_some_and(|c| *c != '/');
 
                             if is_windows_abs_path_start {
-                                // Convert Unix abs path start into Windows abs path start so
-                                // that the same test can be used for both OSes.
+                                // turn a Unix absolute path into a Windows one.
                                 terminal.write(b"C:");
                                 terminal.write(b"\\");
                                 prev_point = prev_input_point(&terminal.terminal);
@@ -3866,12 +3418,8 @@ mod tests {
             }
 
             let hovered_point = hovered_point.expect("Missing hovered point (👉 or 👈)");
-            // All positions above were tracked in absolute (scrollback-
-            // inclusive) coordinates precisely so they can be converted to
-            // `crate::Point` together, right now, through one `ViGrid`
-            // snapshot. This matches what `GhosttyTerminal::hyperlink_at`
-            // itself builds when the caller queries it next, right after
-            // this function returns and before anything else is written.
+            // convert all absolute positions through one final `ViGrid`, matching what
+            // `hyperlink_at` builds next.
             let final_grid = ViGrid::new(&terminal.terminal).unwrap();
             let hovered_char = final_grid
                 .char_at(hovered_point.0, hovered_point.1)
@@ -3916,18 +3464,9 @@ mod tests {
             const RUST_DIAGNOSTIC_REGEX: &str = r#"\s+(-->|:::|at) (?<link>(?<path>.+?))(:$|$)"#;
             const ISSUE_12338_REGEX: &str =
                 r#"[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} (?<link>(?<path>.+))"#;
-            // `🏛\u{FE0F}?`: unlike Alacritty, Ghostty's grid preserves the
-            // VARIATION SELECTOR-16 the test literal writes after 🏛 as
-            // part of that cell's own grapheme cluster rather than
-            // dropping it, so the literal building-emoji match must accept
-            // it optionally to still match the extracted line text.
+            // Ghostty keeps VARIATION SELECTOR-16 in the grapheme cluster of 🏛.
             const MULTIPLE_SAME_LINE_REGEX: &str = r#"(?<link>(?<path>🦀 multiple_same_line 🦀) 🚣(?<line>[0-9]+) 🏛\u{FE0F}?(?<column>[0-9]+)):"#;
-            // The two entries `terminal.path_hyperlink_regexes` defaults to
-            // in `assets/settings/default.json`, transcribed verbatim (each
-            // multi-line entry's array of strings is joined with `\n` by
-            // `terminal_settings.rs`, exactly as done here) so this test
-            // module doesn't need a `settings` crate dependency just to
-            // exercise the real default.
+            // the default `terminal.path_hyperlink_regexes` from `default.json`, joined with `\n`.
             const PYTHON_DIAGNOSTIC_REGEX: &str = r#"File "(?<path>[^"]+)", line (?<line>[0-9]+)"#;
             const DEFAULT_PATH_REGEX: &str = concat!(
                 "(?x)\n",
@@ -4007,11 +3546,8 @@ mod tests {
                         HyperlinkKind::Path,
                         "\n    at {source_location}\nExpected a path, but was a iri"
                     );
-                    // `hyperlink_at` returns `file://` IRIs as raw URI
-                    // text, same as any other IRI; `expected_hyperlink`
-                    // already converted its own `file://` IRI into a
-                    // filesystem path (see `build_terminal_from_test_lines`),
-                    // so mirror that conversion here before comparing.
+                    // `hyperlink_at` returns raw `file://` IRIs, so convert them like
+                    // the expected value.
                     let text = if expected_hyperlink.hyperlink_kind == HyperlinkKind::FileIri {
                         let url = url::Url::parse(&text).unwrap_or_else(|error| {
                             panic!("Failed to parse file IRI `{text}`: {error}")
@@ -4255,12 +3791,11 @@ mod tests {
                 test_path!("    ‹File \"«/awesome.🔥👈»\", line «42»›: Wat?");
             }
 
-            /// These likely rise to the level of being worth fixing.
+            // likely worth fixing.
             mod issues {
                 use super::*;
 
                 #[test]
-                // <https://github.com/alacritty/alacritty/issues/8586>
                 fn issue_alacritty_8586() {
                     test_path!("‹«/👉例/cool.rs»›");
                     test_path!("‹«/例👈/cool.rs»›");
@@ -4275,14 +3810,12 @@ mod tests {
                 }
 
                 #[test]
-                // <https://github.com/zed-industries/zed/issues/12338>
                 fn issue_12338_regex() {
                     test_path!(".rw-r--r--     0     staff 05-27 14:03 ‹«'test file 👉1.txt'»›");
                     test_path!(".rw-r--r--     0     staff 05-27 14:03 ‹«👉'test file 1.txt'»›");
                 }
 
                 #[test]
-                // <https://github.com/zed-industries/zed/issues/12338>
                 fn issue_12338() {
                     test_path!(".rw-r--r--     0     staff 05-27 14:03 ‹«test👉、2.txt»›");
                     test_path!(".rw-r--r--     0     staff 05-27 14:03 ‹«test、👈2.txt»›");
@@ -4307,14 +3840,12 @@ mod tests {
                 }
 
                 #[test]
-                // <https://github.com/zed-industries/zed/issues/40202>
                 fn issue_40202() {
                     test_path!("[‹«lib/blitz_apex_👉server/stats/aggregate_rank_stats.ex»:«35»›: BlitzApexServer.Stats.AggregateRankStats.update/2]
                 1 #=> 1");
                 }
 
                 #[test]
-                // <https://github.com/zed-industries/zed/issues/28194>
                 fn issue_28194() {
                     test_path!(
                         "‹«test/c👉ontrollers/template_items_controller_test.rb»:«20»›:in 'block (2 levels) in <class:TemplateItemsControllerTest>'"
@@ -4322,7 +3853,6 @@ mod tests {
                 }
 
                 #[test]
-                // <https://github.com/zed-industries/zed/issues/50531>
                 fn issue_50531() {
                     test_path!("0: ‹«foo/👉bar.txt»›");
                     test_path!("0: ‹«👉foo/bar.txt»›");
@@ -4332,7 +3862,6 @@ mod tests {
                 }
 
                 #[test]
-                // <https://github.com/zed-industries/zed/issues/46795>
                 fn issue_46795() {
                     test_path!("─‹«/👉test/cool.rs»:«4»:«2»›");
                     test_path!("┤‹«/👉test/cool.rs»:«4»:«2»›");
@@ -4344,7 +3873,7 @@ mod tests {
                 }
             }
 
-            /// Minor issues arguably not important enough to fix/workaround...
+            // minor issues not worth fixing.
             mod nits {
                 use super::*;
 
@@ -4357,8 +3886,7 @@ mod tests {
                 }
 
                 #[test]
-                // Filenames with balanced parentheses are preserved as a single path.
-                // Unbalanced leading `(` (e.g. `Update(.claude/SKILL.md)`) is stripped.
+                // balanced parentheses stay in the path; an unbalanced leading `(` is stripped.
                 fn parens_in_filename() {
                     test_path!("‹«docker-compose.prod(👉copy).yml»›");
                 }
@@ -4518,11 +4046,7 @@ mod tests {
                 test_iri!("https://en.wiktionary.org/wiki/%E1%BF%AC%CF%8C%CE%B4%CE%BF%CF%82");
             }
 
-            /// Alacritty misidentified this as a path instead of an IRI
-            /// (hence the name); Ghostty's own `hyperlink_uri_at_point`/
-            /// `URL_REGEX` fallback ordering doesn't reproduce that bug,
-            /// so unlike the original this now asserts the (more correct)
-            /// IRI classification rather than `#[should_panic]`-pinning it.
+            // Ghostty classifies this as an IRI, unlike the path misclassification in Alacritty.
             #[test]
             fn file_is_a_path() {
                 test_iri!("file://test/cool/index.rs");
