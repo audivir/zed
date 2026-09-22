@@ -112,6 +112,8 @@ pub(super) struct GhosttyTerminal {
     search_text: Option<(String, Vec<crate::Point>)>,
     /// Formatted selection text, dropped whenever the grid or the selection changes.
     selection_text: Option<Option<String>>,
+    /// Decoded RGBA pixels keyed by image ID, with the image generation they were decoded from.
+    decoded_images: collections::HashMap<u32, (u64, Arc<[u8]>)>,
 }
 
 // SAFETY: libghostty-vt objects are `!Send` only because they hold raw pointers and callback
@@ -191,6 +193,7 @@ impl GhosttyTerminal {
             current_vi_cursor: None,
             search_text: None,
             selection_text: None,
+            decoded_images: collections::HashMap::default(),
         })
     }
 
@@ -1164,6 +1167,7 @@ impl GhosttyTerminal {
         let graphics = self.terminal.kitty_graphics()?;
         let mut iteration = self.placements.update(&graphics)?;
         let mut placements = Vec::new();
+        let mut placed_image_ids = collections::HashSet::default();
 
         while let Some(placement) = iteration.next() {
             let image_id = match placement.image_id() {
@@ -1173,6 +1177,7 @@ impl GhosttyTerminal {
                     continue;
                 }
             };
+            placed_image_ids.insert(image_id);
             let Some(image) = graphics.image(image_id) else {
                 continue;
             };
@@ -1196,13 +1201,23 @@ impl GhosttyTerminal {
                 }
             };
 
-            let data = match decode_image_rgba(&image) {
-                Ok(Some(data)) => data,
-                Ok(None) => continue,
-                Err(error) => {
-                    log::debug!("failed to decode kitty image {image_id}: {error}");
-                    continue;
+            // decoding copies or inflates the whole image, so it is only redone on new pixels.
+            let data = match self.decoded_images.get(&image_id) {
+                Some((decoded_generation, data)) if *decoded_generation == generation => {
+                    data.clone()
                 }
+                _ => match decode_image_rgba(&image) {
+                    Ok(Some(data)) => {
+                        self.decoded_images
+                            .insert(image_id, (generation, data.clone()));
+                        data
+                    }
+                    Ok(None) => continue,
+                    Err(error) => {
+                        log::debug!("failed to decode kitty image {image_id}: {error}");
+                        continue;
+                    }
+                },
             };
 
             placements.push(crate::ImagePlacement {
@@ -1218,6 +1233,8 @@ impl GhosttyTerminal {
             });
         }
 
+        self.decoded_images
+            .retain(|image_id, _| placed_image_ids.contains(image_id));
         Ok(placements)
     }
 }
@@ -3133,6 +3150,33 @@ mod tests {
             terminal.selection_text().unwrap().as_deref(),
             Some("HELLO world")
         );
+    }
+
+    #[test]
+    fn image_placements_reuse_decoded_pixels_until_the_image_changes() {
+        let mut terminal = GhosttyTerminal::new(8, 4, 100).unwrap();
+        terminal.resize(test_bounds(8, 4)).unwrap();
+        let transmit = |terminal: &mut GhosttyTerminal, pixel: [u8; 4]| {
+            let payload = base64_encode(&pixel);
+            terminal.write(format!("\x1b_Ga=T,f=32,s=1,v=1,i=9,q=1;{payload}\x1b\\").as_bytes());
+        };
+
+        transmit(&mut terminal, [255, 0, 0, 255]);
+        let first = terminal.image_placements().unwrap();
+        let second = terminal.image_placements().unwrap();
+        assert!(Arc::ptr_eq(&first[0].data, &second[0].data));
+
+        transmit(&mut terminal, [0, 0, 255, 255]);
+        let replaced = terminal.image_placements().unwrap();
+        let replaced = replaced
+            .iter()
+            .find(|placement| placement.image_id == 9)
+            .unwrap();
+        assert_eq!(&replaced.data[..4], &[0, 0, 255, 255]);
+
+        terminal.write(b"\x1b_Ga=d,d=A,q=1\x1b\\");
+        assert!(terminal.image_placements().unwrap().is_empty());
+        assert!(terminal.decoded_images.is_empty());
     }
 
     #[test]
