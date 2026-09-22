@@ -108,6 +108,8 @@ pub(super) struct GhosttyTerminal {
     current_selection: Option<crate::SelectionRange>,
     /// Vi-mode cursor position, or `None` when vi mode is disabled.
     current_vi_cursor: Option<crate::Point>,
+    /// Buffer text and point map for search, dropped whenever the grid changes.
+    search_text: Option<(String, Vec<crate::Point>)>,
 }
 
 // SAFETY: libghostty-vt objects are `!Send` only because they hold raw pointers and callback
@@ -179,18 +181,22 @@ impl GhosttyTerminal {
             effects,
             current_selection: None,
             current_vi_cursor: None,
+            search_text: None,
         })
     }
 
     pub(super) fn write(&mut self, bytes: &[u8]) {
+        self.search_text = None;
         self.terminal.vt_write(bytes);
     }
 
     pub(super) fn clear(&mut self) {
+        self.search_text = None;
         self.terminal.vt_write(b"\x1b[3J\x1b[H\x1b[2J");
     }
 
     pub(super) fn resize(&mut self, bounds: TerminalBounds) -> Result<()> {
+        self.search_text = None;
         self.terminal.resize(
             bounds.num_columns().max(1) as u16,
             bounds.num_lines().max(1) as u16,
@@ -726,15 +732,28 @@ impl GhosttyTerminal {
     /// Soft-wrapped rows form one logical line, and hard line breaks become `\n`, so anchored
     /// patterns match per hard line.
     pub(super) fn search_matches(&mut self, regex: &regex::Regex) -> Result<Vec<crate::Range>> {
-        let (text, points) = self.buffer_text_with_point_map()?;
+        if self.search_text.is_none() {
+            self.search_text = Some(self.buffer_text_with_point_map()?);
+        }
+        let Some((text, points)) = self.search_text.as_ref() else {
+            return Ok(Vec::new());
+        };
 
         let mut matches = Vec::new();
-        for found in regex.find_iter(&text) {
+        // matches arrive in order, so char offsets are counted incrementally.
+        let mut counted_bytes = 0;
+        let mut counted_chars = 0;
+        let mut char_offset = |byte_offset: usize| {
+            counted_chars += text[counted_bytes..byte_offset].chars().count();
+            counted_bytes = byte_offset;
+            counted_chars
+        };
+        for found in regex.find_iter(text) {
             if found.start() == found.end() {
                 continue;
             }
-            let start_char = text[..found.start()].chars().count();
-            let end_char = text[..found.end()].chars().count();
+            let start_char = char_offset(found.start());
+            let end_char = char_offset(found.end());
             let Some(&start_point) = points.get(start_char) else {
                 continue;
             };
@@ -2318,6 +2337,23 @@ mod tests {
                 is_block: false,
             })
         );
+    }
+
+    #[test]
+    fn search_matches_sees_new_output_and_maps_multibyte_offsets() {
+        let mut terminal = GhosttyTerminal::new(20, 4, 100).unwrap();
+        terminal.resize(test_bounds(20, 4)).unwrap();
+        terminal.write("é ab é ab".as_bytes());
+        let regex = regex::Regex::new("ab").unwrap();
+
+        let matches = terminal.search_matches(&regex).unwrap();
+        let columns: Vec<_> = matches.iter().map(|range| range.start().column).collect();
+        assert_eq!(columns, [2, 7]);
+
+        terminal.write(b"\r\nab");
+        let matches = terminal.search_matches(&regex).unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[2].start(), crate::Point::new(1, 0));
     }
 
     #[test]
