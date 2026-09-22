@@ -9,11 +9,11 @@ use anyhow::{Context as _, Error, Result};
 use collections::{HashMap, HashSet};
 use editor::{Editor, EditorSettings};
 use gpui::{
-    AnyElement, App, Bounds, Context, Element, ElementId, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId, InteractiveElement,
-    IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement, Pixels, Point, Render,
-    ScrollHandle, Size, Style, Styled, Subscription, Task, WeakEntity, Window, actions, div, img,
-    px, size, uniform_list,
+    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId,
+    InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement,
+    PinchEvent, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, Size, Style, Styled,
+    Subscription, Task, WeakEntity, Window, actions, div, img, px, size, uniform_list,
 };
 use language::File as _;
 use persistence::PdfViewerDb;
@@ -1969,7 +1969,7 @@ impl Element for PdfContentElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
@@ -1978,6 +1978,48 @@ impl Element for PdfContentElement {
         let Some(mut element) = prepaint.take() else {
             return;
         };
+
+        // captured so that zooming takes precedence over the scroll container below.
+        window.on_mouse_event({
+            let pdf_view = self.pdf_view.downgrade();
+            move |event: &ScrollWheelEvent, phase, window, cx| {
+                if phase != DispatchPhase::Capture
+                    || !(event.modifiers.control || event.modifiers.platform)
+                    || !bounds.contains(&event.position)
+                {
+                    return;
+                }
+                let delta = f32::from(event.delta.pixel_delta(window.line_height()).y);
+                let zoom_factor = if delta > 0.0 {
+                    1.0 + delta * 0.01
+                } else {
+                    1.0 / (1.0 - delta * 0.01)
+                };
+                pdf_view
+                    .update(cx, |this, cx| {
+                        this.set_zoom(this.zoom_level * zoom_factor, Some(event.position), cx)
+                    })
+                    .log_err();
+                cx.stop_propagation();
+            }
+        });
+        window.on_mouse_event({
+            let pdf_view = self.pdf_view.downgrade();
+            move |event: &PinchEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || !bounds.contains(&event.position) {
+                    return;
+                }
+                pdf_view
+                    .update(cx, |this, cx| {
+                        this.set_zoom(
+                            this.zoom_level * (1.0 + event.delta),
+                            Some(event.position),
+                            cx,
+                        )
+                    })
+                    .log_err();
+            }
+        });
 
         element.paint(window, cx);
     }
@@ -3855,6 +3897,59 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn modified_scroll_and_pinch_zoom_but_plain_scroll_does_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/dense_paragraph.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, _window, cx| view.restore_view_state(1.0, 0, cx));
+        cx.run_until_parked();
+
+        let position = cx
+            .debug_bounds("pdf-page-0")
+            .unwrap_or_else(|| panic!("page 0 should be laid out"))
+            .center();
+        let zoom_level =
+            |cx: &mut gpui::VisualTestContext| view.read_with(cx, |view, _| view.zoom_level);
+        let scroll = |cx: &mut gpui::VisualTestContext, modifiers: gpui::Modifiers| {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(50.))),
+                modifiers,
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        };
+
+        scroll(cx, gpui::Modifiers::none());
+        assert_eq!(zoom_level(cx), 1.0);
+
+        scroll(cx, gpui::Modifiers::control());
+        assert!((zoom_level(cx) - 1.5).abs() < 0.001, "{}", zoom_level(cx));
+
+        cx.simulate_event(PinchEvent {
+            position,
+            delta: -0.5,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert!((zoom_level(cx) - 0.75).abs() < 0.001, "{}", zoom_level(cx));
     }
 
     #[allow(clippy::await_holding_lock)]
