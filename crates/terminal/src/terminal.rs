@@ -2313,11 +2313,19 @@ impl Terminal {
         for (index, color) in palette.iter_mut().enumerate() {
             *color = to_vte_rgb(get_color_at_index(index, theme));
         }
-        if let Err(error) = ghostty
-            .lock()
-            .set_default_theme_colors(foreground, background, cursor, palette)
+        let color_scheme = if theme.appearance().is_light() {
+            libghostty_vt::terminal::ColorScheme::Light
+        } else {
+            libghostty_vt::terminal::ColorScheme::Dark
+        };
+        let mut ghostty = ghostty.lock();
+        if let Err(error) =
+            ghostty.set_default_theme_colors(foreground, background, cursor, palette)
         {
             log::error!("failed to sync ghostty default theme colors: {error}");
+        }
+        if let Err(error) = ghostty.set_color_scheme(color_scheme) {
+            log::error!("failed to sync ghostty color scheme: {error}");
         }
     }
 
@@ -2867,6 +2875,30 @@ impl Terminal {
 
         // hold the lock for the whole function so all fields come from one consistent state.
         let mut ghostty = ghostty.lock();
+
+        // keep showing the previous frame while a program redraws inside a synchronized update,
+        // so full-screen programs never show half-drawn frames.
+        match ghostty.synchronized_output_deferral() {
+            Ok(ghostty::SynchronizedOutputDeferral::Render) => {}
+            Ok(ghostty::SynchronizedOutputDeferral::Defer) => return,
+            Ok(ghostty::SynchronizedOutputDeferral::DeferStarted(generation)) => {
+                let ghostty_handle = self.ghostty.clone();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(ghostty::SYNCHRONIZED_OUTPUT_TIMEOUT)
+                        .await;
+                    if let Some(ghostty_handle) = ghostty_handle {
+                        ghostty_handle.lock().expire_synchronized_output(generation);
+                    }
+                    this.update(cx, |_, cx| cx.emit(Event::Wakeup)).ok();
+                })
+                .detach();
+                return;
+            }
+            Err(error) => {
+                log::error!("failed to read ghostty synchronized output mode: {error}");
+            }
+        }
 
         match ghostty.build_content() {
             Ok((cells, mode, display_offset)) => {
@@ -6737,6 +6769,52 @@ mod tests {
                 cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
             assert_eq!(clipboard_text.as_deref(), Some("original"));
         }
+    }
+
+    #[gpui::test]
+    async fn test_synchronized_output_holds_back_rendering(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let rendered_text = |cx: &mut TestAppContext| {
+            terminal.update(cx, |terminal, cx| {
+                terminal.refresh_last_content_from_ghostty(cx);
+                terminal
+                    .last_content
+                    .cells
+                    .iter()
+                    .map(|cell| cell.character())
+                    .collect::<String>()
+            })
+        };
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x1b[?2026hfirst", cx);
+        });
+        assert!(!rendered_text(cx).contains("first"));
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x1b[?2026l", cx);
+        });
+        assert!(rendered_text(cx).contains("first"));
+
+        // a program that never ends its update is rendered once the timeout expires.
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x1b[?2026hsecond", cx);
+        });
+        assert!(!rendered_text(cx).contains("second"));
+        cx.executor()
+            .advance_clock(ghostty::SYNCHRONIZED_OUTPUT_TIMEOUT);
+        cx.run_until_parked();
+        assert!(rendered_text(cx).contains("second"));
     }
 
     // clipboard writes must also work through the PTY parser thread.

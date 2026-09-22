@@ -7,6 +7,7 @@ use std::{
         mpsc::{Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
@@ -17,7 +18,7 @@ use libghostty_vt::{
     render::{CellIterator, CursorVisualStyle, RowIterator},
     screen,
     style::{self, StyleColor},
-    terminal::{CursorStyle, ScrollViewport},
+    terminal::{ColorScheme, CursorStyle, Mode, ScrollViewport, SizeReportSize},
 };
 use parking_lot::Mutex as ParkingMutex;
 use portable_pty::{CommandBuilder, PtySize};
@@ -30,6 +31,11 @@ use crate::{
 
 /// Maximum bytes of decoded Kitty image data retained per terminal, the Ghostty default.
 const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 320 * 1024 * 1024;
+
+/// Longest time a synchronized update (mode 2026) may hold back rendering, as in Ghostty.
+///
+/// Guards against programs that enable the mode and then stall or exit without resetting it.
+pub(super) const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Size of each recycled PTY read buffer.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -55,6 +61,32 @@ pub(super) enum GhosttyEffect {
     TitleChanged(String),
     /// OSC 52 or iTerm2 OSC 1337 clipboard write, normalized to plain text.
     ClipboardStore(String),
+}
+
+/// Host facts that Ghostty callbacks report back to programs.
+///
+/// Shared with the callbacks, which run inside `vt_write` while the terminal is mutably borrowed.
+#[derive(Default)]
+struct HostState {
+    color_scheme: Option<ColorScheme>,
+    cell_width: u32,
+    cell_height: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SynchronizedOutput {
+    Idle,
+    /// Rendering is held back for the update with this generation.
+    Deferring(u64),
+    /// The update outlived its timeout, so rendering resumes until the program ends it.
+    Expired,
+}
+
+pub(super) enum SynchronizedOutputDeferral {
+    Render,
+    Defer,
+    /// Rendering is held back for a newly started update with this generation.
+    DeferStarted(u64),
 }
 
 enum PtyCommand {
@@ -104,6 +136,10 @@ pub(super) struct GhosttyTerminal {
     cells: CellIterator<'static>,
     placements: PlacementIterator<'static>,
     effects: Arc<ParkingMutex<Vec<GhosttyEffect>>>,
+    host_state: Arc<ParkingMutex<HostState>>,
+    /// Progress of the current synchronized update (mode 2026).
+    synchronized_output: SynchronizedOutput,
+    synchronized_output_generation: u64,
     /// Active selection in Zed point space, mirroring the one installed in Ghostty.
     current_selection: Option<crate::SelectionRange>,
     /// Vi-mode cursor position, or `None` when vi mode is disabled.
@@ -133,6 +169,7 @@ impl GhosttyTerminal {
         anyhow::ensure!(cols > 0, "terminal columns must be greater than zero");
         anyhow::ensure!(rows > 0, "terminal rows must be greater than zero");
         let effects = Arc::new(ParkingMutex::new(Vec::new()));
+        let host_state = Arc::new(ParkingMutex::new(HostState::default()));
         let mut terminal = Box::new(libghostty_vt::Terminal::new(TerminalOptions {
             cols,
             rows,
@@ -179,6 +216,25 @@ impl GhosttyTerminal {
             }
         })?;
 
+        // answers CSI ? 996 n, which editors use to pick a light or dark background.
+        terminal.on_color_scheme({
+            let host_state = host_state.clone();
+            move |_terminal| host_state.lock().color_scheme
+        })?;
+        // answers XTWINOPS size queries, which image tools use when the PTY reports no pixel size.
+        terminal.on_size({
+            let host_state = host_state.clone();
+            move |terminal| {
+                let host_state = host_state.lock();
+                Some(SizeReportSize {
+                    rows: terminal.rows().ok()?,
+                    columns: terminal.cols().ok()?,
+                    cell_width: host_state.cell_width,
+                    cell_height: host_state.cell_height,
+                })
+            }
+        })?;
+
         terminal.set_kitty_image_storage_limit(KITTY_IMAGE_STORAGE_LIMIT_BYTES)?;
         install_png_decoder()?;
 
@@ -189,6 +245,9 @@ impl GhosttyTerminal {
             cells: CellIterator::new()?,
             placements: PlacementIterator::new()?,
             effects,
+            host_state,
+            synchronized_output: SynchronizedOutput::Idle,
+            synchronized_output_generation: 0,
             current_selection: None,
             current_vi_cursor: None,
             search_text: None,
@@ -212,15 +271,68 @@ impl GhosttyTerminal {
     pub(super) fn resize(&mut self, bounds: TerminalBounds) -> Result<()> {
         self.search_text = None;
         self.selection_text = None;
+        // round instead of truncating: libghostty-vt recovers the cell size from the total
+        // height, and truncation undercounts Kitty image rows by one per ~20px of height.
+        let cell_width = f32::from(bounds.cell_width()).max(1.0).round() as u32;
+        let cell_height = f32::from(bounds.line_height()).max(1.0).round() as u32;
+        {
+            let mut host_state = self.host_state.lock();
+            host_state.cell_width = cell_width;
+            host_state.cell_height = cell_height;
+        }
         self.terminal.resize(
             bounds.num_columns().max(1) as u16,
             bounds.num_lines().max(1) as u16,
-            // round instead of truncating: libghostty-vt recovers the cell size from the total
-            // height, and truncation undercounts Kitty image rows by one per ~20px of height.
-            f32::from(bounds.cell_width()).max(1.0).round() as u32,
-            f32::from(bounds.line_height()).max(1.0).round() as u32,
+            cell_width,
+            cell_height,
         )?;
         Ok(())
+    }
+
+    /// Sets the color scheme reported to programs, and notifies those that subscribed to
+    /// changes with mode 2031.
+    pub(super) fn set_color_scheme(&mut self, color_scheme: ColorScheme) -> Result<()> {
+        let previous = self.host_state.lock().color_scheme.replace(color_scheme);
+        if previous.is_some_and(|previous| previous != color_scheme)
+            && self.terminal.mode(Mode::COLOR_SCHEME_REPORT)?
+        {
+            let mut report = [0u8; 16];
+            let length = color_scheme.encode_report(&mut report)?;
+            if let Some(report) = report.get(..length) {
+                self.effects
+                    .lock()
+                    .push(GhosttyEffect::PtyWrite(report.to_vec()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether rendering should wait for a synchronized update (mode 2026) to finish.
+    ///
+    /// The first deferral of an update returns its generation, which the caller passes to
+    /// [`Self::expire_synchronized_output`] after [`SYNCHRONIZED_OUTPUT_TIMEOUT`].
+    pub(super) fn synchronized_output_deferral(&mut self) -> Result<SynchronizedOutputDeferral> {
+        if !self.terminal.mode(Mode::SYNC_OUTPUT)? {
+            self.synchronized_output = SynchronizedOutput::Idle;
+            return Ok(SynchronizedOutputDeferral::Render);
+        }
+        Ok(match self.synchronized_output {
+            SynchronizedOutput::Expired => SynchronizedOutputDeferral::Render,
+            SynchronizedOutput::Deferring(_) => SynchronizedOutputDeferral::Defer,
+            SynchronizedOutput::Idle => {
+                self.synchronized_output_generation += 1;
+                let generation = self.synchronized_output_generation;
+                self.synchronized_output = SynchronizedOutput::Deferring(generation);
+                SynchronizedOutputDeferral::DeferStarted(generation)
+            }
+        })
+    }
+
+    /// Stops deferring rendering for the given synchronized update, if it is still running.
+    pub(super) fn expire_synchronized_output(&mut self, generation: u64) {
+        if self.synchronized_output == SynchronizedOutput::Deferring(generation) {
+            self.synchronized_output = SynchronizedOutput::Expired;
+        }
     }
 
     pub(super) fn scroll_viewport(&mut self, scroll: ScrollViewport) {
@@ -3332,6 +3444,44 @@ mod tests {
     }
 
     // colors must stay `Named`, `Indexed`, or `Spec`, since only the first two follow the theme.
+    #[test]
+    fn host_queries_report_color_scheme_and_size() {
+        let mut terminal = GhosttyTerminal::new(80, 24, 100).unwrap();
+        terminal.resize(test_bounds(80, 24)).unwrap();
+        let query = |terminal: &mut GhosttyTerminal, bytes: &[u8]| {
+            terminal.take_effects();
+            terminal.write(bytes);
+            terminal
+                .take_effects()
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    GhosttyEffect::PtyWrite(bytes) => Some(String::from_utf8(bytes).unwrap()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+
+        // without a known scheme the query is ignored rather than guessed.
+        assert_eq!(query(&mut terminal, b"\x1b[?996n"), "");
+        terminal.set_color_scheme(ColorScheme::Dark).unwrap();
+        assert_eq!(query(&mut terminal, b"\x1b[?996n"), "\x1b[?997;1n");
+
+        // theme changes are only pushed to programs that enabled mode 2031.
+        terminal.set_color_scheme(ColorScheme::Light).unwrap();
+        assert!(terminal.take_effects().is_empty());
+        query(&mut terminal, b"\x1b[?2031h");
+        terminal.set_color_scheme(ColorScheme::Dark).unwrap();
+        let effects = terminal.take_effects();
+        assert!(
+            matches!(effects.as_slice(), [GhosttyEffect::PtyWrite(bytes)] if bytes == b"\x1b[?997;1n"),
+            "{effects:?}"
+        );
+
+        assert_eq!(query(&mut terminal, b"\x1b[18t"), "\x1b[8;24;80t");
+        assert_eq!(query(&mut terminal, b"\x1b[16t"), "\x1b[6;16;8t");
+        assert_eq!(query(&mut terminal, b"\x1b[14t"), "\x1b[4;384;640t");
+    }
+
     #[test]
     fn build_content_reports_text_and_styles() {
         let mut terminal = GhosttyTerminal::new(20, 3, 100).unwrap();
