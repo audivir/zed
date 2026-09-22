@@ -1358,6 +1358,8 @@
       "shift-down": "terminal::ScrollLineDown",
       "shift-home": "terminal::ScrollToTop",
       "shift-end": "terminal::ScrollToBottom",
+      "ctrl-shift-up": "terminal::ScrollToPreviousPrompt",
+      "ctrl-shift-down": "terminal::ScrollToNextPrompt",
       "ctrl-shift-space": "terminal::ToggleViMode",
       "ctrl-shift-r": "terminal::RerunTask",
       "ctrl-alt-r": "terminal::RerunTask",

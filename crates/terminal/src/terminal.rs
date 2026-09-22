@@ -841,6 +841,10 @@ actions!(
         ScrollToTop,
         /// Scrolls to the bottom of the terminal buffer.
         ScrollToBottom,
+        /// Scrolls to the previous shell prompt, when the shell marks prompts with OSC 133.
+        ScrollToPreviousPrompt,
+        /// Scrolls to the next shell prompt, when the shell marks prompts with OSC 133.
+        ScrollToNextPrompt,
         /// Toggles vi mode in the terminal.
         ToggleViMode,
         /// Selects all text in the terminal.
@@ -2523,6 +2527,26 @@ impl Terminal {
 
     pub fn scroll_to_bottom(&mut self) {
         self.events.push_back(InternalEvent::Scroll(Scroll::Bottom));
+    }
+
+    /// Scrolls the previous or next shell prompt to the top of the viewport.
+    ///
+    /// Returns whether the viewport moved.
+    pub fn scroll_to_prompt(&mut self, previous: bool, cx: &mut Context<Self>) -> bool {
+        let Some(ghostty) = self.ghostty.clone() else {
+            return false;
+        };
+        let scrolled = match ghostty.lock().scroll_to_prompt(previous) {
+            Ok(scrolled) => scrolled,
+            Err(error) => {
+                log::error!("failed to scroll ghostty terminal to a prompt: {error}");
+                false
+            }
+        };
+        if scrolled {
+            cx.emit(Event::Wakeup);
+        }
+        scrolled
     }
 
     pub fn scrolled_to_top(&self) -> bool {

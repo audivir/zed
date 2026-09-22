@@ -1209,6 +1209,49 @@ impl GhosttyTerminal {
         Ok(())
     }
 
+    /// Scrolls the nearest shell prompt above or below the viewport top to the top, using the
+    /// prompt rows marked by OSC 133 shell integration.
+    ///
+    /// Scrolls to the bottom when no later prompt exists, and returns whether the viewport moved.
+    pub(super) fn scroll_to_prompt(&mut self, previous: bool) -> Result<bool> {
+        let total_rows = self.terminal.total_rows()?;
+        let viewport_rows = usize::from(self.terminal.rows()?);
+        let bottom_top_row = total_rows.saturating_sub(viewport_rows);
+        let top_row = bottom_top_row.saturating_sub(self.alacritty_style_display_offset()?);
+        let is_prompt = |row: usize| -> Result<bool> {
+            Ok(self.screen_grid_ref(0, row)?.row()?.semantic_prompt()?
+                == screen::RowSemanticPrompt::Prompt)
+        };
+
+        let target = if previous {
+            let mut target = None;
+            for row in (0..top_row).rev() {
+                if is_prompt(row)? {
+                    target = Some(row);
+                    break;
+                }
+            }
+            target
+        } else {
+            let mut target = None;
+            for row in top_row + 1..total_rows {
+                if row >= bottom_top_row {
+                    break;
+                }
+                if is_prompt(row)? {
+                    target = Some(row);
+                    break;
+                }
+            }
+            Some(target.unwrap_or(bottom_top_row))
+        };
+        let Some(target) = target.filter(|target| *target != top_row) else {
+            return Ok(false);
+        };
+        self.terminal.scroll_viewport(ScrollViewport::Row(target));
+        Ok(true)
+    }
+
     /// Scrolls the viewport by the minimum amount that brings `point` into view.
     pub(super) fn scroll_viewport_to_reveal(&mut self, point: crate::Point) -> Result<()> {
         let display_offset = self.alacritty_style_display_offset()? as i32;
@@ -3685,6 +3728,48 @@ mod tests {
             assert!(steps < 10_000, "compression never finished");
         }
         assert_eq!(terminal.buffer_text().unwrap(), text);
+    }
+
+    #[test]
+    fn scroll_to_prompt_jumps_between_osc_133_prompts() {
+        let mut terminal = GhosttyTerminal::new(20, 5, 1_000).unwrap();
+        terminal.resize(test_bounds(20, 5)).unwrap();
+        for command in 0..3 {
+            terminal.write(format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd{command}\r\n").as_bytes());
+            terminal.write(b"\x1b]133;C\x07");
+            for line in 0..10 {
+                terminal.write(format!("out{command}-{line}\r\n").as_bytes());
+            }
+            terminal.write(b"\x1b]133;D;0\x07");
+        }
+        terminal.write(b"\x1b]133;A\x07$ ");
+        // prompts start at rows 0, 11, and 22, and the live prompt is at row 33.
+        let top_row_text = |terminal: &mut GhosttyTerminal| {
+            let (cells, _, display_offset) = terminal.build_content().unwrap();
+            let top_line = -(display_offset as i32);
+            cells
+                .iter()
+                .filter(|cell| cell.point.line == top_line)
+                .map(|cell| cell.character())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        assert!(terminal.scroll_to_prompt(true).unwrap());
+        assert_eq!(top_row_text(&mut terminal), "$ cmd2");
+        assert!(terminal.scroll_to_prompt(true).unwrap());
+        assert_eq!(top_row_text(&mut terminal), "$ cmd1");
+        assert!(terminal.scroll_to_prompt(true).unwrap());
+        assert_eq!(top_row_text(&mut terminal), "$ cmd0");
+        assert!(!terminal.scroll_to_prompt(true).unwrap());
+
+        assert!(terminal.scroll_to_prompt(false).unwrap());
+        assert_eq!(top_row_text(&mut terminal), "$ cmd1");
+        assert!(terminal.scroll_to_prompt(false).unwrap());
+        assert!(terminal.scroll_to_prompt(false).unwrap());
+        assert_eq!(terminal.alacritty_style_display_offset().unwrap(), 0);
+        assert!(!terminal.scroll_to_prompt(false).unwrap());
     }
 
     #[test]

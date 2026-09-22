@@ -37,8 +37,8 @@ use task::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
     PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
-    ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal,
-    TerminalBounds, ToggleViMode,
+    ScrollToBottom, ScrollToNextPrompt, ScrollToPreviousPrompt, ScrollToTop, Search,
+    ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -870,6 +870,38 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn scroll_to_previous_prompt(
+        &mut self,
+        _: &ScrollToPreviousPrompt,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_alt_screen(cx) {
+            cx.propagate();
+            return;
+        }
+
+        self.terminal
+            .update(cx, |term, cx| term.scroll_to_prompt(true, cx));
+        cx.notify();
+    }
+
+    fn scroll_to_next_prompt(
+        &mut self,
+        _: &ScrollToNextPrompt,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_alt_screen(cx) {
+            cx.propagate();
+            return;
+        }
+
+        self.terminal
+            .update(cx, |term, cx| term.scroll_to_prompt(false, cx));
+        cx.notify();
+    }
+
     fn scroll_to_bottom(&mut self, _: &ScrollToBottom, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_alt_screen(cx) {
             cx.propagate();
@@ -1444,6 +1476,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::scroll_page_down))
             .on_action(cx.listener(TerminalView::scroll_to_top))
             .on_action(cx.listener(TerminalView::scroll_to_bottom))
+            .on_action(cx.listener(TerminalView::scroll_to_previous_prompt))
+            .on_action(cx.listener(TerminalView::scroll_to_next_prompt))
             .on_action(cx.listener(TerminalView::toggle_vi_mode))
             .on_action(cx.listener(TerminalView::show_character_palette))
             .on_action(cx.listener(TerminalView::select_all))
