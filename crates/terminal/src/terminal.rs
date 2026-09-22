@@ -5728,14 +5728,10 @@ mod tests {
         );
     }
 
-    // single-line scrolling drifts the image `viewport_row` behind the text near the top of
-    // scrollback, so the image overlaps the following text. The drift happens inside Ghostty
-    // and the root cause is unknown.
+    // images must move exactly as far as the viewport scrolls and stay directly below the text
+    // printed before them.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
-    #[ignore = "Ghostty's own image-placement viewport_row falls behind \
-                once scrolling approaches the top of scrollback, after \
-                enough single-line scroll steps. Root cause not yet found."]
     async fn test_image_viewport_row_tracks_repeated_line_scrolling(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
@@ -5796,35 +5792,54 @@ mod tests {
         }
         assert!(settled, "output did not settle in time");
 
-        // scroll up one line at a time; a correctly tracked image moves down one row per line.
-        let mut baseline: collections::HashMap<u32, i32> = collections::HashMap::default();
-        let mut steps_since_baseline: collections::HashMap<u32, i32> =
-            collections::HashMap::default();
+        // scroll up one line at a time, past the top of scrollback.
+        let mut baseline: collections::HashMap<u32, (i32, usize)> = collections::HashMap::default();
+        for step in 1..=50 {
+            let (images, display_offset, row_of_line) =
+                window.update_window_entity(&terminal, |term, window, cx| {
+                    term.scroll_line_up();
+                    term.sync(window, cx);
+                    let content = &term.last_content;
+                    let mut row_of_line = collections::HashMap::default();
+                    for (row, line) in &content.cells.iter().chunk_by(|cell| cell.point.line) {
+                        let text: String = line.map(|cell| cell.character()).collect();
+                        row_of_line.insert(text.trim().to_string(), row);
+                    }
+                    (content.images.clone(), content.display_offset, row_of_line)
+                });
 
-        for step in 1..=45 {
-            window.update_window_entity(&terminal, |term, window, cx| {
-                term.scroll_line_up();
-                term.sync(window, cx);
-            });
-            let images = terminal.read_with(window, |term, _| term.last_content.images.clone());
             for placement in &images {
-                let baseline_row = *baseline
+                let (baseline_row, baseline_offset) = *baseline
                     .entry(placement.image_id)
-                    .or_insert(placement.viewport_row);
-                let baseline_step = *steps_since_baseline
-                    .entry(placement.image_id)
-                    .or_insert(step);
-                let expected_row = baseline_row + (step - baseline_step);
+                    .or_insert((placement.viewport_row, display_offset));
+                let scrolled = display_offset as i32 - baseline_offset as i32;
                 assert_eq!(
-                    placement.viewport_row, expected_row,
-                    "image {} drifted after {step} single-line scrolls: expected viewport_row \
-                     {expected_row} (baseline {baseline_row} first seen at step {baseline_step}), \
-                     got {}; an image's position must track the viewport 1:1 with each scroll \
-                     step, not lag behind the text scrolling around it",
-                    placement.image_id, placement.viewport_row
+                    placement.viewport_row,
+                    baseline_row + scrolled,
+                    "image {} moved differently than the viewport at step {step}",
+                    placement.image_id
                 );
+
+                let line_above_row = ["BEFORE_4", "MIDDLE_19"]
+                    .iter()
+                    .filter_map(|line| row_of_line.get(*line).copied())
+                    .filter(|row| *row < placement.viewport_row)
+                    .max();
+                if let Some(row) = line_above_row {
+                    assert_eq!(
+                        row,
+                        placement.viewport_row - 1,
+                        "image {} is not directly below its preceding text at step {step}",
+                        placement.image_id
+                    );
+                }
             }
         }
+        assert_eq!(
+            baseline.len(),
+            2,
+            "both images should have scrolled into view"
+        );
     }
 
     // resizing must not move a placed image or the drawn cursor.
