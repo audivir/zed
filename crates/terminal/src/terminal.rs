@@ -105,19 +105,16 @@ enum ViMotion {
     ParagraphDown,
 }
 
-/// Compiled once for the whole process (a constant pattern, unlike
-/// `terminal.path_hyperlink_regexes`, which is per-user-setting and lives
-/// on each `Terminal`'s own `RegexSearches`), for `GhosttyTerminal::
-/// hyperlink_at`'s bare-URL matching. `.unwrap()` is safe: `URL_REGEX` is a
-/// fixed string constant covered by `hyperlinks::tests::test_url_regex`.
+/// Bare URL regex for `GhosttyTerminal::hyperlink_at`, compiled once per process.
+///
+/// `URL_REGEX` is a constant covered by `hyperlinks::tests::test_url_regex`, so unwrapping is
+/// safe.
 static GHOSTTY_URL_REGEX: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(URL_REGEX).unwrap());
 
 #[derive(Clone, Debug)]
 pub struct Search {
-    /// `GhosttyTerminal::search_matches` runs the general-purpose `regex`
-    /// crate directly over Ghostty's extracted buffer text (see that
-    /// method's doc comment).
+    /// Search regex applied by `GhosttyTerminal::search_matches` to the extracted buffer text.
     ghostty_search: regex::Regex,
 }
 
@@ -347,13 +344,11 @@ impl Hyperlink {
     }
 }
 
-/// A single terminal grid cell's content and style, snapshotted out of
-/// whichever backend produced it (owned, not a live view) so it can outlive
-/// a single render pass.
+/// Owned snapshot of the content and style of a terminal cell.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Cell {
     character: char,
-    /// Extra combining/zero-width codepoints beyond `character`, if any.
+    /// Combining or zero-width codepoints following `character`.
     zerowidth: Vec<char>,
     foreground: Color,
     background: Color,
@@ -620,25 +615,21 @@ impl SelectionRange {
     }
 }
 
-/// A Kitty graphics protocol image placement visible in the viewport, with
-/// pixel data already decoded to RGBA8 and positioning resolved to
-/// viewport-relative grid coordinates (may be negative if the placement is
-/// partially scrolled above the top of the viewport).
+/// Container for a visible Kitty graphics placement with RGBA8 pixels.
+///
+/// Positions are viewport-relative grid coordinates, negative when partially scrolled above the
+/// viewport.
 #[derive(Clone, Debug)]
 pub struct ImagePlacement {
     pub image_id: u32,
-    /// Changes whenever the underlying image's pixel data is replaced,
-    /// letting callers cache decoded/converted image data by `image_id` and
-    /// only rebuild it when `generation` changes.
+    /// Changes whenever the image pixels are replaced, so callers can cache by `image_id`.
     pub generation: u64,
     pub viewport_column: i32,
     pub viewport_row: i32,
-    /// Number of grid columns/rows this placement occupies. The image's own
-    /// `pixel_width`/`pixel_height` are usually slightly smaller than
-    /// `grid_columns * cell_width`/`grid_rows * line_height` (rows/columns
-    /// are whole cells, rounded up from the image's real pixel size), so
-    /// renderers should paint to fill the grid cells rather than the exact
-    /// pixel size, to avoid a gap between the image and following text.
+    /// Grid columns occupied by the placement.
+    ///
+    /// Cells round up from the pixel size, so renderers fill the grid cells to avoid a gap before
+    /// the following text.
     pub grid_columns: u32,
     pub grid_rows: u32,
     pub pixel_width: u32,
@@ -665,8 +656,7 @@ pub struct Content {
     pub scrolled_to_top: bool,
     pub scrolled_to_bottom: bool,
     pub bottom_row_occupied: bool,
-    /// Kitty graphics protocol image placements currently visible in the
-    /// viewport. Always empty on Windows.
+    /// Kitty graphics placements visible in the viewport, always empty on Windows.
     pub images: Vec<ImagePlacement>,
 }
 
@@ -711,12 +701,9 @@ impl Default for Content {
     }
 }
 
-/// A backend-agnostic port of `alacritty::adjusted_last_hovered_word`:
-/// decides whether `previous`'s hovered word can still be trusted against
-/// `new`'s grid shape/scroll position, adjusting its line by the scroll
-/// delta if only the viewport shifted. Takes `Content` snapshots rather
-/// than a `Grid` reference so it works for any backend that populates
-/// `Content::columns`/`screen_lines`/`total_lines`/`display_offset`.
+/// Returns the previously hovered word if it is still valid for `new`.
+///
+/// Shifts its line by the scroll delta when only the viewport moved.
 fn adjusted_last_hovered_word(
     new: &Content,
     previous: &Content,
@@ -738,11 +725,10 @@ fn adjusted_last_hovered_word(
         && grid_lines_change == GridLinesChange::Unchanged
     {
         if total_lines_delta == 0 {
-            // Viewport and content are the same, we can reuse existing match
+            // viewport and content are unchanged, so reuse the match.
             Some(last_hovered_word.clone())
         } else {
-            // Content is changed, but viewport is shifted the same, reuse
-            // the match, but need to shift the match lines by the same amount.
+            // content changed but the viewport shifted equally, so shift the match lines.
             let mut adjusted_hovered_word = last_hovered_word.clone();
             adjusted_hovered_word.word_match = Range::new(
                 Point::new(
@@ -950,11 +936,7 @@ impl fmt::Debug for TerminalBackendEvent {
 
 enum PtyEvent {
     Event(TerminalBackendEvent),
-    /// Effects (PTY writes, bell, title changes, clipboard writes) produced
-    /// by writing a batch of PTY output into the Ghostty terminal on the
-    /// dedicated parser thread (see `ghostty::spawn_pty`), drained via
-    /// `GhosttyTerminal::take_effects` and applied by
-    /// `Terminal::process_ghostty_effects`.
+    /// Effects produced by the parser thread for a batch of PTY output.
     GhosttyPtyOutput {
         effects: Vec<ghostty::GhosttyEffect>,
     },
@@ -1215,14 +1197,8 @@ impl TerminalBuilder {
 
         let (_events_tx, events_rx) = unbounded();
 
-        // Display-only terminals have no PTY at all (`write_output` injects
-        // pre-recorded bytes directly, bypassing the PTY/event-loop
-        // machinery entirely). Failure here (should be rare: only cols/rows
-        // being zero, guarded by `.max(1)`, or an internal allocation
-        // failure) degrades to `ghostty: None`, an inert, empty terminal
-        // (see `refresh_last_content_from_ghostty`/`get_content`/etc.)
-        // rather than making construction fallible for every caller of
-        // what has otherwise always been an infallible constructor.
+        // display-only terminals have no PTY. Construction only fails on allocation failure,
+        // which degrades to an inert terminal instead of making this constructor fallible.
         let ghostty = match ghostty::GhosttyTerminal::new(
             terminal_bounds.num_columns().max(1) as u16,
             terminal_bounds.num_lines().max(1) as u16,
@@ -1694,13 +1670,9 @@ pub struct Terminal {
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
-    /// The Ghostty-backed terminal driving rendering, selection, search,
-    /// and (on the live PTY path) the actual PTY connection (see
-    /// [`ghostty`]). `None` only for the rare `GhosttyTerminal::new()`
-    /// construction-failure case on a display-only terminal (logged at
-    /// construction; the live PTY path fails construction outright
-    /// instead). Shared with the PTY parser thread; see the `unsafe impl
-    /// Send` comment on `ghostty::GhosttyTerminal`.
+    /// Ghostty terminal driving rendering, selection, search, and the PTY connection.
+    ///
+    /// `None` only if construction of a display-only terminal failed.
     ghostty: Option<Arc<parking_lot::Mutex<ghostty::GhosttyTerminal>>>,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
@@ -1711,14 +1683,10 @@ pub struct Terminal {
     pub matches: Vec<Range>,
     pub last_content: Content,
     pub selection_head: Option<Point>,
-    /// The type and anchor point of the currently-active selection, so
-    /// `InternalEvent::UpdateSelection` (mouse drag) knows how to extend it:
-    /// `Simple` extends the raw endpoint, `Semantic`/`Lines` re-derive
-    /// word/line boundaries from the anchor to the drag point on every
-    /// update (`GhosttyTerminal::select_word_range`/`select_line_range`),
-    /// mirroring how Alacritty's own `Selection` re-expands a stored
-    /// `SelectionType` lazily on every read instead of storing pre-expanded
-    /// bounds.
+    /// Type and anchor of the active selection, used to extend it on drag.
+    ///
+    /// `Simple` moves the endpoint, while `Semantic` and `Lines` re-derive boundaries from the
+    /// anchor on every update.
     selection_anchor: Option<(SelectionType, Point)>,
 
     pub breadcrumb_text: String,
@@ -1746,11 +1714,9 @@ pub struct Terminal {
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
     pending_cwd_boundary: Option<i32>,
-    /// The scrollback cap Ghostty was constructed with (see
-    /// `CopyTemplate::max_scroll_history_lines`), needed by `cwd_at_line` to
-    /// tell whether `history_size` may already reflect evictions (in which
-    /// case stored `cwd_history` row offsets no longer identify their
-    /// original lines).
+    /// Scrollback cap Ghostty was constructed with.
+    ///
+    /// Tells `cwd_at_line` whether evictions may have invalidated recorded row offsets.
     scrolling_history: usize,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
@@ -1760,15 +1726,12 @@ pub struct Terminal {
     pty_write_log: std::cell::RefCell<Vec<Vec<u8>>>,
 }
 
-/// A working directory recorded at a specific point in the retained
-/// scrollback, so a hyperlink click on old output can resolve to the
-/// directory that was current when that output was produced, not whatever
-/// the terminal's cwd is now. See `Terminal::cwd_at_line`.
+/// Container for a working directory recorded at a scrollback position.
+///
+/// Lets hyperlinks in old output resolve against the directory current at that time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CwdHistoryEntry {
-    /// Absolute row offset (`history_size + line`) in the retained
-    /// scrollback buffer. Monotonically increasing as more content is
-    /// produced, until the scrollback cap is hit (see `scrolling_history`).
+    /// Absolute row offset (`history_size + line`) in the retained scrollback.
     scrollback_position: i32,
     working_directory: PathBuf,
 }
@@ -1839,11 +1802,7 @@ impl Terminal {
         }
     }
 
-    /// Batches consecutive `GhosttyPtyOutput` events (coalescing their
-    /// effects into a single dispatch) instead of processing each PTY
-    /// parser-thread batch individually, before falling through to
-    /// `process_event` for interleaved non-Ghostty events. Ordering between
-    /// the two is preserved.
+    /// Processes queued events, coalescing consecutive `GhosttyPtyOutput` effects.
     fn process_events(
         &mut self,
         events: impl IntoIterator<Item = PtyEvent>,
@@ -1879,9 +1838,7 @@ impl Terminal {
         self.process_ghostty_pty_output(effects, cx);
     }
 
-    /// Dispatches Ghostty effects (PTY writes, bell, title changes)
-    /// accumulated by the PTY parser thread. The raw bytes that produced
-    /// them were already fed into the Ghostty terminal on that thread.
+    /// Dispatches effects accumulated by the PTY parser thread.
     fn process_ghostty_pty_output(
         &mut self,
         effects: Vec<ghostty::GhosttyEffect>,
@@ -1975,9 +1932,7 @@ impl Terminal {
                     log::error!("failed to resize ghostty terminal: {error}");
                 }
                 if columns_changed {
-                    // A column change reflows the grid, so previously
-                    // recorded scrollback offsets no longer point at their
-                    // original lines.
+                    // column changes reflow the grid and invalidate recorded offsets.
                     self.reset_cwd_history();
                 }
 
@@ -2180,14 +2135,8 @@ impl Terminal {
                 trace!("Finding hyperlink at position: position={position:?}, open={open:?}");
 
                 let hyperlink = if let Some(ghostty) = self.ghostty.as_ref() {
-                    // Reads Ghostty's live display offset rather than
-                    // `self.last_content.display_offset`: this event can be
-                    // processed mid-`sync()`, right after a scroll/vi-cursor
-                    // event whose viewport shift `self.last_content` hasn't
-                    // picked up yet (that only happens at the end of `sync`,
-                    // in `refresh_last_content_from_ghostty`). Using the
-                    // stale cached offset would resolve `position` against
-                    // the pre-scroll row instead of the live one.
+                    // read the live display offset, since `last_content` may predate a scroll
+                    // processed earlier in this `sync`.
                     let display_offset = ghostty
                         .lock()
                         .alacritty_style_display_offset()
@@ -2342,18 +2291,10 @@ impl Terminal {
         }
     }
 
-    /// Configures Ghostty's default foreground/background/cursor colors
-    /// and 256-color palette from Zed's active theme, so Ghostty always has
-    /// a real color to answer OSC 4/10/11/12 queries with independently
-    /// (see the `ColorRequest` handler in `process_event`). Called once at
-    /// construction (`TerminalBuilder::subscribe`) and again whenever the
-    /// theme changes (`TerminalView::settings_changed`).
+    /// Sets the default Ghostty colors from the active theme, so Ghostty can answer color
+    /// queries.
     ///
-    /// No-ops if the theme system hasn't been initialized, since
-    /// `cx.theme()` panics otherwise. This is true for most of this
-    /// crate's unit tests, which construct terminals without
-    /// `theme_settings::init`; real terminals always run inside a fully
-    /// initialized app.
+    /// Does nothing without an initialized theme, as in most unit tests.
     pub fn sync_ghostty_theme_colors(&mut self, cx: &App) {
         let Some(ghostty) = self.ghostty.as_ref() else {
             return;
@@ -2386,18 +2327,11 @@ impl Terminal {
 
     /// Terminal byte streams already contain their control sequences and must not be normalized.
     fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        // No PTY thread drives this path (see
-        // `TerminalBuilder::new_display_only_with_bounds`), so bytes are
-        // injected directly here, synchronously.
+        // no PTY thread drives this path, so bytes are written synchronously.
         if let Some(ghostty) = self.ghostty.clone() {
             let mut ghostty_guard = ghostty.lock();
             ghostty_guard.write(bytes);
-            // Nothing drives `sync()`'s usual PTY-parser-thread wakeup for
-            // this path, so a queued effect like ClipboardStore or a title
-            // change needs to be drained and processed here directly
-            // rather than left to accumulate unboundedly across repeated
-            // writes to a long-lived display-only terminal (e.g. an Agent
-            // Panel thread that keeps appending tool-call output).
+            // drain effects here, since no parser wakeup processes them for this path.
             let effects = ghostty_guard.take_effects();
             drop(ghostty_guard);
             self.process_ghostty_effects(effects, cx);
@@ -2433,13 +2367,7 @@ impl Terminal {
         }
     }
 
-    /// Number of lines actually occupied by content: scrollback history plus
-    /// however far down the live screen the cursor or trailing text reaches.
-    /// A Ghostty-side port of Alacritty's `used_lines`, since Ghostty has no
-    /// equivalent built in; operates on the last-synced viewport cells
-    /// (`self.last_content`), so it reflects the screen only when not
-    /// scrolled, matching Alacritty's own screen-relative (not
-    /// scrollback-relative) semantics.
+    /// Returns the number of lines occupied by scrollback plus used screen content.
     pub fn used_lines(&self) -> usize {
         if self.last_content.mode.contains(Modes::ALT_SCREEN) {
             return self.last_content.total_lines;
@@ -2492,12 +2420,7 @@ impl Terminal {
     }
 
     pub fn select_all(&mut self) {
-        // `GhosttyTerminal::select_all` already applies the selection to
-        // its own state; routing the resulting range back through
-        // `InternalEvent::SetSelection` (which sets it again) reuses that
-        // handler's existing `selection_anchor`/`selection_head`
-        // bookkeeping and primary-clipboard write rather than duplicating
-        // it here.
+        // route the range through `SetSelection` to reuse its anchor and clipboard handling.
         let range = self
             .ghostty
             .as_ref()
@@ -2722,12 +2645,7 @@ impl Terminal {
     }
 
     fn clear_for_init_command(&mut self, cx: &mut Context<Self>) {
-        // Synchronous, unlike the queued `InternalEvent::Clear` (Cmd+K):
-        // must take effect before `write_init_command` below writes the
-        // init command bytes, not on the next `sync()`. `get_content()`/
-        // rendering read from Ghostty directly, so clearing it here is
-        // enough; `self.last_content` catches up on the next `sync()`,
-        // triggered by the `Event::Wakeup` below, same as `InternalEvent::Clear`.
+        // clear synchronously so the screen is empty before the init command is written.
         if let Some(ghostty) = self.ghostty.as_ref() {
             let effects = {
                 let mut ghostty = ghostty.lock();
@@ -2743,11 +2661,8 @@ impl Terminal {
     fn write_input(&mut self, input: impl Into<Cow<'static, [u8]>>) {
         let input = input.into();
         if !self.is_remote_terminal && input.contains(&b'\r') {
-            // Snapshot the position of the command that's about to be sent,
-            // before the PTY echoes it back and the prompt scrolls. If a cwd
-            // change is later detected (see `record_cwd_change`), it's
-            // attributed to this boundary rather than wherever the cursor
-            // happens to be by the time the change is observed.
+            // record the command position before the echo scrolls, so a later cwd change is
+            // attributed to it.
             let history_size = self.total_lines().saturating_sub(self.viewport_lines());
             self.pending_cwd_boundary = Some(Self::scrollback_position(
                 self.last_content.cursor.point.line,
@@ -2937,17 +2852,9 @@ impl Terminal {
         }
     }
 
-    /// Rebuilds `self.last_content` from Ghostty's current state. This is
-    /// the half of `sync` that doesn't need a `Window`, split out so tests
-    /// without one (e.g. `init_ctrl_click_hyperlink_test`, run outside a
-    /// window) can still refresh content after `write_output` without
-    /// reaching into Ghostty internals themselves.
+    /// Rebuilds `last_content` from Ghostty without needing a `Window`.
     fn refresh_last_content_from_ghostty(&mut self, cx: &mut Context<Self>) {
-        // No Ghostty backend at all. Should be rare (only the
-        // `GhosttyTerminal::new()` construction-failure edge case in
-        // `TerminalBuilder::new_display_only_with_bounds`, already logged
-        // there). `process_terminal_event` above still tracked bounds/etc.
-        // where relevant; there's nothing further to build content from.
+        // no Ghostty backend exists after a failed display-only construction.
         let Some(ghostty) = self.ghostty.clone() else {
             return;
         };
@@ -2959,12 +2866,7 @@ impl Terminal {
         };
         content.columns = content.terminal_bounds.num_columns();
 
-        // Held for the rest of this function instead of re-locking per
-        // field: besides avoiding repeated lock/unlock overhead while the
-        // PTY parser thread is also contending for this same mutex, it
-        // keeps every field below consistent with a single Ghostty state
-        // snapshot rather than one that could shift between separate lock
-        // acquisitions if the parser thread wrote more output in between.
+        // hold the lock for the whole function so all fields come from one consistent state.
         let mut ghostty = ghostty.lock();
 
         match ghostty.build_content() {
@@ -2984,9 +2886,7 @@ impl Terminal {
                 content.cursor_char = metadata.cursor_char;
                 content.scrolled_to_top = metadata.scrolled_to_top;
                 content.scrolled_to_bottom = metadata.scrolled_to_bottom;
-                // `Event::BlinkChanged`'s only consumer just assigns the
-                // value unconditionally (`terminal_view.rs`), so there's no
-                // need to detect an actual change before emitting.
+                // the only consumer assigns the value unconditionally.
                 cx.emit(Event::BlinkChanged(metadata.cursor_blinking));
             }
             Err(error) => {
@@ -3023,10 +2923,7 @@ impl Terminal {
         }
         drop(ghostty);
 
-        // A direct port of `alacritty::make_content`'s own
-        // `bottom_row_occupied` computation, sourced from the
-        // Ghostty-derived `content.cells`/`content.cursor`/
-        // `content.display_offset` set above.
+        // whether the bottom row holds the cursor or any content.
         let bottom_line = content.screen_lines as i32 - 1 - content.display_offset as i32;
         content.bottom_row_occupied = content.cursor.point.line >= bottom_line
             || content
@@ -3036,13 +2933,7 @@ impl Terminal {
                 .take_while(|cell| cell.point.line >= bottom_line)
                 .any(|cell| cell.cell.character() != ' ');
 
-        // A port of `alacritty::adjusted_last_hovered_word`: only carries
-        // the hovered word forward when the grid shape and visible line
-        // count haven't changed, adjusting its line by the scroll delta
-        // when only the viewport shifted. Ghostty has no direct equivalent
-        // of Alacritty's `Grid`, so this compares the previous/new `Content`
-        // snapshots (`self.last_content` before it's overwritten below)
-        // instead of grid state directly.
+        // carry the hovered word forward only while the grid shape is unchanged.
         let (last_hovered_word, grid_lines_change) =
             adjusted_last_hovered_word(&content, &self.last_content);
         content.last_hovered_word = last_hovered_word;
@@ -3051,12 +2942,7 @@ impl Terminal {
         self.last_content = content;
     }
 
-    /// Exposes the most recently synced content's cells for rendering
-    /// (e.g. the REPL crate's plain-text terminal output cell, which draws
-    /// directly instead of going through `terminal_view`'s live
-    /// `TerminalElement`). `IndexedCell`/`&IndexedCell` already implement
-    /// `terminal_view::TerminalElement::layout_grid`'s `TerminalLayoutCell`
-    /// bound, so this needs no Ghostty-specific iterator type.
+    /// Calls `f` with the cells of the most recently synced content.
     pub fn with_renderable_cells<R>(
         &self,
         f: impl FnOnce(std::slice::Iter<'_, IndexedCell>) -> R,
@@ -3549,12 +3435,9 @@ impl Terminal {
         }
     }
 
-    /// Records that the terminal's working directory changed to
-    /// `new_working_directory`, at the scrollback position `write_input`
-    /// stashed in `pending_cwd_boundary` when the command that (presumably)
-    /// caused the change was submitted. If none was stashed (e.g. the very
-    /// first cwd, detected without a preceding Enter keypress), uses the
-    /// current cursor position instead.
+    /// Records a working directory change at the position stashed by `write_input`.
+    ///
+    /// Uses the cursor position if nothing was stashed.
     pub(crate) fn record_cwd_change(&mut self, new_working_directory: PathBuf) {
         if self.is_remote_terminal {
             return;
@@ -3570,10 +3453,7 @@ impl Terminal {
         });
     }
 
-    /// Discards `cwd_history`, keeping only the terminal's current working
-    /// directory. Called whenever the retained scrollback is invalidated in
-    /// a way that makes stored `scrollback_position`s meaningless: a full
-    /// clear, or a column resize (which reflows every line).
+    /// Discards `cwd_history` after a clear or reflow invalidated its positions.
     fn reset_cwd_history(&mut self) {
         self.pending_cwd_boundary = None;
         self.cwd_history = self
@@ -3587,10 +3467,9 @@ impl Terminal {
             .unwrap_or_default();
     }
 
-    /// The working directory that was current when the content at `line`
-    /// (`history_size + line` in absolute scrollback coordinates) was
-    /// produced, falling back to the terminal's current working directory
-    /// when there's no recorded history for that position.
+    /// Returns the working directory current when `line` was produced.
+    ///
+    /// Falls back to the current working directory.
     fn cwd_at_line(&self, line: i32, history_size: usize) -> Option<PathBuf> {
         // Once the scrollback cap is reached, evictions move retained lines without changing
         // `history_size`, so stored row offsets no longer identify their original lines.
@@ -3839,9 +3718,7 @@ impl Terminal {
         if !lines_to_show.is_empty()
             && let Some(ghostty) = self.ghostty.as_ref()
         {
-            // Goes through Ghostty's real VT parser (`write`, the same path
-            // `write_output` uses for display-only terminals). A leading
-            // `\r\n` forces a fresh line and resets the column.
+            // a leading `\r\n` starts a fresh line.
             let mut text = String::from("\r\n");
             for line in &lines_to_show {
                 text.push_str(line);
@@ -4432,14 +4309,7 @@ mod tests {
         cx.new(|cx| builder.subscribe(cx))
     }
 
-    /// `Terminal::register_task_finished`'s task-summary text
-    /// ("Task `...` finished successfully") is appended after the real
-    /// process exits, when no more PTY output will ever arrive. This write
-    /// must also go through Ghostty, since `Content.cells` always comes
-    /// from `GhosttyTerminal::build_content`. Drives a real PTY end to end
-    /// (`true`, which exits 0 immediately) rather than `write_output`,
-    /// since this specifically exercises the post-process-exit
-    /// live-terminal path.
+    // the task summary is written after the process exits and must still reach Ghostty.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_task_summary_is_visible_after_real_process_exits(cx: &mut TestAppContext) {
@@ -4953,7 +4823,7 @@ mod tests {
         assert_eq!(exit_status.await, Some(ExitStatus::default()));
         assert_content_eventually(&terminal, "hello", cx).await;
 
-        // Inject additional output directly into the emulator (display-only path)
+        // inject output through the display-only path.
         terminal.update(cx, |term, cx| {
             term.write_output(b"\nfrom_injection", cx);
         });
@@ -4965,31 +4835,19 @@ mod tests {
         );
     }
 
-    /// Regression test for the PNG decoder being installed on the wrong
-    /// thread: `libghostty_vt::kitty::graphics::set_png_decoder` stores its
-    /// callback in the library's own thread-local state, so PNG-format
-    /// Kitty graphics data written on a different thread than the one that
-    /// called it is silently rejected. Unlike `ghostty::tests`, which write
-    /// directly into a `GhosttyTerminal` on the test's own thread, this
-    /// drives a real spawned process's PTY output through the dedicated
-    /// parser thread from `ghostty::spawn_pty`, the actual path a real
-    /// terminal uses.
+    // the PNG decoder is thread-local, so PNG data must decode on the PTY parser thread.
     #[gpui::test]
     async fn test_kitty_image_placement_via_real_pty(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        // A minimal 1x1 PNG (from libghostty-vt's own `kitty::graphics`
-        // doctest), transmitted and scaled to 10x4 cells.
+        // a 1x1 PNG scaled to 10x4 cells.
         let escape: &[u8] = b"\x1b_Ga=T,f=100,c=10,r=4,q=1;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\";
         let path = std::env::temp_dir().join("zed_kitty_test_payload.bin");
         std::fs::write(&path, escape).unwrap();
 
         let terminal = build_test_terminal(cx, "cat", &[path.to_str().unwrap()]).await;
 
-        // A real terminal panel resizes as soon as it lays out, before any
-        // output arrives; this headless test never lays out a window, so
-        // set cell pixel dimensions explicitly (Kitty graphics can't
-        // compute grid positions without them).
+        // set cell pixel sizes explicitly, since no window lays out this terminal.
         terminal
             .update(cx, |term, _| {
                 term.ghostty
@@ -5022,7 +4880,7 @@ mod tests {
         assert_eq!(placements[0].pixel_height, 20);
     }
 
-    // Text written after an image must land below it, not overlap it.
+    // text written after an image must land below it.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_cursor_row_after_image_placement(cx: &mut TestAppContext) {
@@ -5063,8 +4921,7 @@ mod tests {
         assert_eq!(placements.len(), 1);
         let image_bottom_row = placements[0].viewport_row + 4; // r=4 rows tall
 
-        // Let more output (the trailing text) settle. Ghostty handles Kitty
-        // graphics natively, so its own cursor is checked directly.
+        // let the trailing text settle.
         let mut cursor_row = None;
         for _ in 0..300 {
             cursor_row = terminal.update(cx, |term, _| {
@@ -5089,14 +4946,13 @@ mod tests {
         );
     }
 
-    // A cursor scrolled out of the viewport must be hidden, not drawn at a
-    // fake position.
+    // a cursor scrolled out of the viewport must be hidden.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_cursor_hidden_when_scrolled_out_of_viewport(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        // Print far more lines than fit on screen so there's real scrollback.
+        // print enough lines to create scrollback.
         let mut script = String::new();
         for i in 0..60 {
             script.push_str(&format!("printf 'LINE_{i}\\n'\n"));
@@ -5126,9 +4982,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Poll until all 60 lines have actually landed (bash/printf is a real
-        // subprocess, not synchronous), so the scroll below has real
-        // scrollback to push the cursor out of.
+        // wait until all 60 lines have landed.
         let mut shape_before = None;
         for _ in 0..300 {
             let (row, shape) = terminal.update(cx, |term, _| {
@@ -5174,9 +5028,7 @@ mod tests {
         );
     }
 
-    // Regresses a bug where the reported cursor row stopped advancing
-    // correctly after a second image was placed, leaving it on top of
-    // earlier output instead of past it.
+    // the cursor row must keep advancing past a second image.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_cursor_row_after_repeated_image_placements(cx: &mut TestAppContext) {
@@ -5222,9 +5074,7 @@ mod tests {
         assert_eq!(placements.len(), 2);
         let second_image_bottom_row = placements[1].viewport_row + 4; // r=4 rows tall
 
-        // Let more output (the trailing text) settle. Checked against
-        // Ghostty's own cursor directly, since it handles Kitty graphics
-        // natively.
+        // let the trailing text settle.
         let mut cursor_row = None;
         for _ in 0..300 {
             cursor_row = terminal.update(cx, |term, _| {
@@ -5249,9 +5099,7 @@ mod tests {
         );
     }
 
-    /// Like `build_test_terminal`, but constructs the entity inside `window`
-    /// so it has a current window and methods like `sync` (and anything that
-    /// goes through `update_window_entity`) work.
+    // like `build_test_terminal`, but inside `window` so window-dependent methods like `sync` work.
     async fn build_test_terminal_in_window(
         window: &mut VisualTestContext,
         command: &str,
@@ -5289,13 +5137,8 @@ mod tests {
         window.new_window_entity(|_, cx| builder.subscribe(cx))
     }
 
-    // The drawn cursor (`last_content.cursor`, used for the caret and for
-    // nothing else) must land at or past the bottom of every placed image,
-    // same as the previous test's direct `content_metadata` query. This
-    // exercises the full `sync` path end to end, rather than calling
-    // `content_metadata` directly, to catch a regression where
-    // `last_content` falls out of sync with what `content_metadata` would
-    // report.
+    // the drawn cursor must land at or past the bottom of every image through the full `sync`
+    // path.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_drawn_cursor_row_after_repeated_image_placements(cx: &mut TestAppContext) {
@@ -5314,9 +5157,8 @@ mod tests {
         let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
-        // Narrow enough that the image's right edge (c=10) sits close to the
-        // terminal's own right margin, the condition under which Ghostty's
-        // own cursor-position query has been observed to undercount.
+        // narrow enough that the image reaches near the right margin, where the cursor query of
+        // Ghostty has undercounted.
         let bounds = TerminalBounds::new(
             px(20.),
             px(10.),
@@ -5351,7 +5193,7 @@ mod tests {
         assert_eq!(placements.len(), 2);
         let second_image_bottom_row = placements[1].viewport_row + 4; // r=4 rows tall
 
-        // Let more output (the trailing text) settle, then sync once more.
+        // let the trailing text settle and sync once more.
         window
             .background_executor
             .timer(Duration::from_millis(50))
@@ -5371,9 +5213,7 @@ mod tests {
         );
     }
 
-    // Images must stay visually anchored to their content as the viewport
-    // scrolls: an image's `viewport_row` should shift by exactly the number
-    // of rows scrolled, and it must disappear once fully scrolled past.
+    // images shift with the scrolled content and disappear once scrolled past.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_images_scroll_with_content(cx: &mut TestAppContext) {
@@ -5383,8 +5223,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(image);
         payload.extend_from_slice(b"\r\n");
-        // Enough plain lines afterward to force real scrollback on a small
-        // terminal, well past the image's own height.
+        // enough lines to scroll the image into scrollback.
         for i in 0..40 {
             payload.extend_from_slice(format!("LINE_{i}\r\n").as_bytes());
         }
@@ -5395,8 +5234,7 @@ mod tests {
         let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
-        // Small viewport: tall enough to see the whole image at first, short
-        // enough that 40 more lines definitely scrolls it away.
+        // tall enough to show the whole image, short enough for 40 lines to scroll it away.
         let bounds = TerminalBounds::new(
             px(20.),
             px(10.),
@@ -5414,10 +5252,7 @@ mod tests {
                 .map(|ghostty| ghostty.lock().resize(bounds))
         });
 
-        // `cat` dumps the whole payload near-instantly, so by the time any
-        // poll runs, the image (printed first) has typically already
-        // scrolled off this small viewport. Wait for the *last* line
-        // instead of trying to catch the image mid-flight.
+        // wait for the last line, since the image usually scrolls away before any poll.
         let mut settled = false;
         for _ in 0..300 {
             window.update_window_entity(&terminal, |term, window, cx| {
@@ -5435,9 +5270,7 @@ mod tests {
         }
         assert!(settled, "output did not settle in time");
 
-        // The image (printed before any LINE_N) has scrolled well above the
-        // top of a 10-row viewport, so it must no longer be reported as
-        // visible.
+        // the image lies above the viewport and is not reported.
         let images_after_scroll =
             terminal.read_with(window, |term, _| term.last_content.images.clone());
         assert!(
@@ -5446,10 +5279,7 @@ mod tests {
             images_after_scroll.first().map(|p| p.viewport_row)
         );
 
-        // Scroll back up to the very top: the image was the first thing
-        // printed, so it must reappear pinned to row 0, proving its
-        // position tracks the actual content rather than staying wherever it
-        // last was (or vanishing permanently) as the viewport scrolls.
+        // scrolling to the top brings the image back at row 0.
         window.update_window_entity(&terminal, |term, window, cx| {
             term.scroll_to_top();
             term.sync(window, cx);
@@ -5474,9 +5304,7 @@ mod tests {
         );
     }
 
-    /// Builds a display-only, Ghostty-backed terminal and writes `content`
-    /// into it directly via `write_output`, so tests can exercise
-    /// Ghostty-backed mouse selection.
+    // builds a display-only terminal with `content` written into it.
     fn build_selection_test_terminal(
         window: &mut VisualTestContext,
         content: &[u8],
@@ -5524,10 +5352,7 @@ mod tests {
         );
     }
 
-    // A plain click-drag must select exactly the dragged-over cells via
-    // Ghostty's set_selection/update_selection, with
-    // DEBUG_CELL_WIDTH/LINE_HEIGHT (5px) making pixel-to-column math exact
-    // for deterministic assertions.
+    // a click-drag selects exactly the dragged cells; 5px debug cells keep the math exact.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_ghostty_backed_simple_click_drag_selects_text(cx: &mut TestAppContext) {
@@ -5536,8 +5361,7 @@ mod tests {
         let terminal = build_selection_test_terminal(window, b"hello world", "hello world");
 
         window.update_window_entity(&terminal, |term, _, cx| {
-            // Click inside column 0 ("h"), drag to column 4 ("o"): should
-            // select "hello" (columns 0..=4 inclusive).
+            // drag from column 0 to column 4 to select `hello`.
             mouse_down_at_with_click_count(term, point(px(2.), px(2.)), 1, cx);
             left_mouse_drag_to(term, point(px(22.), px(2.)), cx);
         });
@@ -5550,8 +5374,6 @@ mod tests {
         assert_eq!(selection_text.as_deref(), Some("hello"));
     }
 
-    /// A double-click with no drag should select exactly the word under the
-    /// click, via `GhosttyTerminal::select_word_at`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_ghostty_backed_double_click_selects_word(cx: &mut TestAppContext) {
@@ -5560,7 +5382,7 @@ mod tests {
         let terminal = build_selection_test_terminal(window, b"hello world", "hello world");
 
         window.update_window_entity(&terminal, |term, _, cx| {
-            // Column 8 ("r" of "world").
+            // column 8, inside `world`.
             mouse_down_at_with_click_count(term, point(px(42.), px(2.)), 2, cx);
         });
         window.update_window_entity(&terminal, |term, window, cx| {
@@ -5572,11 +5394,6 @@ mod tests {
         assert_eq!(selection_text.as_deref(), Some("world"));
     }
 
-    /// Dragging after a double-click should extend the selection by whole
-    /// words (including the whitespace between them), via
-    /// `GhosttyTerminal::select_word_range`. This is the dispatch logic
-    /// `InternalEvent::UpdateSelection` needs for `SelectionType::Semantic`,
-    /// distinct from the already-tested plain `update_selection`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_ghostty_backed_double_click_drag_extends_word_selection(cx: &mut TestAppContext) {
@@ -5585,7 +5402,7 @@ mod tests {
         let terminal = build_selection_test_terminal(window, b"hello world", "hello world");
 
         window.update_window_entity(&terminal, |term, _, cx| {
-            // Double-click "hello" (column 2), drag onto "world" (column 8).
+            // double-click `hello` and drag onto `world`.
             mouse_down_at_with_click_count(term, point(px(12.), px(2.)), 2, cx);
             left_mouse_drag_to(term, point(px(42.), px(2.)), cx);
         });
@@ -5598,9 +5415,6 @@ mod tests {
         assert_eq!(selection_text.as_deref(), Some("hello world"));
     }
 
-    /// Dragging after a triple-click should extend the selection by whole
-    /// lines, via `GhosttyTerminal::select_line_range`, the dispatch logic
-    /// for `SelectionType::Lines`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_ghostty_backed_triple_click_drag_extends_line_selection(cx: &mut TestAppContext) {
@@ -5613,8 +5427,7 @@ mod tests {
         );
 
         window.update_window_entity(&terminal, |term, _, cx| {
-            // Triple-click row 1 ("second line"), drag down onto row 2
-            // ("third line").
+            // triple-click row 1 and drag onto row 2.
             mouse_down_at_with_click_count(term, point(px(12.), px(7.)), 3, cx);
             left_mouse_drag_to(term, point(px(12.), px(12.)), cx);
         });
@@ -5630,9 +5443,6 @@ mod tests {
         assert!(!selection_text.contains("first line"));
     }
 
-    /// `Terminal::select_all` calls `GhosttyTerminal::select_all` directly
-    /// rather than computing a range independently, so it stays correct
-    /// against Ghostty's own scrollback bounds.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_select_all_selects_full_ghostty_content(cx: &mut TestAppContext) {
@@ -5659,12 +5469,6 @@ mod tests {
         assert!(selection_text.contains("third line"));
     }
 
-    /// `Terminal::find_matches` on a real PTY-backed (Ghostty) terminal
-    /// should find every match, including one in scrollback, with
-    /// correctly-positioned `Range`s, end-to-end through the live
-    /// `Terminal` API and `Search` type (as opposed to
-    /// `GhosttyTerminal::search_matches` in isolation, which
-    /// `ghostty.rs`'s own tests already cover).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_find_matches_finds_multiple_matches_including_in_scrollback(
@@ -5703,11 +5507,7 @@ mod tests {
         assert_eq!(sorted[1].start().column, 0);
     }
 
-    /// Toggling vi mode and performing motions on a real PTY-backed
-    /// (Ghostty) terminal must move the *rendered* cursor:
-    /// `GhosttyTerminal::content_metadata` must prefer the vi cursor over
-    /// the real terminal cursor whenever vi mode is active, so vi motions
-    /// stay visible, not just internally consistent.
+    // vi motions must move the rendered cursor, not just the internal one.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_ghostty_backed_vi_mode_motion_moves_rendered_cursor(cx: &mut TestAppContext) {
@@ -5725,7 +5525,7 @@ mod tests {
         });
         assert!(terminal.read_with(window, |term, _| term.vi_mode_enabled()));
 
-        // The vi cursor starts at the real terminal cursor's position.
+        // the vi cursor starts at the terminal cursor.
         let cursor_after_toggle =
             terminal.read_with(window, |term, _| term.last_content.cursor.point);
         assert_eq!(cursor_after_toggle, initial_cursor);
@@ -5749,12 +5549,7 @@ mod tests {
         assert_eq!(cursor_after_motion.line, cursor_after_toggle.line);
     }
 
-    /// Activating a search match while vi mode is active takes the
-    /// `MoveViCursorToPoint` path (mutually exclusive with the plain
-    /// `ScrollToPoint` path `test_activate_match_scrolls_match_into_view`
-    /// covers). This must both move the vi cursor to the match and
-    /// scroll the viewport to reveal it, via
-    /// `GhosttyTerminal::vi_goto_point`'s `scroll_viewport_to_reveal` step.
+    // activating a match in vi mode must move the vi cursor and scroll it into view.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_ghostty_backed_vi_mode_activate_match_reveals_vi_cursor(cx: &mut TestAppContext) {
@@ -5771,10 +5566,8 @@ mod tests {
         window.update_window_entity(&terminal, |term, _, _| {
             term.toggle_vi_mode();
         });
-        // `toggle_vi_mode` only queues an event; `vi_mode_enabled` (checked
-        // synchronously by `activate_match` below to decide between its
-        // `MoveViCursorToPoint`/`ScrollToPoint` branches) isn't flipped
-        // until this event is actually processed.
+        // `toggle_vi_mode` only queues an event, so process it before `activate_match` checks
+        // the mode.
         window.update_window_entity(&terminal, |term, window, cx| {
             term.sync(window, cx);
         });
@@ -5814,12 +5607,7 @@ mod tests {
         );
     }
 
-    /// An OSC 8 native hyperlink on a real PTY-backed (Ghostty) terminal
-    /// must be found via `GhosttyTerminal::hyperlink_at`, normalized
-    /// through the same shared `normalize_hyperlink_match` the regex path
-    /// uses. The other hyperlink tests use `init_ctrl_click_hyperlink_test`
-    /// (`new_display_only`, no Ghostty backend), so none of them actually
-    /// exercise the Ghostty OSC 8 path at all.
+    // the other hyperlink tests use display-only terminals, which do not exercise OSC 8.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_ghostty_backed_osc8_hyperlink_is_found_at_point(cx: &mut TestAppContext) {
@@ -5829,8 +5617,7 @@ mod tests {
         let terminal = build_selection_test_terminal(window, &payload, "click here end");
 
         let hyperlink = window.update_window_entity(&terminal, |term, _, _| {
-            // "click " occupies columns 0..6; "here" (the OSC 8 span) is
-            // columns 6..10.
+            // `here` spans columns 6 to 9.
             term.find_hyperlink_at_point(Point::new(0, 8))
         });
         let hyperlink = hyperlink.expect("expected an OSC 8 hyperlink to be found");
@@ -5848,8 +5635,7 @@ mod tests {
         );
     }
 
-    // Activating a search match that's scrolled out of view must actually
-    // scroll it into the visible viewport.
+    // activating an off-screen match scrolls it into view.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_activate_match_scrolls_match_into_view(cx: &mut TestAppContext) {
@@ -5884,10 +5670,7 @@ mod tests {
         }
         assert!(settled, "output did not settle in time");
 
-        // FIND_ME_MARKER was the first thing printed, so on this terminal's
-        // small default viewport (see DEBUG_TERMINAL_HEIGHT), it must have
-        // scrolled out of view by now, exactly like the image in
-        // test_images_scroll_with_content above.
+        // the marker was printed first, so it has scrolled out of the small viewport.
         let viewport_lines = terminal.read_with(window, |term, _| term.viewport_lines());
         let matches = window
             .update_window_entity(&terminal, |term, _, cx| {
@@ -5927,18 +5710,8 @@ mod tests {
             selection.start.line
         );
 
-        // After activating a match far from the live cursor,
-        // `InternalEvent::ScrollToPoint` must scroll Ghostty's own viewport
-        // to reveal it (via `scroll_viewport_to_reveal`). If that scroll
-        // didn't happen, Ghostty's `cursor_viewport` query would keep
-        // reporting the shell prompt's cursor (40+ lines below the match,
-        // definitely not in this viewport) visible at its last (unmoved,
-        // still-at-the-bottom) position. The resulting rendered row can
-        // coincidentally still land inside 0..viewport_lines (it's math on
-        // two independent offsets, not a bounds violation), which is
-        // exactly what makes this bug class easy to miss: it looks like a
-        // plausible row instead of an obviously out-of-range one. It must
-        // actually be hidden.
+        // the prompt cursor lies far below the match and must be hidden. Without the scroll,
+        // its stale row can still look plausible.
         let cursor = terminal.read_with(window, |term, _| term.last_content.cursor);
         assert_eq!(
             cursor.shape,
@@ -5950,21 +5723,9 @@ mod tests {
         );
     }
 
-    // `test_images_scroll_with_content` above only exercises `scroll_to_top`
-    // (an absolute jump straight to Ghostty's `ScrollViewport::Top`). Mouse
-    // wheel and `shift-up` scrolling instead issue many single-line
-    // `scroll_line_up` calls (`InternalEvent::Scroll(Scroll::Delta(1))`,
-    // applied via `ScrollViewport::Delta(-1)` on the Ghostty side each
-    // time), a completely different code path that an absolute-jump test
-    // can't catch a per-step drift in. This reproduces a real bug report:
-    // after enough single-line scrolls, an image's reported `viewport_row`
-    // falls behind where the text around it has scrolled to, so the image
-    // visibly overlaps the text below it instead of staying above it.
-    //
-    // This is a genuine drift bug in Ghostty's own image-placement row
-    // tracking, not a dual-engine disagreement: it still reproduces with
-    // no Alacritty shadow term involved at all. Root cause not yet found.
-    // Ignored so `cargo test` stays green; un-ignore once the fix lands.
+    // single-line scrolling drifts the image `viewport_row` behind the text near the top of
+    // scrollback, so the image overlaps the following text. The drift happens inside Ghostty
+    // and the root cause is unknown.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     #[ignore = "Ghostty's own image-placement viewport_row falls behind \
@@ -5995,8 +5756,7 @@ mod tests {
         let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
-        // Small viewport: forces plenty of scrollback (~53 rows of content
-        // over a 10-row view) without needing to wait on a huge payload.
+        // a small viewport creates plenty of scrollback.
         let bounds = TerminalBounds::new(
             px(20.),
             px(10.),
@@ -6031,15 +5791,7 @@ mod tests {
         }
         assert!(settled, "output did not settle in time");
 
-        // Both images are scrolled well above the viewport at this point;
-        // scroll up one line at a time and track each image's
-        // `viewport_row` (relative to where it was found once first
-        // visible) against how many lines we've scrolled since then. A
-        // correctly-tracking image's `viewport_row` increases by exactly 1
-        // per line scrolled, since scrolling up moves the viewport's top
-        // one row earlier, pushing every fixed point of content (images
-        // included) one row further down the (now virtually taller)
-        // viewport-relative coordinate space.
+        // scroll up one line at a time; a correctly tracked image moves down one row per line.
         let mut baseline: collections::HashMap<u32, i32> = collections::HashMap::default();
         let mut steps_since_baseline: collections::HashMap<u32, i32> =
             collections::HashMap::default();
@@ -6070,10 +5822,7 @@ mod tests {
         }
     }
 
-    // Resizing the terminal must not disturb an already-placed image's
-    // reported position or the drawn cursor. Both are computed from
-    // Ghostty's own internal viewport-top tracking, so if either jumps
-    // after a resize, Ghostty's own state failed to survive the reflow.
+    // resizing must not move a placed image or the drawn cursor.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[gpui::test]
     async fn test_image_and_cursor_stable_across_resize(cx: &mut TestAppContext) {
@@ -6081,8 +5830,7 @@ mod tests {
 
         let image: &[u8] = b"\x1b_Ga=T,f=100,c=10,r=4,q=1;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\";
         let mut payload = Vec::new();
-        // Real scrollback history above the image, like earlier shell
-        // commands would leave behind.
+        // scrollback above the image, like earlier commands leave behind.
         for i in 0..8 {
             payload.extend_from_slice(format!("BEFORE_{i}\r\n").as_bytes());
         }
@@ -6095,8 +5843,7 @@ mod tests {
         let terminal =
             build_test_terminal_in_window(window, "cat", &[path.to_str().unwrap()]).await;
 
-        // Roomy enough that the image and its trailing text both fit with no
-        // scrolling required.
+        // large enough that the image and trailing text fit without scrolling.
         let initial_bounds = TerminalBounds::new(
             px(20.),
             px(10.),
@@ -6131,11 +5878,7 @@ mod tests {
         assert_eq!(placements.len(), 1, "image placement should appear");
         let row_before_resize = placements[0].viewport_row;
 
-        // Now actually resize, through the same public path a real window
-        // resize takes (`set_size` -> `InternalEvent::Resize`, processed by
-        // the very next `sync`). Keep the row count the same (so nothing is
-        // expected to scroll) but shrink the columns close to the image's
-        // own width, forcing a real reflow of the surrounding text.
+        // keep the rows but shrink the columns near the image width, forcing a reflow.
         let resized_bounds = TerminalBounds::new(
             px(20.),
             px(10.),
@@ -6929,9 +6672,7 @@ mod tests {
         assert_eq!(bytewise.cursor.point, whole_cursor);
     }
 
-    /// `write_output`'s Ghostty backend processes its own queued effects,
-    /// so an OSC 52 SET injected into a display-only terminal applies to
-    /// the clipboard. `b3ZlcndyaXR0ZW4=` base64-decodes to "overwritten".
+    // `b3ZlcndyaXR0ZW4=` decodes to `overwritten`.
     #[gpui::test]
     async fn test_display_only_write_output_applies_osc52(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -6964,12 +6705,7 @@ mod tests {
         }
     }
 
-    /// Drives a real spawned process's PTY output through
-    /// `ghostty::spawn_pty`'s dedicated parser thread (the actual path a
-    /// live terminal uses), unlike the display-only test above which
-    /// injects bytes directly via `write_output`. Pins down that
-    /// `process_ghostty_effects`'s `ClipboardStore` arm is reached from
-    /// that path.
+    // clipboard writes must also work through the PTY parser thread.
     #[gpui::test]
     async fn test_osc52_clipboard_write_via_real_pty(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -6978,7 +6714,7 @@ mod tests {
             cx.write_to_clipboard(ClipboardItem::new_string("original".to_string()));
         });
 
-        // "hello from ghostty" base64-encoded.
+        // `hello from ghostty` in base64.
         let escape: &[u8] = b"\x1b]52;c;aGVsbG8gZnJvbSBnaG9zdHR5\x07";
         let path = std::env::temp_dir().join("zed_osc52_test_payload.bin");
         std::fs::write(&path, escape).unwrap();
@@ -6999,16 +6735,7 @@ mod tests {
         assert_eq!(clipboard_text.as_deref(), Some("hello from ghostty"));
     }
 
-    /// Once a program overrides the background color via OSC 11 SET, a
-    /// later OSC 11 query must answer with that override, exactly once.
-    /// Ghostty answers the query independently once overridden (see
-    /// `ghostty::tests::answers_all_color_queries_independently_once_theme_colors_are_configured`),
-    /// so this also pins down that `process_event`'s `ColorRequest`
-    /// handler correctly skips writing its own response in that case
-    /// rather than double-answering.
-    /// Uses `write_output` rather than a real PTY since the assertion only
-    /// needs `pty_write_log`, which `write_to_pty` populates unconditionally
-    /// regardless of terminal type.
+    // Ghostty answers OSC 11 queries after an override, so Zed must not answer as well.
     #[gpui::test]
     async fn test_osc11_color_query_answers_from_ghostty_override(cx: &mut TestAppContext) {
         let terminal = cx.new(|cx| {
@@ -7050,14 +6777,7 @@ mod tests {
         );
     }
 
-    /// Companion to the test above: with no explicit OSC 11 SET,
-    /// `TerminalBuilder::subscribe` has already configured Ghostty's
-    /// *default* background from the active theme
-    /// (`sync_ghostty_theme_colors`), so a bare OSC 11 query is answered
-    /// by Ghostty independently with that theme color, exactly once, not
-    /// zero times, and matching `get_color_at_index`'s value exactly (the
-    /// same mapping `terminal_element.rs` uses for `Color::Indexed`
-    /// rendering).
+    // the theme default is configured at construction, so a query gets exactly one answer.
     #[gpui::test]
     async fn test_osc11_color_query_answers_from_synced_theme_default(cx: &mut TestAppContext) {
         init_test(cx);
@@ -7102,16 +6822,7 @@ mod tests {
         );
     }
 
-    /// Ghostty answers OSC 4 palette queries independently unconditionally,
-    /// since its `color_palette()` always resolves to a value (its own
-    /// built-in default if Zed hasn't configured one via
-    /// `sync_ghostty_theme_colors`, which this test deliberately doesn't
-    /// call by skipping `init_test`). So `process_event`'s
-    /// `ColorRequest` handler must never write its own response for the
-    /// 0-255 range whenever a Ghostty backend is present. Pins down that a
-    /// plain palette query produces exactly one response, sourced from
-    /// Ghostty's own `GhosttyEffect::PtyWrite` (routed through
-    /// `process_ghostty_effects`), not two.
+    // Ghostty always answers palette queries, so Zed must never answer them too.
     #[gpui::test]
     async fn test_osc4_palette_query_answered_once_by_ghostty(cx: &mut TestAppContext) {
         let terminal = cx.new(|cx| {
@@ -8062,7 +7773,7 @@ mod tests {
 
         assert_content_eventually(&terminal, "done", cx).await;
 
-        // Now try to kill, should be a no-op since task already completed
+        // killing a completed task is a no-op.
         terminal.update(cx, |term, _cx| {
             term.kill_active_task();
         });
