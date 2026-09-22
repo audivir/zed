@@ -274,8 +274,10 @@ impl GhosttyTerminal {
     /// this function rather than reading `scrollbar().offset` directly.
     pub(super) fn alacritty_style_display_offset(&self) -> Result<usize> {
         let scrollbar = self.terminal.scrollbar()?;
-        Ok((scrollbar.total.saturating_sub(scrollbar.len))
-            .saturating_sub(scrollbar.offset) as usize)
+        Ok(
+            (scrollbar.total.saturating_sub(scrollbar.len)).saturating_sub(scrollbar.offset)
+                as usize,
+        )
     }
 
     pub(super) fn content_metadata(
@@ -343,10 +345,7 @@ impl GhosttyTerminal {
             },
             point: cursor_viewport
                 .map(|cursor| {
-                    crate::Point::new(
-                        cursor.y as i32 - display_offset as i32,
-                        cursor.x as usize,
-                    )
+                    crate::Point::new(cursor.y as i32 - display_offset as i32, cursor.x as usize)
                 })
                 .unwrap_or_else(|| crate::Point::new(0, 0)),
         };
@@ -494,7 +493,8 @@ impl GhosttyTerminal {
                 let end = self
                     .terminal
                     .grid_ref(ghostty_viewport_point(display_offset, range.end))?;
-                let selection = libghostty_vt::selection::Selection::new(start, end, range.is_block);
+                let selection =
+                    libghostty_vt::selection::Selection::new(start, end, range.is_block);
                 self.terminal.set_selection(Some(&selection))?;
             }
             None => {
@@ -539,7 +539,10 @@ impl GhosttyTerminal {
 
     /// Derives and installs a word selection at `point`, using Ghostty's own
     /// word-boundary rules (`Terminal::select_word`).
-    pub(super) fn select_word_at(&mut self, point: crate::Point) -> Result<Option<crate::SelectionRange>> {
+    pub(super) fn select_word_at(
+        &mut self,
+        point: crate::Point,
+    ) -> Result<Option<crate::SelectionRange>> {
         let display_offset = self.alacritty_style_display_offset()?;
         let grid_ref = self
             .terminal
@@ -558,14 +561,17 @@ impl GhosttyTerminal {
 
     /// Derives and installs a line selection at `point`, using Ghostty's own
     /// line semantics (`Terminal::select_line`; joins soft-wrapped rows).
-    pub(super) fn select_line_at(&mut self, point: crate::Point) -> Result<Option<crate::SelectionRange>> {
+    pub(super) fn select_line_at(
+        &mut self,
+        point: crate::Point,
+    ) -> Result<Option<crate::SelectionRange>> {
         let display_offset = self.alacritty_style_display_offset()?;
         let grid_ref = self
             .terminal
             .grid_ref(ghostty_viewport_point(display_offset, point))?;
-        let Some(selection) = self.terminal.select_line(
-            libghostty_vt::selection::SelectLineOptions::new(grid_ref),
-        )?
+        let Some(selection) = self
+            .terminal
+            .select_line(libghostty_vt::selection::SelectLineOptions::new(grid_ref))?
         else {
             return Ok(None);
         };
@@ -610,12 +616,16 @@ impl GhosttyTerminal {
             .grid_ref(ghostty_viewport_point(display_offset, drag_point))?;
 
         let word_toward_drag = self.terminal.select_word_between(
-            libghostty_vt::selection::SelectWordBetweenOptions::new(anchor_ref.clone(), drag_ref.clone()),
+            libghostty_vt::selection::SelectWordBetweenOptions::new(
+                anchor_ref.clone(),
+                drag_ref.clone(),
+            ),
         )?;
         let word_toward_anchor = self.terminal.select_word_between(
             libghostty_vt::selection::SelectWordBetweenOptions::new(drag_ref, anchor_ref),
         )?;
-        let (Some(word_toward_drag), Some(word_toward_anchor)) = (word_toward_drag, word_toward_anchor)
+        let (Some(word_toward_drag), Some(word_toward_anchor)) =
+            (word_toward_drag, word_toward_anchor)
         else {
             return Ok(None);
         };
@@ -677,7 +687,8 @@ impl GhosttyTerminal {
         let (Some(anchor_line), Some(drag_line)) = (anchor_line, drag_line) else {
             return Ok(None);
         };
-        let anchor_range = selection_range_from_ghostty(&self.terminal, display_offset, &anchor_line)?;
+        let anchor_range =
+            selection_range_from_ghostty(&self.terminal, display_offset, &anchor_line)?;
         let drag_range = selection_range_from_ghostty(&self.terminal, display_offset, &drag_line)?;
         let start = anchor_range
             .start
@@ -745,7 +756,10 @@ impl GhosttyTerminal {
             if start_char >= points.len() {
                 return None;
             }
-            let end_char = end_char.saturating_sub(1).max(start_char).min(points.len() - 1);
+            let end_char = end_char
+                .saturating_sub(1)
+                .max(start_char)
+                .min(points.len() - 1);
             Some(crate::Range::new(points[start_char], points[end_char]))
         };
 
@@ -853,12 +867,14 @@ impl GhosttyTerminal {
             let row_start = points.len();
 
             for column in 0..cols {
-                let grid_ref = self.terminal.grid_ref(libghostty_vt::terminal::Point::Screen(
-                    libghostty_vt::terminal::PointCoordinate {
-                        x: column as u16,
-                        y: absolute_row as u32,
-                    },
-                ))?;
+                let grid_ref = self
+                    .terminal
+                    .grid_ref(libghostty_vt::terminal::Point::Screen(
+                        libghostty_vt::terminal::PointCoordinate {
+                            x: column as u16,
+                            y: absolute_row as u32,
+                        },
+                    ))?;
                 if column == 0 {
                     row_wrapped = grid_ref.row()?.is_wrapped()?;
                 }
@@ -1024,10 +1040,8 @@ impl GhosttyTerminal {
             0
         };
         if delta != 0 {
-            self.terminal.scroll_viewport(ghostty_scroll(
-                Scroll::Delta(delta),
-                viewport_rows as usize,
-            ));
+            self.terminal
+                .scroll_viewport(ghostty_scroll(Scroll::Delta(delta), viewport_rows as usize));
         }
         Ok(())
     }
@@ -1036,7 +1050,10 @@ impl GhosttyTerminal {
     /// as the mouse wheel or `Scroll::PageUp`/`PageDown`/`Top`/`Bottom`, so
     /// it roughly stays in the same relative viewport position instead of
     /// scrolling out from under the user. No-ops if vi mode isn't enabled.
-    pub(super) fn update_vi_cursor_for_scroll(&mut self, scroll: Scroll) -> Result<Option<crate::Point>> {
+    pub(super) fn update_vi_cursor_for_scroll(
+        &mut self,
+        scroll: Scroll,
+    ) -> Result<Option<crate::Point>> {
         let Some(current) = self.current_vi_cursor else {
             return Ok(None);
         };
@@ -1047,11 +1064,15 @@ impl GhosttyTerminal {
             Scroll::PageUp => self.vi_cursor_scroll(&grid, current, viewport_rows)?,
             Scroll::PageDown => self.vi_cursor_scroll(&grid, current, -viewport_rows)?,
             Scroll::Top => {
-                let column = grid.first_occupied_in_line(grid.topmost_row())?.unwrap_or(0);
+                let column = grid
+                    .first_occupied_in_line(grid.topmost_row())?
+                    .unwrap_or(0);
                 grid.to_point(grid.topmost_row(), column)
             }
             Scroll::Bottom => {
-                let column = grid.first_occupied_in_line(grid.bottommost_row())?.unwrap_or(0);
+                let column = grid
+                    .first_occupied_in_line(grid.bottommost_row())?
+                    .unwrap_or(0);
                 grid.to_point(grid.bottommost_row(), column)
             }
         };
@@ -1233,7 +1254,6 @@ impl GhosttyTerminal {
 
         Ok(placements)
     }
-
 }
 
 /// Decodes a Kitty graphics image's stored pixel data to RGBA8, inflating it
@@ -1401,8 +1421,7 @@ pub(super) fn spawn_pty(
                 while batch.len() < MAX_PTY_PARSE_BATCH_BYTES {
                     match output_rx.try_recv() {
                         Ok(chunk) => {
-                            if batch.len().saturating_add(chunk.len()) > MAX_PTY_PARSE_BATCH_BYTES
-                            {
+                            if batch.len().saturating_add(chunk.len()) > MAX_PTY_PARSE_BATCH_BYTES {
                                 pending_chunk = Some(chunk);
                                 break;
                             }
@@ -1437,9 +1456,9 @@ pub(super) fn spawn_pty(
                 Ok(mut child) => {
                     let status = child.wait().ok().map(portable_pty_exit_status);
                     let event = match status {
-                        Some(status) => PtyEvent::Event(crate::TerminalBackendEvent::ChildExit(
-                            status,
-                        )),
+                        Some(status) => {
+                            PtyEvent::Event(crate::TerminalBackendEvent::ChildExit(status))
+                        }
                         None => PtyEvent::Event(crate::TerminalBackendEvent::Exit),
                     };
                     if events_tx.unbounded_send(event).is_err() {
@@ -1481,10 +1500,15 @@ pub(super) fn spawn_pty(
     let child = pair.slave.spawn_command(command)?;
     let process_id = child.process_id().unwrap_or_default();
     #[cfg(windows)]
-    let handle = child.as_raw_handle().map(|handle| handle as i32).unwrap_or(-1);
+    let handle = child
+        .as_raw_handle()
+        .map(|handle| handle as i32)
+        .unwrap_or(-1);
     #[cfg(not(windows))]
     let handle = master.as_raw_fd().unwrap_or(-1);
-    let info = Arc::new(PtyProcessInfo::new(ProcessIdGetter::new(handle, process_id)));
+    let info = Arc::new(PtyProcessInfo::new(ProcessIdGetter::new(
+        handle, process_id,
+    )));
     if child_tx.send(child).is_err() {
         anyhow::bail!("ghostty PTY reader stopped before child handle was delivered");
     }
@@ -1668,7 +1692,10 @@ fn color_from_style_color(color: StyleColor, default: vte::ansi::NamedColor) -> 
 /// Converts a Zed `Point` (viewport-relative once `display_offset` is added,
 /// per `terminal_element.rs`'s `to_highlighted_range_lines` convention) into
 /// Ghostty's `Point::Viewport` space.
-fn ghostty_viewport_point(display_offset: usize, point: crate::Point) -> libghostty_vt::terminal::Point {
+fn ghostty_viewport_point(
+    display_offset: usize,
+    point: crate::Point,
+) -> libghostty_vt::terminal::Point {
     libghostty_vt::terminal::Point::Viewport(libghostty_vt::terminal::PointCoordinate {
         x: point.column.min(u16::MAX as usize) as u16,
         y: (point.line + display_offset as i32).max(0) as u32,
@@ -1682,7 +1709,10 @@ fn zed_point_from_viewport_coordinate(
     display_offset: usize,
     coordinate: libghostty_vt::terminal::PointCoordinate,
 ) -> crate::Point {
-    crate::Point::new(coordinate.y as i32 - display_offset as i32, coordinate.x as usize)
+    crate::Point::new(
+        coordinate.y as i32 - display_offset as i32,
+        coordinate.x as usize,
+    )
 }
 
 /// Converts a freshly-derived `Selection` snapshot (from `select_word`/
@@ -1699,10 +1729,16 @@ fn selection_range_from_ghostty(
     selection: &libghostty_vt::selection::Selection<'_>,
 ) -> Result<crate::SelectionRange> {
     let start = terminal
-        .point_from_grid_ref(&selection.start(), libghostty_vt::terminal::PointSpace::Viewport)?
+        .point_from_grid_ref(
+            &selection.start(),
+            libghostty_vt::terminal::PointSpace::Viewport,
+        )?
         .context("selection start not representable in viewport space")?;
     let end = terminal
-        .point_from_grid_ref(&selection.end(), libghostty_vt::terminal::PointSpace::Viewport)?
+        .point_from_grid_ref(
+            &selection.end(),
+            libghostty_vt::terminal::PointSpace::Viewport,
+        )?
         .context("selection end not representable in viewport space")?;
     Ok(crate::SelectionRange {
         start: zed_point_from_viewport_coordinate(display_offset, start),
@@ -1733,7 +1769,9 @@ fn hyperlink_uri_at_point(
     if len == 0 {
         return Ok(None);
     }
-    Ok(Some(String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned()))
+    Ok(Some(
+        String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned(),
+    ))
 }
 
 /// Walks from `point` by one column at a time in `direction` (`-1` or `1`),
@@ -1817,12 +1855,14 @@ impl<'a> ViGrid<'a> {
     }
 
     fn grid_ref(&self, absolute_row: i64, column: i64) -> Result<screen::GridRef<'a>> {
-        Ok(self.terminal.grid_ref(libghostty_vt::terminal::Point::Screen(
-            libghostty_vt::terminal::PointCoordinate {
-                x: column.clamp(0, self.last_column()) as u16,
-                y: absolute_row.clamp(self.topmost_row(), self.bottommost_row()) as u32,
-            },
-        ))?)
+        Ok(self
+            .terminal
+            .grid_ref(libghostty_vt::terminal::Point::Screen(
+                libghostty_vt::terminal::PointCoordinate {
+                    x: column.clamp(0, self.last_column()) as u16,
+                    y: absolute_row.clamp(self.topmost_row(), self.bottommost_row()) as u32,
+                },
+            ))?)
     }
 
     fn char_at(&self, absolute_row: i64, column: i64) -> Result<char> {
@@ -2122,15 +2162,14 @@ fn ghostty_word_motion(
 fn ghostty_bracket_motion(grid: &ViGrid<'_>, row: i64, col: i64) -> Result<(i64, i64)> {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let character = grid.char_at(row, col)?;
-    let (open, close, direction) = if let Some(&(open, close)) =
-        PAIRS.iter().find(|(open, _)| *open == character)
-    {
-        (open, close, 1i64)
-    } else if let Some(&(open, close)) = PAIRS.iter().find(|(_, close)| *close == character) {
-        (open, close, -1i64)
-    } else {
-        return Ok((row, col));
-    };
+    let (open, close, direction) =
+        if let Some(&(open, close)) = PAIRS.iter().find(|(open, _)| *open == character) {
+            (open, close, 1i64)
+        } else if let Some(&(open, close)) = PAIRS.iter().find(|(_, close)| *close == character) {
+            (open, close, -1i64)
+        } else {
+            return Ok((row, col));
+        };
 
     let mut depth: i32 = 1;
     let (mut r, mut c) = (row, col);
@@ -2391,7 +2430,10 @@ mod tests {
         );
         assert_eq!(terminal.vi_cursor(), Some(after_delta));
 
-        let after_top = terminal.update_vi_cursor_for_scroll(Scroll::Top).unwrap().unwrap();
+        let after_top = terminal
+            .update_vi_cursor_for_scroll(Scroll::Top)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             after_top.line, -18,
             "Top should land on the very first row (line 0; each of the 20 written lines \
@@ -2447,10 +2489,20 @@ mod tests {
         terminal.toggle_vi_mode().unwrap();
         terminal.vi_goto_point(crate::Point::new(2, 1)).unwrap();
 
-        let point = terminal.vi_motion(ViMotion::FirstOccupied).unwrap().unwrap();
-        assert_eq!(point, crate::Point::new(2, 0), "'z' is the first occupied cell of row 2");
+        let point = terminal
+            .vi_motion(ViMotion::FirstOccupied)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            point,
+            crate::Point::new(2, 0),
+            "'z' is the first occupied cell of row 2"
+        );
 
-        let point = terminal.vi_motion(ViMotion::FirstOccupied).unwrap().unwrap();
+        let point = terminal
+            .vi_motion(ViMotion::FirstOccupied)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             point,
             crate::Point::new(0, 1),
@@ -2616,7 +2668,11 @@ mod tests {
         let regex = regex::Regex::new("needle").unwrap();
         let matches = terminal.search_matches(&regex).unwrap();
 
-        assert_eq!(matches.len(), 1, "expected the match to span the wrap boundary");
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected the match to span the wrap boundary"
+        );
         assert_eq!(matches[0].start(), crate::Point::new(0, 8));
         assert_eq!(matches[0].end(), crate::Point::new(1, 3));
     }
@@ -2668,7 +2724,12 @@ mod tests {
 
         for column in 6..=9 {
             let (uri, is_url, range) = terminal
-                .hyperlink_at(crate::Point::new(0, column), &url_regex, &path_regexes, timeout)
+                .hyperlink_at(
+                    crate::Point::new(0, column),
+                    &url_regex,
+                    &path_regexes,
+                    timeout,
+                )
                 .unwrap()
                 .unwrap_or_else(|| panic!("expected a hyperlink at column {column}"));
             assert_eq!(uri, "https://example.com");
@@ -2758,9 +2819,8 @@ mod tests {
         terminal.resize(test_bounds(60, 2)).unwrap();
         terminal.write(b"error at src/main.rs:42:7: something broke");
         let url_regex = regex::Regex::new("$^").unwrap();
-        let path_regexes = vec![
-            regex::Regex::new(r"(?<path>\S+\.rs):(?<line>[0-9]+):(?<column>[0-9]+)").unwrap(),
-        ];
+        let path_regexes =
+            vec![regex::Regex::new(r"(?<path>\S+\.rs):(?<line>[0-9]+):(?<column>[0-9]+)").unwrap()];
 
         // Column 15 is inside "src/main.rs".
         let (text, is_url, range) = terminal
@@ -2809,7 +2869,10 @@ mod tests {
             .select_line_at(crate::Point::new(0, 3))
             .unwrap()
             .expect("expected a line selection");
-        assert_eq!(terminal.selection_text().unwrap().as_deref(), Some("hello world"));
+        assert_eq!(
+            terminal.selection_text().unwrap().as_deref(),
+            Some("hello world")
+        );
         assert_eq!(range.start.line, 0);
         assert_eq!(range.end.line, 0);
     }
@@ -2820,7 +2883,10 @@ mod tests {
         terminal.resize(test_bounds(20, 2)).unwrap();
         terminal.write(b"hello world\r\nsecond line");
 
-        terminal.select_all().unwrap().expect("expected a selection");
+        terminal
+            .select_all()
+            .unwrap()
+            .expect("expected a selection");
         let text = terminal.selection_text().unwrap().unwrap();
         assert!(text.contains("hello world"));
         assert!(text.contains("second line"));
@@ -2842,7 +2908,10 @@ mod tests {
             .select_word_range(crate::Point::new(0, 4), crate::Point::new(0, 15))
             .unwrap()
             .expect("expected a word-range selection");
-        assert_eq!(terminal.selection_text().unwrap().as_deref(), Some("commit --amend"));
+        assert_eq!(
+            terminal.selection_text().unwrap().as_deref(),
+            Some("commit --amend")
+        );
         assert_eq!(terminal.selection_range(), Some(range));
 
         // Same anchor, drag left onto "git": selection should flip to
@@ -2851,7 +2920,10 @@ mod tests {
             .select_word_range(crate::Point::new(0, 4), crate::Point::new(0, 1))
             .unwrap()
             .expect("expected a word-range selection");
-        assert_eq!(terminal.selection_text().unwrap().as_deref(), Some("git commit"));
+        assert_eq!(
+            terminal.selection_text().unwrap().as_deref(),
+            Some("git commit")
+        );
         assert_eq!(terminal.selection_range(), Some(range));
     }
 
@@ -3042,7 +3114,10 @@ mod tests {
             .unwrap();
 
         let background = terminal.terminal.bg_color().unwrap().unwrap();
-        assert_eq!((background.r, background.g, background.b), (0x1E, 0x1E, 0x2E));
+        assert_eq!(
+            (background.r, background.g, background.b),
+            (0x1E, 0x1E, 0x2E)
+        );
         let palette_entry = terminal
             .terminal
             .color_palette()
@@ -3056,7 +3131,11 @@ mod tests {
         terminal.write(b"\x1b]11;rgb:12/34/56\x1b\\");
         let overridden_background = terminal.terminal.bg_color().unwrap().unwrap();
         assert_eq!(
-            (overridden_background.r, overridden_background.g, overridden_background.b),
+            (
+                overridden_background.r,
+                overridden_background.g,
+                overridden_background.b
+            ),
             (0x12, 0x34, 0x56)
         );
     }
@@ -3181,12 +3260,15 @@ mod tests {
             terminal.resize(bounds).unwrap();
 
             let data = base64_encode(&[255u8, 0, 0, 255].repeat((height * height) as usize));
-            terminal.write(
-                format!("\x1b_Ga=T,f=32,s={height},v={height},q=1;{data}\x1b\\").as_bytes(),
-            );
+            terminal
+                .write(format!("\x1b_Ga=T,f=32,s={height},v={height},q=1;{data}\x1b\\").as_bytes());
 
             let placements = terminal.image_placements().unwrap();
-            assert_eq!(placements.len(), 1, "height={height}: expected one placement");
+            assert_eq!(
+                placements.len(),
+                1,
+                "height={height}: expected one placement"
+            );
             assert_eq!(
                 placements[0].grid_rows, expected_rows,
                 "height={height}: expected {expected_rows} rows"
@@ -3230,12 +3312,15 @@ mod tests {
             terminal.resize(bounds).unwrap();
 
             let data = base64_encode(&[255u8, 0, 0, 255].repeat((height * height) as usize));
-            terminal.write(
-                format!("\x1b_Ga=T,f=32,s={height},v={height},q=1;{data}\x1b\\").as_bytes(),
-            );
+            terminal
+                .write(format!("\x1b_Ga=T,f=32,s={height},v={height},q=1;{data}\x1b\\").as_bytes());
 
             let placements = terminal.image_placements().unwrap();
-            assert_eq!(placements.len(), 1, "height={height}: expected one placement");
+            assert_eq!(
+                placements.len(),
+                1,
+                "height={height}: expected one placement"
+            );
             let rounded_cell_height = f32::from(cell_height).round();
             let expected_rows = (height as f32 / rounded_cell_height).ceil() as u32;
             assert_eq!(
@@ -3269,16 +3354,19 @@ mod tests {
         let height = 2000u32; // 2000px = 100 rows
         let width = 2000u32;
         let data = base64_encode(&[255u8, 0, 0, 255].repeat((width * height) as usize));
-        terminal.write(
-            format!("\x1b_Ga=T,f=32,s={width},v={height},q=1;{data}\x1b\\").as_bytes(),
-        );
+        terminal.write(format!("\x1b_Ga=T,f=32,s={width},v={height},q=1;{data}\x1b\\").as_bytes());
 
         let placements = terminal.image_placements().unwrap();
         assert_eq!(placements.len(), 1, "expected 1 placement");
         let p = &placements[0];
         eprintln!(
             "Placement: viewport_row={}, viewport_col={}, grid_rows={}, grid_cols={}, px_w={}, px_h={}",
-            p.viewport_row, p.viewport_column, p.grid_rows, p.grid_columns, p.pixel_width, p.pixel_height
+            p.viewport_row,
+            p.viewport_column,
+            p.grid_rows,
+            p.grid_columns,
+            p.pixel_width,
+            p.pixel_height
         );
     }
 
@@ -3452,8 +3540,7 @@ mod tests {
     }
 
     fn base64_encode(data: &[u8]) -> String {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in data.chunks(3) {
             let b0 = chunk[0];
@@ -3546,7 +3633,9 @@ mod tests {
         /// while writing must stay in this absolute space until everything
         /// is written and a single final `ViGrid` can convert them all
         /// consistently (see `build_terminal_from_test_lines`'s last step).
-        fn cursor_point(terminal: &libghostty_vt::Terminal<'static, 'static>) -> Result<(i64, i64)> {
+        fn cursor_point(
+            terminal: &libghostty_vt::Terminal<'static, 'static>,
+        ) -> Result<(i64, i64)> {
             let grid = ViGrid::new(terminal)?;
             let point = crate::Point::new(
                 terminal.cursor_y().unwrap_or(0) as i32,
@@ -3739,8 +3828,9 @@ mod tests {
             }
 
             if hyperlink_kind == HyperlinkKind::FileIri {
-                let url = url::Url::parse(&iri_or_path)
-                    .unwrap_or_else(|error| panic!("Failed to parse file IRI `{iri_or_path}`: {error}"));
+                let url = url::Url::parse(&iri_or_path).unwrap_or_else(|error| {
+                    panic!("Failed to parse file IRI `{iri_or_path}`: {error}")
+                });
                 let path = url.to_file_path().unwrap_or_else(|_| {
                     panic!("Failed to interpret file IRI `{iri_or_path}` as a path")
                 });
@@ -3759,7 +3849,8 @@ mod tests {
                 .char_at(hovered_point.0, hovered_point.1)
                 .unwrap_or(' ');
             let hovered_point = final_grid.to_point(hovered_point.0, hovered_point.1);
-            let hyperlink_match = final_grid.to_point(hyperlink_match.start().0, hyperlink_match.start().1)
+            let hyperlink_match = final_grid
+                .to_point(hyperlink_match.start().0, hyperlink_match.start().1)
                 ..=final_grid.to_point(hyperlink_match.end().0, hyperlink_match.end().1);
             (
                 terminal,
@@ -3802,16 +3893,14 @@ mod tests {
             // part of that cell's own grapheme cluster rather than
             // dropping it, so the literal building-emoji match must accept
             // it optionally to still match the extracted line text.
-            const MULTIPLE_SAME_LINE_REGEX: &str =
-                r#"(?<link>(?<path>🦀 multiple_same_line 🦀) 🚣(?<line>[0-9]+) 🏛\u{FE0F}?(?<column>[0-9]+)):"#;
+            const MULTIPLE_SAME_LINE_REGEX: &str = r#"(?<link>(?<path>🦀 multiple_same_line 🦀) 🚣(?<line>[0-9]+) 🏛\u{FE0F}?(?<column>[0-9]+)):"#;
             // The two entries `terminal.path_hyperlink_regexes` defaults to
             // in `assets/settings/default.json`, transcribed verbatim (each
             // multi-line entry's array of strings is joined with `\n` by
             // `terminal_settings.rs`, exactly as done here) so this test
             // module doesn't need a `settings` crate dependency just to
             // exercise the real default.
-            const PYTHON_DIAGNOSTIC_REGEX: &str =
-                r#"File "(?<path>[^"]+)", line (?<line>[0-9]+)"#;
+            const PYTHON_DIAGNOSTIC_REGEX: &str = r#"File "(?<path>[^"]+)", line (?<line>[0-9]+)"#;
             const DEFAULT_PATH_REGEX: &str = concat!(
                 "(?x)\n",
                 "(?<path>\n",
@@ -3911,7 +4000,10 @@ mod tests {
                             expected_hyperlink.iri_or_path.as_str(),
                             format_hyperlink_match(&expected_hyperlink.hyperlink_match).as_str()
                         ),
-                        (text.as_str(), format_hyperlink_match(&(range.start()..=range.end())).as_str()),
+                        (
+                            text.as_str(),
+                            format_hyperlink_match(&(range.start()..=range.end())).as_str()
+                        ),
                         "\n    at {source_location}"
                     );
                 }
