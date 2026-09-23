@@ -2410,6 +2410,54 @@ struct PdfSearchKey {
     query: SharedString,
     match_case: bool,
     whole_word: bool,
+    regex: bool,
+}
+
+/// Finds the matches of `query` in the text layer of a page, with one rectangle per line of each
+/// match.
+fn search_text_spans(
+    query: &SearchQuery,
+    page_index: usize,
+    spans: &[PdfTextSpan],
+) -> Vec<PdfSearchResult> {
+    let mut text = String::new();
+    let mut span_starts = Vec::with_capacity(spans.len());
+    for span in spans {
+        span_starts.push(text.len());
+        text.push_str(&span.text);
+    }
+
+    query
+        .search_str(&text)
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .filter_map(|range| {
+            let first = span_starts
+                .partition_point(|&start| start <= range.start)
+                .checked_sub(1)?;
+            let end = span_starts.partition_point(|&start| start < range.end);
+            let mut line_bounds: Vec<Bounds<f32>> = Vec::new();
+            for span in spans.get(first..end)? {
+                let bounds = span.bounds;
+                // generated spaces and line breaks have no area.
+                if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+                    continue;
+                }
+                match line_bounds.last_mut() {
+                    Some(line)
+                        if (bounds.origin.y - line.origin.y).abs() < line.size.height / 2.0 =>
+                    {
+                        *line = line.union(&bounds);
+                    }
+                    _ => line_bounds.push(bounds),
+                }
+            }
+            (!line_bounds.is_empty()).then_some(PdfSearchResult {
+                page_index,
+                bounds: line_bounds,
+            })
+        })
+        .collect()
 }
 
 pub enum PdfViewEvent {
@@ -2887,7 +2935,7 @@ impl SearchableItem for PdfView {
         SearchOptions {
             case: true,
             word: true,
-            regex: false,
+            regex: true,
             replacement: false,
             selection: false,
             select_all: false,
@@ -3016,6 +3064,7 @@ impl SearchableItem for PdfView {
             query: query.as_str().to_string().into(),
             match_case: query.case_sensitive(),
             whole_word: query.whole_word(),
+            regex: query.is_regex(),
         };
 
         if let Some((last_key, last_matches)) = &self.last_search_query
@@ -3028,26 +3077,48 @@ impl SearchableItem for PdfView {
             // debounce the expensive search; typing again drops this task.
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
 
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let key = key.clone();
-                    async move {
-                        crate::pdf_renderer::PdfRenderer::new(
-                            pdf.id,
-                            pdf.bytes.clone(),
-                            pdf.password.clone(),
-                        )
-                        .search_document(
-                            &key.query,
-                            key.match_case,
-                            key.whole_word,
-                            pdf.metadata.clone(),
-                        )
-                        .await
-                    }
-                })
-                .await;
+            let result = if key.regex {
+                // PDFium only searches literal text, so regexes run over the text layer.
+                for page_index in 0..pdf.metadata.page_count {
+                    let task = cx.update(|cx| pdf.clone().request_text_spans(cx, page_index));
+                    task.await;
+                }
+                let pages = (0..pdf.metadata.page_count)
+                    .filter_map(|page_index| {
+                        Some((page_index, pdf.text_spans_for_page(page_index)?))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(cx
+                    .background_spawn(async move {
+                        pages
+                            .iter()
+                            .flat_map(|(page_index, spans)| {
+                                search_text_spans(&query, *page_index, spans)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await)
+            } else {
+                cx.background_executor()
+                    .spawn({
+                        let key = key.clone();
+                        async move {
+                            crate::pdf_renderer::PdfRenderer::new(
+                                pdf.id,
+                                pdf.bytes.clone(),
+                                pdf.password.clone(),
+                            )
+                            .search_document(
+                                &key.query,
+                                key.match_case,
+                                key.whole_word,
+                                pdf.metadata.clone(),
+                            )
+                            .await
+                        }
+                    })
+                    .await
+            };
 
             this.update(cx, |view, cx| match result {
                 Ok(matches) => {
@@ -3759,6 +3830,59 @@ mod tests {
     }
 
     #[test]
+    fn regex_search_maps_matches_to_one_rect_per_line() {
+        // "foo bar" on one line and "baz" on the next, with a generated line break between.
+        let spans = [
+            span("f", 0.0, 0.0, 10.0, 10.0),
+            span("o", 10.0, 0.0, 10.0, 10.0),
+            span("o", 20.0, 0.0, 10.0, 10.0),
+            span(" ", 30.0, 0.0, 10.0, 10.0),
+            span("b", 40.0, 0.0, 10.0, 10.0),
+            span("a", 50.0, 0.0, 10.0, 10.0),
+            span("r", 60.0, 0.0, 10.0, 10.0),
+            span("\n", 0.0, 0.0, 0.0, 0.0),
+            span("b", 0.0, 20.0, 10.0, 10.0),
+            span("a", 10.0, 20.0, 10.0, 10.0),
+            span("z", 20.0, 20.0, 10.0, 10.0),
+        ];
+        let query = |pattern: &str| {
+            SearchQuery::regex(
+                pattern,
+                false,
+                false,
+                false,
+                false,
+                Default::default(),
+                Default::default(),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+
+        let matches = search_text_spans(&query("ba[rz]"), 3, &spans);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].page_index, 3);
+        assert_eq!(
+            matches[0].bounds,
+            vec![span("", 40.0, 0.0, 30.0, 10.0).bounds]
+        );
+        assert_eq!(
+            matches[1].bounds,
+            vec![span("", 0.0, 20.0, 30.0, 10.0).bounds]
+        );
+
+        let across_lines = search_text_spans(&query("bar\\sbaz"), 0, &spans);
+        assert_eq!(
+            across_lines[0].bounds,
+            vec![
+                span("", 40.0, 0.0, 30.0, 10.0).bounds,
+                span("", 0.0, 20.0, 30.0, 10.0).bounds,
+            ]
+        );
+    }
+
+    #[test]
     fn selection_to_text_joins_pages_with_newlines_in_document_order() {
         let page0 = Arc::new(two_line_fixture()); // "HelloWorld" as one span list
         let page1 = Arc::new(vec![span("!", 0.0, 0.0, 10.0, 10.0)]);
@@ -3912,6 +4036,52 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(rendered_inverted(), Some(true));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn regex_search_runs_over_the_text_layer(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/whole_words.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+
+        let search = |pattern: &str, whole_word: bool, cx: &mut gpui::VisualTestContext| {
+            let query = SearchQuery::regex(
+                pattern,
+                whole_word,
+                false,
+                false,
+                false,
+                Default::default(),
+                Default::default(),
+                false,
+                None,
+            )
+            .unwrap();
+            let task = view.update_in(cx, |view, window, cx| {
+                view.find_matches(Arc::new(query), window, cx)
+            });
+            cx.executor().advance_clock(SEARCH_DEBOUNCE);
+            task
+        };
+
+        let matches = search("c\\w+", false, cx).await;
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().all(|found| found.page_index == 0));
+        let matches = search("ca.", true, cx).await;
+        assert_eq!(
+            matches.len(),
+            2,
+            "whole words skip the one inside concatenate"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
