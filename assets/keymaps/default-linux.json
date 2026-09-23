@@ -1632,6 +1632,12 @@
       "pagedown": "pdf_viewer::NextPage",
       "home": "pdf_viewer::FirstPage",
       "end": "pdf_viewer::LastPage",
+      "up": "pdf_viewer::ScrollUp",
+      "down": "pdf_viewer::ScrollDown",
+      "left": "pdf_viewer::ScrollLeft",
+      "right": "pdf_viewer::ScrollRight",
+      "space": "pdf_viewer::ScrollViewportDown",
+      "shift-space": "pdf_viewer::ScrollViewportUp",
     },
   },
   {

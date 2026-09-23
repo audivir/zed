@@ -70,6 +70,18 @@ actions!(
         NextPage,
         /// Goes to the previous page.
         PreviousPage,
+        /// Scrolls up by a line.
+        ScrollUp,
+        /// Scrolls down by a line.
+        ScrollDown,
+        /// Scrolls left by a column.
+        ScrollLeft,
+        /// Scrolls right by a column.
+        ScrollRight,
+        /// Scrolls up by most of the viewport height.
+        ScrollViewportUp,
+        /// Scrolls down by most of the viewport height.
+        ScrollViewportDown,
         /// Goes to the first page.
         FirstPage,
         /// Goes to the last page.
@@ -107,6 +119,10 @@ const THUMBNAIL_ROW_HEIGHT: f32 = 150.0;
 /// do not re-render thumbnails.
 const THUMBNAIL_CACHE_MARGIN: usize = 32;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Distance the arrow keys scroll, in pixels.
+const KEYBOARD_SCROLL_STEP: f32 = 40.0;
+/// Part of the viewport kept in view when scrolling by a viewport, for reading continuity.
+const VIEWPORT_SCROLL_OVERLAP: f32 = 0.1;
 /// Distance to scroll past the edge of the page in single-page mode to flip to the next one.
 const PAGE_FLIP_OVERSCROLL: f32 = 80.0;
 /// Pause in scroll events that ends a gesture, so trackpad momentum flips at most one page.
@@ -1252,6 +1268,60 @@ impl PdfView {
     fn previous_page(&mut self, _: &PreviousPage, _window: &mut Window, cx: &mut Context<Self>) {
         let target = self.current_page.saturating_sub(1);
         self.jump_to_page(target, cx);
+    }
+
+    /// Scrolls by `delta` pixels, where positive values move toward the end of the document.
+    fn scroll_by(&mut self, delta: Point<Pixels>, cx: &mut Context<Self>) {
+        let max_offset = self.scroll_handle.max_offset();
+        let offset = self.scroll_handle.offset();
+        self.scroll_handle.set_offset(Point {
+            x: (offset.x - delta.x).clamp(-max_offset.x, px(0.)),
+            y: (offset.y - delta.y).clamp(-max_offset.y, px(0.)),
+        });
+        cx.notify();
+    }
+
+    fn scroll_up(&mut self, _: &ScrollUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(gpui::point(px(0.), px(-KEYBOARD_SCROLL_STEP)), cx);
+    }
+
+    fn scroll_down(&mut self, _: &ScrollDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(gpui::point(px(0.), px(KEYBOARD_SCROLL_STEP)), cx);
+    }
+
+    fn scroll_left(&mut self, _: &ScrollLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(gpui::point(px(-KEYBOARD_SCROLL_STEP), px(0.)), cx);
+    }
+
+    fn scroll_right(&mut self, _: &ScrollRight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(gpui::point(px(KEYBOARD_SCROLL_STEP), px(0.)), cx);
+    }
+
+    fn viewport_scroll_distance(&self) -> Pixels {
+        self.container_bounds
+            .map_or(px(KEYBOARD_SCROLL_STEP), |bounds| {
+                bounds.size.height * (1.0 - VIEWPORT_SCROLL_OVERLAP)
+            })
+    }
+
+    fn scroll_viewport_up(
+        &mut self,
+        _: &ScrollViewportUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let distance = self.viewport_scroll_distance();
+        self.scroll_by(gpui::point(px(0.), -distance), cx);
+    }
+
+    fn scroll_viewport_down(
+        &mut self,
+        _: &ScrollViewportDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let distance = self.viewport_scroll_distance();
+        self.scroll_by(gpui::point(px(0.), distance), cx);
     }
 
     fn first_page(&mut self, _: &FirstPage, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2868,6 +2938,12 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::zoom_to_actual_size))
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::previous_page))
+            .on_action(cx.listener(Self::scroll_up))
+            .on_action(cx.listener(Self::scroll_down))
+            .on_action(cx.listener(Self::scroll_left))
+            .on_action(cx.listener(Self::scroll_right))
+            .on_action(cx.listener(Self::scroll_viewport_up))
+            .on_action(cx.listener(Self::scroll_viewport_down))
             .on_action(cx.listener(Self::first_page))
             .on_action(cx.listener(Self::last_page))
             .on_action(cx.listener(Self::copy))
@@ -4271,6 +4347,51 @@ mod tests {
         cx.simulate_resize(size(px(400.), px(300.)));
         cx.run_until_parked();
         assert_eq!(zoom_level(cx), zoomed, "a manual zoom ends fitting");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn keyboard_scrolling_moves_by_lines_and_viewports(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, _window, cx| view.restore_view_state(6.0, 0, cx));
+        cx.run_until_parked();
+        let scroll_y = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| -view.scroll_handle.offset().y.as_f32())
+        };
+
+        view.update_in(cx, |view, window, cx| view.scroll_up(&ScrollUp, window, cx));
+        assert_eq!(scroll_y(cx), 0.0, "scrolling stops at the top");
+
+        view.update_in(cx, |view, window, cx| {
+            view.scroll_down(&ScrollDown, window, cx)
+        });
+        assert_eq!(scroll_y(cx), KEYBOARD_SCROLL_STEP);
+
+        let viewport_height = view.read_with(cx, |view, _| {
+            view.container_bounds
+                .expect("view should be laid out")
+                .size
+                .height
+                .as_f32()
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.scroll_viewport_down(&ScrollViewportDown, window, cx)
+        });
+        let expected = KEYBOARD_SCROLL_STEP + viewport_height * (1.0 - VIEWPORT_SCROLL_OVERLAP);
+        assert!((scroll_y(cx) - expected).abs() < 0.01, "{}", scroll_y(cx));
     }
 
     #[allow(clippy::await_holding_lock)]
