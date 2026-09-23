@@ -69,30 +69,45 @@ pub(super) enum GhosttyEffect {
     ClipboardStore(String),
     /// ConEmu OSC 9;4 progress report, where `None` removes the progress.
     Progress(Option<crate::TerminalProgress>),
+    /// iTerm2 OSC 9 or rxvt OSC 777 desktop notification.
+    Notification {
+        title: Option<String>,
+        body: String,
+    },
 }
 
-const PROGRESS_REPORT_PREFIX: &[u8] = b"\x1b]9;4;";
-/// Longest progress report parameters kept while waiting for their terminator.
-const MAX_PROGRESS_REPORT_BYTES: usize = 32;
+/// OSC sequences Ghostty parses but does not report, found by scanning the output directly.
+#[derive(Debug, PartialEq)]
+enum OscReport {
+    Progress(Option<crate::TerminalProgress>),
+    Notification { title: Option<String>, body: String },
+}
 
-/// Finds ConEmu `OSC 9;4` progress reports, which Ghostty parses but does not report.
+const OSC_9_PREFIX: &[u8] = b"\x1b]9;";
+const OSC_777_PREFIX: &[u8] = b"\x1b]777;";
+/// Longest report parameters kept while waiting for their terminator; longer ones are ignored.
+const MAX_OSC_REPORT_BYTES: usize = 1024;
+
+/// Finds OSC 9 and OSC 777 reports in terminal output.
 #[derive(Default)]
-struct ProgressScanner {
+struct OscScanner {
     /// Start of a report cut off by the end of the previous write.
     pending: Vec<u8>,
 }
 
-impl ProgressScanner {
-    fn scan(&mut self, bytes: &[u8], mut report: impl FnMut(Option<crate::TerminalProgress>)) {
+impl OscScanner {
+    fn scan(&mut self, bytes: &[u8], mut report: impl FnMut(OscReport)) {
         let mut offset = 0;
         if !self.pending.is_empty() {
-            let take = bytes.len().min(MAX_PROGRESS_REPORT_BYTES);
+            let take = bytes.len().min(MAX_OSC_REPORT_BYTES);
             let mut joined = std::mem::take(&mut self.pending);
             let pending_len = joined.len();
             joined.extend_from_slice(&bytes[..take]);
             match Self::scan_report(&joined, 0) {
-                ReportScan::Found { end, progress } => {
-                    report(progress);
+                ReportScan::Found { end, report: found } => {
+                    if let Some(found) = found {
+                        report(found);
+                    }
                     offset = end.saturating_sub(pending_len);
                 }
                 ReportScan::Incomplete if take == bytes.len() => {
@@ -106,8 +121,10 @@ impl ProgressScanner {
         while let Some(escape) = bytes[offset..].iter().position(|&byte| byte == 0x1b) {
             let start = offset + escape;
             match Self::scan_report(bytes, start) {
-                ReportScan::Found { end, progress } => {
-                    report(progress);
+                ReportScan::Found { end, report: found } => {
+                    if let Some(found) = found {
+                        report(found);
+                    }
                     offset = end;
                 }
                 ReportScan::Incomplete => {
@@ -122,51 +139,88 @@ impl ProgressScanner {
     /// Parses the report starting at the escape byte at `start`.
     fn scan_report(bytes: &[u8], start: usize) -> ReportScan {
         let rest = &bytes[start..];
-        let prefix_len = rest.len().min(PROGRESS_REPORT_PREFIX.len());
-        if rest[..prefix_len] != PROGRESS_REPORT_PREFIX[..prefix_len] {
-            return ReportScan::NotAReport;
-        }
-        if prefix_len < PROGRESS_REPORT_PREFIX.len() {
-            return ReportScan::Incomplete;
-        }
+        let mut incomplete = false;
+        for prefix in [OSC_9_PREFIX, OSC_777_PREFIX] {
+            let prefix_len = rest.len().min(prefix.len());
+            if rest[..prefix_len] != prefix[..prefix_len] {
+                continue;
+            }
+            if prefix_len < prefix.len() {
+                incomplete = true;
+                continue;
+            }
 
-        let parameters = &rest[PROGRESS_REPORT_PREFIX.len()..];
-        let terminator = parameters
-            .iter()
-            .take(MAX_PROGRESS_REPORT_BYTES)
-            .position(|&byte| byte == 0x07 || byte == 0x1b);
-        let Some(terminator) = terminator else {
-            return if parameters.len() < MAX_PROGRESS_REPORT_BYTES {
-                ReportScan::Incomplete
-            } else {
-                ReportScan::NotAReport
+            let parameters = &rest[prefix.len()..];
+            let terminator = parameters
+                .iter()
+                .take(MAX_OSC_REPORT_BYTES)
+                .position(|&byte| byte == 0x07 || byte == 0x1b);
+            let Some(terminator) = terminator else {
+                return if parameters.len() < MAX_OSC_REPORT_BYTES {
+                    ReportScan::Incomplete
+                } else {
+                    ReportScan::NotAReport
+                };
             };
-        };
-        // ST is `ESC \`, so its second byte may still be in the next write.
-        let terminator_len = if parameters[terminator] == 0x1b { 2 } else { 1 };
-        let end = start + PROGRESS_REPORT_PREFIX.len() + terminator + terminator_len;
-        let Some(progress) = parse_progress(&parameters[..terminator]) else {
-            return ReportScan::NotAReport;
-        };
-        ReportScan::Found {
-            end: end.min(bytes.len()),
-            progress,
+            // ST is `ESC \`, so its second byte may still be in the next write.
+            let terminator_len = if parameters[terminator] == 0x1b { 2 } else { 1 };
+            let end = start + prefix.len() + terminator + terminator_len;
+            let parameters = &parameters[..terminator];
+            let report = if prefix == OSC_9_PREFIX {
+                parse_osc_9(parameters)
+            } else {
+                parse_osc_777(parameters)
+            };
+            return ReportScan::Found {
+                end: end.min(bytes.len()),
+                report,
+            };
+        }
+        if incomplete {
+            ReportScan::Incomplete
+        } else {
+            ReportScan::NotAReport
         }
     }
 }
 
 enum ReportScan {
+    /// A complete sequence ending at `end`, with `None` for ones that report nothing.
     Found {
         end: usize,
-        progress: Option<crate::TerminalProgress>,
+        report: Option<OscReport>,
     },
     Incomplete,
     NotAReport,
 }
 
+/// Parses OSC 9, which ConEmu uses for numbered commands like `4` for progress, and iTerm2 for
+/// notifications with any other text.
+fn parse_osc_9(parameters: &[u8]) -> Option<OscReport> {
+    let text = String::from_utf8_lossy(parameters);
+    let command = text.split(';').next().unwrap_or_default();
+    if !command.is_empty() && command.bytes().all(|byte| byte.is_ascii_digit()) {
+        let arguments = text.strip_prefix("4;")?;
+        return parse_progress(arguments).map(OscReport::Progress);
+    }
+    (!text.trim().is_empty()).then(|| OscReport::Notification {
+        title: None,
+        body: text.into_owned(),
+    })
+}
+
+/// Parses rxvt's `OSC 777;notify;title;body` notification.
+fn parse_osc_777(parameters: &[u8]) -> Option<OscReport> {
+    let text = String::from_utf8_lossy(parameters);
+    let (title, body) = text.strip_prefix("notify;")?.split_once(';')?;
+    (!title.is_empty() || !body.is_empty()).then(|| OscReport::Notification {
+        title: Some(title.to_string()).filter(|title| !title.is_empty()),
+        body: body.to_string(),
+    })
+}
+
 /// Parses the `state;percent` parameters of a progress report.
-fn parse_progress(parameters: &[u8]) -> Option<Option<crate::TerminalProgress>> {
-    let parameters = std::str::from_utf8(parameters).ok()?;
+fn parse_progress(parameters: &str) -> Option<Option<crate::TerminalProgress>> {
     let (state, percent) = match parameters.split_once(';') {
         Some((state, percent)) => (state, Some(percent)),
         None => (parameters, None),
@@ -315,7 +369,7 @@ pub(super) struct GhosttyTerminal {
     current_vi_cursor: Option<crate::Point>,
     /// Buffer text for search, dropped whenever the grid changes.
     search_text: Option<SearchText>,
-    progress_scanner: ProgressScanner,
+    osc_scanner: OscScanner,
     /// Formatted selection text, dropped whenever the grid or the selection changes.
     selection_text: Option<Option<String>>,
     /// Decoded RGBA pixels keyed by image ID, with the image generation they were decoded from.
@@ -425,7 +479,7 @@ impl GhosttyTerminal {
             current_selection: None,
             current_vi_cursor: None,
             search_text: None,
-            progress_scanner: ProgressScanner::default(),
+            osc_scanner: OscScanner::default(),
             selection_text: None,
             decoded_images: collections::HashMap::default(),
             #[cfg(test)]
@@ -438,8 +492,13 @@ impl GhosttyTerminal {
         self.selection_text = None;
         self.terminal.vt_write(bytes);
         let effects = &self.effects;
-        self.progress_scanner.scan(bytes, |progress| {
-            effects.lock().push(GhosttyEffect::Progress(progress));
+        self.osc_scanner.scan(bytes, |report| {
+            effects.lock().push(match report {
+                OscReport::Progress(progress) => GhosttyEffect::Progress(progress),
+                OscReport::Notification { title, body } => {
+                    GhosttyEffect::Notification { title, body }
+                }
+            });
         });
     }
 
@@ -3031,10 +3090,14 @@ mod tests {
         use crate::TerminalProgress;
 
         let scan = |writes: &[&[u8]]| {
-            let mut scanner = ProgressScanner::default();
+            let mut scanner = OscScanner::default();
             let mut reports = Vec::new();
             for write in writes {
-                scanner.scan(write, |progress| reports.push(progress));
+                scanner.scan(write, |report| {
+                    if let OscReport::Progress(progress) = report {
+                        reports.push(progress);
+                    }
+                });
             }
             reports
         };
@@ -3052,8 +3115,8 @@ mod tests {
                 None,
             ]
         );
-        // unknown states and other OSC 9 notifications are not progress.
-        assert_eq!(scan(&[b"\x1b]9;4;7;1\x07\x1b]9;hello\x07"]), vec![]);
+        // unknown states and other ConEmu commands are not progress.
+        assert_eq!(scan(&[b"\x1b]9;4;7;1\x07\x1b]9;1;500\x07"]), vec![]);
 
         let report: &[u8] = b"text \x1b]9;4;1;7\x1b\\ more";
         for split in 0..=report.len() {
@@ -3061,6 +3124,51 @@ mod tests {
             assert_eq!(
                 scan(&[first, second]),
                 vec![Some(TerminalProgress::Normal(7))],
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn notifications_are_found_even_when_split_across_writes() {
+        let scan = |writes: &[&[u8]]| {
+            let mut scanner = OscScanner::default();
+            let mut reports = Vec::new();
+            for write in writes {
+                scanner.scan(write, |report| reports.push(report));
+            }
+            reports
+        };
+        let notification = |title: Option<&str>, body: &str| OscReport::Notification {
+            title: title.map(str::to_string),
+            body: body.to_string(),
+        };
+
+        assert_eq!(
+            scan(&[b"\x1b]9;Build finished\x07\x1b]777;notify;Tests;42 passed\x1b\\"]),
+            vec![
+                notification(None, "Build finished"),
+                notification(Some("Tests"), "42 passed"),
+            ]
+        );
+        // other rxvt extensions, empty notifications, and runaway sequences report nothing.
+        let runaway = [
+            b"\x1b]9;".as_slice(),
+            &[b'a'; 2 * MAX_OSC_REPORT_BYTES],
+            b"\x07",
+        ]
+        .concat();
+        assert_eq!(
+            scan(&[b"\x1b]777;preexec\x07\x1b]9;\x07", &runaway]),
+            vec![]
+        );
+
+        let report: &[u8] = b"$ make\x1b]777;notify;make;done\x07";
+        for split in 0..=report.len() {
+            let (first, second) = report.split_at(split);
+            assert_eq!(
+                scan(&[first, second]),
+                vec![notification(Some("make"), "done")],
                 "split at {split}"
             );
         }

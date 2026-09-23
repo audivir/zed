@@ -1266,6 +1266,21 @@ fn subscribe_for_terminal_events(
                     }
                 }
 
+                Event::Notification { title, body } => {
+                    // like other terminals, notify only while the user is not looking at Zed.
+                    if !window.is_window_active() {
+                        let title = title
+                            .clone()
+                            .unwrap_or_else(|| terminal.read(cx).title(true));
+                        cx.show_system_notification(gpui::SystemNotification {
+                            tag: format!("terminal-{}", terminal.entity_id()).into(),
+                            title: title.into(),
+                            body: body.clone().into(),
+                            actions: Vec::new(),
+                        });
+                    }
+                }
+
                 Event::TitleChanged => {
                     cx.emit(ItemEvent::UpdateTab);
                 }
@@ -3504,6 +3519,62 @@ mod tests {
             terminal.last_content().terminal_bounds.bounds
         });
         (bounds, draw_size)
+    }
+
+    #[gpui::test]
+    async fn test_notifications_reach_the_desktop_only_while_zed_is_inactive(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, workspace) = init_test(cx).await;
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let (_terminal_view, cx) = cx.add_window_view(|window, cx| {
+            TerminalView::new(
+                terminal.clone(),
+                workspace.downgrade(),
+                None,
+                project.downgrade(),
+                window,
+                cx,
+            )
+        });
+        let notify = |title: Option<&str>, cx: &mut VisualTestContext| {
+            terminal.update(cx, |_, cx| {
+                cx.emit(Event::Notification {
+                    title: title.map(str::to_string),
+                    body: "Build finished".to_string(),
+                })
+            });
+            cx.run_until_parked();
+        };
+        // the test platform, like Windows, only delivers notifications for an identified app.
+        cx.update(|window, cx| {
+            cx.set_app_identity("dev.zed.Zed", "Zed");
+            window.activate_window();
+        });
+        cx.run_until_parked();
+
+        notify(Some("make"), cx);
+        assert!(cx.shown_system_notifications().is_empty());
+
+        cx.deactivate_window();
+        notify(Some("make"), cx);
+        notify(None, cx);
+        let shown = cx.shown_system_notifications();
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown[0].title.as_ref(), "make");
+        assert_eq!(shown[0].body.as_ref(), "Build finished");
+        let terminal_title = terminal.read_with(cx, |terminal, _| terminal.title(true));
+        assert_eq!(shown[1].title.as_ref(), terminal_title);
     }
 
     #[gpui::test]

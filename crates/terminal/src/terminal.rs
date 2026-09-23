@@ -896,6 +896,11 @@ pub enum Event {
     SelectionsChanged,
     NewNavigationTarget(Option<MaybeNavigationTarget>),
     Open(MaybeNavigationTarget),
+    /// A program asked for a desktop notification with OSC 9 or OSC 777.
+    Notification {
+        title: Option<String>,
+        body: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1926,6 +1931,9 @@ impl Terminal {
                     cx.write_to_clipboard(ClipboardItem::new_string(data));
                 }
                 ghostty::GhosttyEffect::Progress(progress) => self.set_progress(progress, cx),
+                ghostty::GhosttyEffect::Notification { title, body } => {
+                    cx.emit(Event::Notification { title, body });
+                }
             }
         }
     }
@@ -2418,11 +2426,18 @@ impl Terminal {
             let mut ghostty_guard = ghostty.lock();
             ghostty_guard.write(bytes);
             // drain effects here, since no parser wakeup processes them for this path. Clipboard
-            // writes are dropped, since agent and REPL output must not overwrite the clipboard.
+            // writes and notifications are dropped, since agent and REPL output must not overwrite
+            // the clipboard or reach the desktop.
             let effects = ghostty_guard
                 .take_effects()
                 .into_iter()
-                .filter(|effect| !matches!(effect, ghostty::GhosttyEffect::ClipboardStore(_)))
+                .filter(|effect| {
+                    !matches!(
+                        effect,
+                        ghostty::GhosttyEffect::ClipboardStore(_)
+                            | ghostty::GhosttyEffect::Notification { .. }
+                    )
+                })
                 .collect();
             drop(ghostty_guard);
             self.process_ghostty_effects(effects, cx);
