@@ -67,6 +67,123 @@ pub(super) enum GhosttyEffect {
     TitleChanged(String),
     /// OSC 52 or iTerm2 OSC 1337 clipboard write, normalized to plain text.
     ClipboardStore(String),
+    /// ConEmu OSC 9;4 progress report, where `None` removes the progress.
+    Progress(Option<crate::TerminalProgress>),
+}
+
+const PROGRESS_REPORT_PREFIX: &[u8] = b"\x1b]9;4;";
+/// Longest progress report parameters kept while waiting for their terminator.
+const MAX_PROGRESS_REPORT_BYTES: usize = 32;
+
+/// Finds ConEmu `OSC 9;4` progress reports, which Ghostty parses but does not report.
+#[derive(Default)]
+struct ProgressScanner {
+    /// Start of a report cut off by the end of the previous write.
+    pending: Vec<u8>,
+}
+
+impl ProgressScanner {
+    fn scan(&mut self, bytes: &[u8], mut report: impl FnMut(Option<crate::TerminalProgress>)) {
+        let mut offset = 0;
+        if !self.pending.is_empty() {
+            let take = bytes.len().min(MAX_PROGRESS_REPORT_BYTES);
+            let mut joined = std::mem::take(&mut self.pending);
+            let pending_len = joined.len();
+            joined.extend_from_slice(&bytes[..take]);
+            match Self::scan_report(&joined, 0) {
+                ReportScan::Found { end, progress } => {
+                    report(progress);
+                    offset = end.saturating_sub(pending_len);
+                }
+                ReportScan::Incomplete if take == bytes.len() => {
+                    self.pending = joined;
+                    return;
+                }
+                ReportScan::Incomplete | ReportScan::NotAReport => {}
+            }
+        }
+
+        while let Some(escape) = bytes[offset..].iter().position(|&byte| byte == 0x1b) {
+            let start = offset + escape;
+            match Self::scan_report(bytes, start) {
+                ReportScan::Found { end, progress } => {
+                    report(progress);
+                    offset = end;
+                }
+                ReportScan::Incomplete => {
+                    self.pending = bytes[start..].to_vec();
+                    return;
+                }
+                ReportScan::NotAReport => offset = start + 1,
+            }
+        }
+    }
+
+    /// Parses the report starting at the escape byte at `start`.
+    fn scan_report(bytes: &[u8], start: usize) -> ReportScan {
+        let rest = &bytes[start..];
+        let prefix_len = rest.len().min(PROGRESS_REPORT_PREFIX.len());
+        if rest[..prefix_len] != PROGRESS_REPORT_PREFIX[..prefix_len] {
+            return ReportScan::NotAReport;
+        }
+        if prefix_len < PROGRESS_REPORT_PREFIX.len() {
+            return ReportScan::Incomplete;
+        }
+
+        let parameters = &rest[PROGRESS_REPORT_PREFIX.len()..];
+        let terminator = parameters
+            .iter()
+            .take(MAX_PROGRESS_REPORT_BYTES)
+            .position(|&byte| byte == 0x07 || byte == 0x1b);
+        let Some(terminator) = terminator else {
+            return if parameters.len() < MAX_PROGRESS_REPORT_BYTES {
+                ReportScan::Incomplete
+            } else {
+                ReportScan::NotAReport
+            };
+        };
+        // ST is `ESC \`, so its second byte may still be in the next write.
+        let terminator_len = if parameters[terminator] == 0x1b { 2 } else { 1 };
+        let end = start + PROGRESS_REPORT_PREFIX.len() + terminator + terminator_len;
+        let Some(progress) = parse_progress(&parameters[..terminator]) else {
+            return ReportScan::NotAReport;
+        };
+        ReportScan::Found {
+            end: end.min(bytes.len()),
+            progress,
+        }
+    }
+}
+
+enum ReportScan {
+    Found {
+        end: usize,
+        progress: Option<crate::TerminalProgress>,
+    },
+    Incomplete,
+    NotAReport,
+}
+
+/// Parses the `state;percent` parameters of a progress report.
+fn parse_progress(parameters: &[u8]) -> Option<Option<crate::TerminalProgress>> {
+    let parameters = std::str::from_utf8(parameters).ok()?;
+    let (state, percent) = match parameters.split_once(';') {
+        Some((state, percent)) => (state, Some(percent)),
+        None => (parameters, None),
+    };
+    let percent = percent
+        .filter(|percent| !percent.is_empty())
+        .map(|percent| percent.parse::<u32>().map(|percent| percent.min(100) as u8))
+        .transpose()
+        .ok()?;
+    Some(match state {
+        "0" => None,
+        "1" => Some(crate::TerminalProgress::Normal(percent.unwrap_or(0))),
+        "2" => Some(crate::TerminalProgress::Error(percent)),
+        "3" => Some(crate::TerminalProgress::Indeterminate),
+        "4" => Some(crate::TerminalProgress::Paused(percent)),
+        _ => return None,
+    })
 }
 
 /// Host facts that Ghostty callbacks report back to programs.
@@ -198,6 +315,7 @@ pub(super) struct GhosttyTerminal {
     current_vi_cursor: Option<crate::Point>,
     /// Buffer text for search, dropped whenever the grid changes.
     search_text: Option<SearchText>,
+    progress_scanner: ProgressScanner,
     /// Formatted selection text, dropped whenever the grid or the selection changes.
     selection_text: Option<Option<String>>,
     /// Decoded RGBA pixels keyed by image ID, with the image generation they were decoded from.
@@ -307,6 +425,7 @@ impl GhosttyTerminal {
             current_selection: None,
             current_vi_cursor: None,
             search_text: None,
+            progress_scanner: ProgressScanner::default(),
             selection_text: None,
             decoded_images: collections::HashMap::default(),
             #[cfg(test)]
@@ -318,6 +437,10 @@ impl GhosttyTerminal {
         self.search_text = None;
         self.selection_text = None;
         self.terminal.vt_write(bytes);
+        let effects = &self.effects;
+        self.progress_scanner.scan(bytes, |progress| {
+            effects.lock().push(GhosttyEffect::Progress(progress));
+        });
     }
 
     pub(super) fn clear(&mut self) {
@@ -2904,6 +3027,46 @@ mod tests {
     }
 
     #[test]
+    fn progress_reports_are_found_even_when_split_across_writes() {
+        use crate::TerminalProgress;
+
+        let scan = |writes: &[&[u8]]| {
+            let mut scanner = ProgressScanner::default();
+            let mut reports = Vec::new();
+            for write in writes {
+                scanner.scan(write, |progress| reports.push(progress));
+            }
+            reports
+        };
+
+        assert_eq!(
+            scan(&[b"\x1b[31mbuilding\x1b[0m \x1b]9;4;1;42\x07 done"]),
+            vec![Some(TerminalProgress::Normal(42))]
+        );
+        assert_eq!(
+            scan(&[b"\x1b]9;4;3\x1b\\\x1b]9;4;2;150\x07\x1b]9;4;4\x07\x1b]9;4;0\x07"]),
+            vec![
+                Some(TerminalProgress::Indeterminate),
+                Some(TerminalProgress::Error(Some(100))),
+                Some(TerminalProgress::Paused(None)),
+                None,
+            ]
+        );
+        // unknown states and other OSC 9 notifications are not progress.
+        assert_eq!(scan(&[b"\x1b]9;4;7;1\x07\x1b]9;hello\x07"]), vec![]);
+
+        let report: &[u8] = b"text \x1b]9;4;1;7\x1b\\ more";
+        for split in 0..=report.len() {
+            let (first, second) = report.split_at(split);
+            assert_eq!(
+                scan(&[first, second]),
+                vec![Some(TerminalProgress::Normal(7))],
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
     fn search_matches_spans_a_soft_wrapped_line_boundary() {
         let mut terminal = GhosttyTerminal::new(10, 3, 100).unwrap();
         terminal.resize(test_bounds(10, 3)).unwrap();
@@ -3494,10 +3657,7 @@ mod tests {
             .char_indices()
             .map(|(offset, _)| search_text.point(offset).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            (search_text.text, points),
-            buffer_text_per_cell(&terminal)
-        );
+        assert_eq!((search_text.text, points), buffer_text_per_cell(&terminal));
     }
 
     #[test]

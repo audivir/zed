@@ -38,7 +38,8 @@ use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, MouseInputMode, Paste,
     PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
     ScrollToBottom, ScrollToNextPrompt, ScrollToPreviousPrompt, ScrollToTop, Search,
-    ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
+    ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, TerminalProgress,
+    ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -46,7 +47,7 @@ use terminal_panel::TerminalPanel;
 use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
 use ui::{
-    ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+    CommonAnimationExt as _, ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
@@ -1361,6 +1362,35 @@ impl ScrollbarVisibility for TerminalScrollbarSettingsWrapper {
     }
 }
 
+/// Shows the progress a program in the terminal reports, like the tabs of Ghostty and Windows
+/// Terminal do.
+fn progress_indicator(progress: TerminalProgress) -> AnyElement {
+    let percent_label = |percent: u8, color: Color| {
+        Label::new(format!("{percent}%"))
+            .size(LabelSize::Small)
+            .color(color)
+            .into_any_element()
+    };
+    match progress {
+        TerminalProgress::Normal(percent) => percent_label(percent, Color::Muted),
+        TerminalProgress::Error(Some(percent)) => percent_label(percent, Color::Error),
+        TerminalProgress::Paused(Some(percent)) => percent_label(percent, Color::Warning),
+        TerminalProgress::Error(None) => Icon::new(IconName::XCircle)
+            .size(IconSize::Small)
+            .color(Color::Error)
+            .into_any_element(),
+        TerminalProgress::Paused(None) => Icon::new(IconName::DebugPause)
+            .size(IconSize::Small)
+            .color(Color::Warning)
+            .into_any_element(),
+        TerminalProgress::Indeterminate => Icon::new(IconName::ArrowCircle)
+            .size(IconSize::Small)
+            .color(Color::Muted)
+            .with_rotate_animation(2)
+            .into_any_element(),
+    }
+}
+
 impl TerminalView {
     /// Attempts to process a keystroke in the terminal. Returns true if handled.
     ///
@@ -1635,6 +1665,7 @@ impl Item for TerminalView {
             None => (IconName::Terminal, Color::Muted, None),
         };
 
+        let progress = terminal.progress();
         let self_handle = self.self_handle.clone();
         h_flex()
             .gap_1()
@@ -1702,6 +1733,9 @@ impl Item for TerminalView {
                         )
                     }),
             )
+            .when_some(progress, |this, progress| {
+                this.child(progress_indicator(progress))
+            })
             .into_any()
     }
 

@@ -871,6 +871,20 @@ pub fn insert_zed_terminal_env(
 }
 
 ///Upward flowing events, for changing the title and such
+/// Progress a program reports through ConEmu `OSC 9;4` sequences, shown on the terminal tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalProgress {
+    /// Percentage done.
+    Normal(u8),
+    Error(Option<u8>),
+    Indeterminate,
+    Paused(Option<u8>),
+}
+
+/// Time after the last progress report until the progress is cleared, in case the program that
+/// reported it exited without removing it.
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     TitleChanged,
@@ -1275,6 +1289,8 @@ impl TerminalBuilder {
             init_command_startup_tx: None,
             event_loop_task: Task::ready(Ok(())),
             idle_compression_task: Task::ready(()),
+            progress: None,
+            progress_timeout_task: Task::ready(()),
             background_executor: background_executor.clone(),
             path_style,
             cwd_history: Vec::new(),
@@ -1558,6 +1574,8 @@ impl TerminalBuilder {
                 init_command_startup_tx: None,
                 event_loop_task: Task::ready(Ok(())),
                 idle_compression_task: Task::ready(()),
+                progress: None,
+                progress_timeout_task: Task::ready(()),
                 background_executor,
                 path_style,
                 cwd_history: if is_remote_terminal {
@@ -1721,6 +1739,9 @@ pub struct Terminal {
     event_loop_task: Task<Result<(), anyhow::Error>>,
     /// Compresses the scrollback once output goes idle; replaced after every output batch.
     idle_compression_task: Task<()>,
+    progress: Option<TerminalProgress>,
+    /// Clears `progress` after [`PROGRESS_TIMEOUT`] without reports.
+    progress_timeout_task: Task<()>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
@@ -1904,7 +1925,27 @@ impl Terminal {
                 ghostty::GhosttyEffect::ClipboardStore(data) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(data));
                 }
+                ghostty::GhosttyEffect::Progress(progress) => self.set_progress(progress, cx),
             }
+        }
+    }
+
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        self.progress
+    }
+
+    fn set_progress(&mut self, progress: Option<TerminalProgress>, cx: &mut Context<Self>) {
+        self.progress_timeout_task = if progress.is_some() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(PROGRESS_TIMEOUT).await;
+                this.update(cx, |this, cx| this.set_progress(None, cx)).ok();
+            })
+        } else {
+            Task::ready(())
+        };
+        if self.progress != progress {
+            self.progress = progress;
+            cx.emit(Event::TitleChanged);
         }
     }
 
@@ -3813,6 +3854,7 @@ impl Terminal {
         exit_status: Option<ExitStatus>,
         cx: &mut Context<Terminal>,
     ) {
+        self.set_progress(None, cx);
         if let Some(tx) = &self.completion_tx {
             tx.try_send(exit_status).ok();
         }
@@ -6924,6 +6966,46 @@ mod tests {
             .advance_clock(ghostty::SYNCHRONIZED_OUTPUT_TIMEOUT);
         cx.run_until_parked();
         assert!(rendered_text(cx).contains("second"));
+    }
+
+    #[gpui::test]
+    async fn test_progress_reports_show_until_removed_or_stale(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                Some(10_000),
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let progress =
+            |cx: &mut TestAppContext| terminal.read_with(cx, |terminal, _| terminal.progress());
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;1;30\x07", cx)
+        });
+        assert_eq!(progress(cx), Some(TerminalProgress::Normal(30)));
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;0\x07", cx)
+        });
+        assert_eq!(progress(cx), None);
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b]9;4;3\x07", cx)
+        });
+        cx.executor().advance_clock(PROGRESS_TIMEOUT / 2);
+        cx.run_until_parked();
+        assert_eq!(progress(cx), Some(TerminalProgress::Indeterminate));
+        cx.executor().advance_clock(PROGRESS_TIMEOUT);
+        cx.run_until_parked();
+        assert_eq!(
+            progress(cx),
+            None,
+            "a program that stopped reporting should not keep it"
+        );
     }
 
     #[gpui::test]
