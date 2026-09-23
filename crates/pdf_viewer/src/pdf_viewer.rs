@@ -506,6 +506,14 @@ pub struct PdfView {
     inverted_colors: bool,
     page_flip: PageFlip,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// Fit the zoom follows when the viewport resizes, until the user zooms otherwise.
+    fit_mode: Option<FitMode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FitMode {
+    Page,
+    Width,
 }
 
 /// Scrolling past the edge of the page in single-page mode.
@@ -561,6 +569,7 @@ impl PdfView {
             inverted_colors: false,
             page_flip: PageFlip::default(),
             context_menu: None,
+            fit_mode: None,
         }
     }
 
@@ -642,6 +651,7 @@ impl PdfView {
             inverted_colors: false,
             page_flip: PageFlip::default(),
             context_menu: None,
+            fit_mode: None,
         }
     }
 
@@ -1184,23 +1194,50 @@ impl PdfView {
     }
 
     fn fit_to_view(&mut self, _: &FitToView, _window: &mut Window, cx: &mut Context<Self>) {
-        let pdf = self.pdf(cx);
-        let page_size = (self.current_page < pdf.metadata.page_count)
-            .then(|| self.display_page_size(&pdf, self.current_page));
-        if let Some((bounds, size)) = self.container_bounds.zip(page_size) {
-            let new_zoom = PdfView::compute_fit_to_view_zoom(bounds, size);
-            self.set_zoom(new_zoom, None, cx);
-        }
+        self.fit(FitMode::Page, cx);
     }
 
     fn fit_to_width(&mut self, _: &FitToWidth, _window: &mut Window, cx: &mut Context<Self>) {
+        self.fit(FitMode::Width, cx);
+    }
+
+    /// Zooms to fit the current page and keeps fitting it as the viewport resizes.
+    fn fit(&mut self, mode: FitMode, cx: &mut Context<Self>) {
+        if let Some(bounds) = self.container_bounds
+            && let Some(zoom) = self.fit_zoom(mode, bounds, cx)
+        {
+            self.set_zoom(zoom, None, cx);
+            self.fit_mode = Some(mode);
+        }
+    }
+
+    fn fit_zoom(&self, mode: FitMode, bounds: Bounds<Pixels>, cx: &App) -> Option<f32> {
         let pdf = self.pdf(cx);
-        let page_size = (self.current_page < pdf.metadata.page_count)
-            .then(|| self.display_page_size(&pdf, self.current_page));
-        if let Some((bounds, size)) = self.container_bounds.zip(page_size) {
-            let container_width: f32 = bounds.size.width.into();
-            let scale_x = container_width / size.width;
-            self.set_zoom(scale_x * 0.98, None, cx); // Slight margin to accommodate potential scrollbars
+        let size = (self.current_page < pdf.metadata.page_count)
+            .then(|| self.display_page_size(&pdf, self.current_page))?;
+        Some(match mode {
+            FitMode::Page => PdfView::compute_fit_to_view_zoom(bounds, size),
+            // a slight margin leaves room for a scrollbar.
+            FitMode::Width => bounds.size.width.as_f32() / size.width * 0.98,
+        })
+    }
+
+    /// Re-applies the fit mode when the viewport size changes.
+    fn refit_to_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        let Some(mode) = self.fit_mode else {
+            return;
+        };
+        if self
+            .container_bounds
+            .is_none_or(|previous| previous.size == bounds.size)
+        {
+            return;
+        }
+        if let Some(zoom) = self.fit_zoom(mode, bounds, cx)
+            && (zoom - self.zoom_level).abs() > 0.001
+        {
+            self.set_zoom(zoom, None, cx);
+            self.fit_mode = Some(mode);
         }
     }
 
@@ -1259,6 +1296,7 @@ impl PdfView {
         cx: &mut Context<Self>,
     ) {
         self.new_state = true;
+        self.fit_mode = None;
 
         let old_zoom = self.zoom_level;
 
@@ -1684,6 +1722,8 @@ impl Element for PdfContentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        self.pdf_view
+            .update(cx, |view, cx| view.refit_to_bounds(bounds, cx));
         let (
             do_log,
             pdf,
@@ -2648,6 +2688,7 @@ impl Item for PdfView {
             inverted_colors: self.inverted_colors,
             page_flip: PageFlip::default(),
             context_menu: None,
+            fit_mode: None,
         })))
     }
 
@@ -4187,6 +4228,46 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(view.read_with(cx, |view, _| view.inverted_colors));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn fit_to_width_follows_resizes_until_zoomed_manually(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/solid_red.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        cx.simulate_resize(size(px(400.), px(300.)));
+        cx.run_until_parked();
+        let zoom_level =
+            |cx: &mut gpui::VisualTestContext| view.read_with(cx, |view, _| view.zoom_level);
+
+        view.update_in(cx, |view, window, cx| {
+            view.fit_to_width(&FitToWidth, window, cx)
+        });
+        cx.run_until_parked();
+        let fitted = zoom_level(cx);
+
+        cx.simulate_resize(size(px(800.), px(300.)));
+        cx.run_until_parked();
+        let widened = zoom_level(cx);
+        assert!(
+            widened > fitted * 1.5,
+            "fit to width should follow a wider viewport, went from {fitted} to {widened}"
+        );
+
+        view.update_in(cx, |view, window, cx| view.zoom_in(&ZoomIn, window, cx));
+        let zoomed = zoom_level(cx);
+        cx.simulate_resize(size(px(400.), px(300.)));
+        cx.run_until_parked();
+        assert_eq!(zoom_level(cx), zoomed, "a manual zoom ends fitting");
     }
 
     #[allow(clippy::await_holding_lock)]
