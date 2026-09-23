@@ -2613,7 +2613,10 @@ impl SerializableItem for PdfView {
             cx.update(|window, cx| {
                 Ok(cx.new(|cx| {
                     let mut view = PdfView::new(pdf_item, project, window, cx);
-                    if let Some((zoom_level, current_page, page_offset)) = view_state {
+                    if let Some((zoom_level, current_page, page_offset, inverted_colors)) =
+                        view_state
+                    {
+                        view.inverted_colors = inverted_colors.unwrap_or(false);
                         let current_page = current_page.max(0) as usize;
                         view.restore_view_state(zoom_level as f32, current_page, cx);
                         if let Some((x, y)) = page_offset {
@@ -2662,6 +2665,7 @@ impl SerializableItem for PdfView {
         let position =
             (self.rotation == PageRotation::None).then(|| self.scroll_position_in_page(cx));
         let page_offset = position.map(|position| (position.x as f64, position.y as f64));
+        let inverted_colors = self.inverted_colors;
 
         let db = PdfViewerDb::global(cx);
         Some(cx.background_spawn({
@@ -2671,9 +2675,9 @@ impl SerializableItem for PdfView {
                     item_id,
                     workspace_id,
                     pdf_path,
-                    zoom_level,
-                    current_page,
+                    (zoom_level, current_page),
                     page_offset,
+                    inverted_colors,
                 )
                 .await
             }
@@ -3498,6 +3502,9 @@ mod persistence {
                 ALTER TABLE pdf_viewers ADD COLUMN page_offset_x REAL;
                 ALTER TABLE pdf_viewers ADD COLUMN page_offset_y REAL;
             ),
+            sql!(
+                ALTER TABLE pdf_viewers ADD COLUMN inverted_colors INTEGER;
+            ),
         ];
     }
 
@@ -3511,13 +3518,13 @@ mod persistence {
                 item_id: ItemId,
                 workspace_id: WorkspaceId,
                 pdf_path: PathBuf,
-                zoom_level: f64,
-                current_page: i64,
-                page_offset: Option<(f64, f64)>
+                zoom_level_and_page: (f64, i64),
+                page_offset: Option<(f64, f64)>,
+                inverted_colors: bool
             ) -> Result<()> {
                 INSERT OR REPLACE INTO pdf_viewers
-                    (item_id, workspace_id, pdf_path, zoom_level, current_page, page_offset_x, page_offset_y)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (item_id, workspace_id, pdf_path, zoom_level, current_page, page_offset_x, page_offset_y, inverted_colors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             }
         }
 
@@ -3529,10 +3536,11 @@ mod persistence {
             }
         }
 
-        // returns `(zoom_level, current_page, (page_offset_x, page_offset_y))` if saved.
+        // returns `(zoom_level, current_page, (page_offset_x, page_offset_y), inverted_colors)` if
+        // saved.
         query! {
-            pub fn get_pdf_view_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(f64, i64, Option<(f64, f64)>)>> {
-                SELECT zoom_level, current_page, page_offset_x, page_offset_y
+            pub fn get_pdf_view_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(f64, i64, Option<(f64, f64)>, Option<bool>)>> {
+                SELECT zoom_level, current_page, page_offset_x, page_offset_y, inverted_colors
                 FROM pdf_viewers
                 WHERE item_id = ? AND workspace_id = ?
             }
@@ -4178,25 +4186,32 @@ mod tests {
         let db = cx.update(|cx| PdfViewerDb::global(cx));
         let path = std::path::PathBuf::from("/tmp/document.pdf");
 
-        db.save_pdf_view_state(1, workspace_id, path.clone(), 1.5, 3, Some((12.0, -4.0)))
-            .await
-            .unwrap();
+        db.save_pdf_view_state(
+            1,
+            workspace_id,
+            path.clone(),
+            (1.5, 3),
+            Some((12.0, -4.0)),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             db.get_pdf_path(1, workspace_id).unwrap(),
             Some(path.clone())
         );
         assert_eq!(
             db.get_pdf_view_state(1, workspace_id).unwrap(),
-            Some((1.5, 3, Some((12.0, -4.0))))
+            Some((1.5, 3, Some((12.0, -4.0)), Some(true)))
         );
 
         // views saved while rotated store no offset.
-        db.save_pdf_view_state(1, workspace_id, path, 1.5, 3, None)
+        db.save_pdf_view_state(1, workspace_id, path, (1.5, 3), None, false)
             .await
             .unwrap();
         assert_eq!(
             db.get_pdf_view_state(1, workspace_id).unwrap(),
-            Some((1.5, 3, None))
+            Some((1.5, 3, None, Some(false)))
         );
     }
 
