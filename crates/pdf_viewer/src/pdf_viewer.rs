@@ -472,7 +472,8 @@ pub struct PdfView {
     current_page: usize,
     current_tasks: HashMap<usize, Task<()>>,
     new_state: bool,
-    search_matches: Vec<PdfSearchResult>,
+    /// Shared so that `prepaint` can take the matches every frame without copying them.
+    search_matches: Arc<[PdfSearchResult]>,
     active_match_index: Option<usize>,
     search_token: Option<SearchToken>,
     pub active_jump: Option<(ScrollAnchor, PdfTarget)>,
@@ -539,7 +540,7 @@ impl PdfView {
             current_page: 0,
             current_tasks: Default::default(),
             new_state: false,
-            search_matches: Vec::new(),
+            search_matches: Arc::default(),
             active_match_index: None,
             search_token: None,
             active_jump: None,
@@ -620,7 +621,7 @@ impl PdfView {
             current_page: 0,
             current_tasks: Default::default(),
             new_state: false,
-            search_matches: Vec::new(),
+            search_matches: Arc::default(),
             active_match_index: None,
             search_token: None,
             active_jump: None,
@@ -656,7 +657,7 @@ impl PdfView {
             self.active_match_index = None;
             self.last_search_query = None;
             if had_matches {
-                self.search_matches.clear();
+                self.search_matches = Arc::default();
                 cx.emit(SearchEvent::MatchesInvalidated);
             }
 
@@ -2626,7 +2627,7 @@ impl Item for PdfView {
             current_page: self.current_page,
             current_tasks: Default::default(),
             new_state: false,
-            search_matches: Vec::new(),
+            search_matches: Arc::default(),
             active_match_index: None,
             search_token: None,
             active_jump: None,
@@ -3013,14 +3014,14 @@ impl SearchableItem for PdfView {
 
     fn get_matches(&self, _window: &mut Window, _cx: &mut App) -> (Vec<Self::Match>, SearchToken) {
         (
-            self.search_matches.clone(),
+            self.search_matches.to_vec(),
             self.search_token.unwrap_or_default(),
         )
     }
 
     fn clear_matches(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let had_matches = !self.search_matches.is_empty();
-        self.search_matches.clear();
+        self.search_matches = Arc::default();
         self.active_match_index = None;
         if self.search_error.take().is_some() {
             cx.notify();
@@ -3039,7 +3040,7 @@ impl SearchableItem for PdfView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search_matches = matches.to_vec();
+        self.search_matches = matches.into();
         self.active_match_index = active_match_index;
         self.search_token = Some(token);
         cx.emit(SearchEvent::MatchesInvalidated);
