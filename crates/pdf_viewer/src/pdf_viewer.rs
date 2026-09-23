@@ -2487,6 +2487,13 @@ impl Element for PdfContentElement {
                             if !this.is_selecting_text {
                                 return;
                             }
+                            // the button can be released outside the container, which never
+                            // delivers the mouse-up that ends the drag.
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                this.is_selecting_text = false;
+                                this.pending_click_anchor = None;
+                                return;
+                            }
                             let Some(position) = hit_test_selection_point(
                                 &selection_hit_regions,
                                 event.position,
@@ -5682,6 +5689,34 @@ mod tests {
                 view.text_selection.is_some(),
                 "the drag's selection should survive mouse-up"
             );
+        });
+
+        // a drag whose mouse-up is never delivered, e.g. released outside the window, must not
+        // keep following the mouse.
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: drag_start,
+            modifiers: gpui::Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: drag_end,
+            modifiers: gpui::Modifiers::none(),
+            pressed_button: Some(MouseButton::Left),
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: drag_start,
+            modifiers: gpui::Modifiers::none(),
+            pressed_button: None,
+        });
+        view.update(cx, |view, _cx| {
+            let selection = view
+                .text_selection
+                .as_ref()
+                .expect("the drag's selection should remain");
+            assert_eq!(selection.head.char_index, words[1].start);
+            assert!(!view.is_selecting_text);
         });
     }
 
