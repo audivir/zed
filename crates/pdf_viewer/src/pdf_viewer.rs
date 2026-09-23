@@ -935,11 +935,15 @@ impl PdfView {
 
         // start or reuse a thumbnail render; `on_rendered` re-renders this row.
         let view_weak = cx.entity().downgrade();
-        if let Some(task) = pdf.clone().request_thumbnail(cx, page_idx, move |cx| {
-            if let Some(view) = view_weak.upgrade() {
-                view.update(cx, |_, cx| cx.notify());
-            }
-        }) {
+        let inverted = self.inverted_colors;
+        if let Some(task) = pdf
+            .clone()
+            .request_thumbnail(cx, page_idx, inverted, move |cx| {
+                if let Some(view) = view_weak.upgrade() {
+                    view.update(cx, |_, cx| cx.notify());
+                }
+            })
+        {
             task.detach();
         }
 
@@ -985,7 +989,11 @@ impl PdfView {
                     } else {
                         cx.theme().colors().border
                     })
-                    .bg(gpui::white())
+                    .bg(if inverted {
+                        gpui::black()
+                    } else {
+                        gpui::white()
+                    })
                     .when_some(thumbnail, |this, data| {
                         this.child(img(data.image.clone()).size_full())
                     }),

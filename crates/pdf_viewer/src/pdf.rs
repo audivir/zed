@@ -257,14 +257,25 @@ impl Pdf {
         }))
     }
 
-    /// Requests a thumbnail render of `page_idx` at `THUMBNAIL_SCALE`.
+    /// Requests a thumbnail render of `page_idx` at `THUMBNAIL_SCALE`, with inverted lightness
+    /// if `inverted`.
     pub fn request_thumbnail(
         self: Arc<Self>,
         cx: &mut App,
         page_idx: usize,
+        inverted: bool,
         on_rendered: impl FnOnce(&mut App) + Send + 'static,
     ) -> Option<Task<()>> {
-        if self.thumbnail_cache.read().contains_key(&page_idx) {
+        let style = RenderStyle {
+            inverted,
+            ..RenderStyle::default()
+        };
+        if self
+            .thumbnail_cache
+            .read()
+            .get(&page_idx)
+            .is_some_and(|thumbnail| thumbnail.style == style)
+        {
             return None;
         }
         if self.failed_thumbnails.lock().contains(&page_idx) {
@@ -292,7 +303,7 @@ impl Pdf {
                             page_idx,
                             THUMBNAIL_SCALE,
                             0.0,
-                            RenderStyle::default(),
+                            style,
                             None,
                             pdf.metadata.clone(),
                         )
@@ -720,7 +731,7 @@ mod tests {
         let rendered = Arc::new(AtomicBool::new(false));
         let rendered_in_callback = rendered.clone();
         let task = cx.update(|cx| {
-            pdf.clone().request_thumbnail(cx, 0, move |_| {
+            pdf.clone().request_thumbnail(cx, 0, false, move |_| {
                 rendered_in_callback.store(true, Ordering::SeqCst)
             })
         });
@@ -732,11 +743,17 @@ mod tests {
         // thumbnails do not touch the main page cache.
         assert!(!pdf.page_cache.read().contains_key(&0));
 
-        let second = cx.update(|cx| pdf.clone().request_thumbnail(cx, 0, |_| {}));
+        let second = cx.update(|cx| pdf.clone().request_thumbnail(cx, 0, false, |_| {}));
         assert!(
             second.is_none(),
             "expected a cached thumbnail to short-circuit rather than re-render"
         );
+
+        let inverted = cx.update(|cx| pdf.clone().request_thumbnail(cx, 0, true, |_| {}));
+        inverted
+            .expect("a thumbnail in another style should render again")
+            .await;
+        assert!(pdf.thumbnail_cache.read()[&0].style.inverted);
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -754,7 +771,7 @@ mod tests {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
         let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
         for page_idx in 0..2 {
-            let task = cx.update(|cx| pdf.clone().request_thumbnail(cx, page_idx, |_| {}));
+            let task = cx.update(|cx| pdf.clone().request_thumbnail(cx, page_idx, false, |_| {}));
             task.expect("uncached thumbnail should render").await;
         }
 
