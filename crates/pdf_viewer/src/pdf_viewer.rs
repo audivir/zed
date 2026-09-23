@@ -834,9 +834,17 @@ impl PdfView {
         };
         let pdf = self.pdf(cx);
         let page_index = self.current_page;
+        let directory = match &self.source {
+            PdfSource::Item(item) => item
+                .read(cx)
+                .abs_path(cx)
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+            PdfSource::Memory(_) => None,
+        }
+        .unwrap_or_default();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |_window, cx| {
-                DocumentPropertiesModal::new(&pdf, page_index, cx)
+                DocumentPropertiesModal::new(pdf, page_index, directory, cx)
             });
         });
     }

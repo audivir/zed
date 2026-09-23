@@ -208,6 +208,15 @@ pub struct DocumentMetadata {
     /// Whether opening failed because a password is missing or wrong.
     pub needs_password: bool,
     pub properties: DocumentProperties,
+    /// Files embedded in the document, in the order `PdfRenderer::attachment_bytes` indexes them.
+    pub attachments: Vec<PdfAttachmentInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfAttachmentInfo {
+    pub name: String,
+    /// Size of the embedded file in bytes.
+    pub size: usize,
 }
 
 /// Descriptive fields of the document information dictionary, with empty ones left out.
@@ -315,6 +324,7 @@ impl DocumentMetadata {
             error,
             needs_password: false,
             properties: DocumentProperties::default(),
+            attachments: Vec::new(),
         }
     }
 
@@ -332,6 +342,7 @@ impl DocumentMetadata {
             error: Some(error.to_string()),
             needs_password: true,
             properties: DocumentProperties::default(),
+            attachments: Vec::new(),
         }
     }
 }
@@ -599,6 +610,14 @@ impl PdfRenderer {
             error: None,
             needs_password: false,
             properties: DocumentProperties::from_document(document),
+            attachments: document
+                .attachments()
+                .iter()
+                .map(|attachment| PdfAttachmentInfo {
+                    name: attachment.name(),
+                    size: attachment.len(),
+                })
+                .collect(),
         };
 
         Ok(metadata)
@@ -957,6 +976,24 @@ impl PdfRenderer {
         Ok(text_spans)
     }
 
+    /// Returns the contents of the embedded file at `index` in `DocumentMetadata::attachments`.
+    pub async fn attachment_bytes(&self, index: usize) -> Result<Vec<u8>> {
+        let mut pdfium_state = lock_pdfium_state().await?;
+        let document = open_document(
+            &mut pdfium_state,
+            self.id,
+            &self.pdf_bytes,
+            self.password.as_deref(),
+        )
+        .map_err(|e| anyhow!("Failed to read PDF bytes: {:?}", e))?;
+        let index = u16::try_from(index)?;
+        document
+            .attachments()
+            .get(index)
+            .and_then(|attachment| attachment.save_to_bytes())
+            .map_err(|e| anyhow!("Failed to read attachment {index}: {:?}", e))
+    }
+
     /// Searches the document for `query`.
     pub async fn search_document(
         &self,
@@ -1116,6 +1153,31 @@ mod tests {
         assert_eq!(format_pdf_date("D:2024"), "2024");
         assert_eq!(format_pdf_date("D:202401"), "2024-01");
         assert_eq!(format_pdf_date("yesterday"), "yesterday");
+    }
+
+    #[test]
+    fn embedded_files_are_listed_and_readable() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (id, bytes) = fixture("embedded_attachment.pdf");
+        evict_document(id);
+        let renderer = PdfRenderer::new(id, bytes, None);
+
+        let metadata =
+            futures::executor::block_on(renderer.get_metadata(None)).expect("fixture should open");
+        let contents = b"hello from an attachment\n";
+        assert_eq!(
+            metadata.attachments,
+            vec![PdfAttachmentInfo {
+                name: "notes.txt".to_string(),
+                size: contents.len(),
+            }]
+        );
+        let attachment = futures::executor::block_on(renderer.attachment_bytes(0))
+            .expect("attachment should be readable");
+        assert_eq!(attachment, contents);
+        assert!(futures::executor::block_on(renderer.attachment_bytes(1)).is_err());
+
+        evict_document(id);
     }
 
     #[test]
