@@ -3507,7 +3507,17 @@ impl Render for PdfViewToolbarControls {
         }
 
         let max_digits = page_count.to_string().len().max(1);
-        let input_width = px(10.0 + (max_digits as f32 * 8.0));
+        // a single-line editor draws in the UI font at 0.875rem regardless of the container's text
+        // size, so measure its digits. One extra digit leaves room for the cursor, and 10px
+        // covers the padding and border.
+        let ui_font = ThemeSettings::get_global(cx).ui_font.clone();
+        let font_size = rems(0.875).to_pixels(window.rem_size());
+        let text_system = window.text_system();
+        let digit_width = text_system
+            .advance(text_system.resolve_font(&ui_font), font_size, '0')
+            .map(|advance| advance.width)
+            .unwrap_or(font_size);
+        let input_width = digit_width * (max_digits + 1) as f32 + px(10.0);
 
         let zoom_percentage: SharedString =
             format!("{}%", (zoom_level * 100.0).round() as i32).into();
