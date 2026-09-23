@@ -19,7 +19,12 @@ use language::File as _;
 use persistence::PdfViewerDb;
 use project::{Project, ProjectPath, search::SearchQuery};
 use settings::{SeedQuerySetting, Settings};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    ops::RangeInclusive,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use theme_settings::ThemeSettings;
 use ui::{Banner, FluentBuilder as _, ScrollAxes, Severity, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
@@ -88,6 +93,10 @@ const THUMBNAIL_ROW_HEIGHT: f32 = 150.0;
 /// do not re-render thumbnails.
 const THUMBNAIL_CACHE_MARGIN: usize = 32;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Distance to scroll past the edge of the page in single-page mode to flip to the next one.
+const PAGE_FLIP_OVERSCROLL: f32 = 80.0;
+/// Pause in scroll events that ends a gesture, so trackpad momentum flips at most one page.
+const PAGE_FLIP_GESTURE_GAP: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub enum PdfSource {
@@ -114,7 +123,7 @@ pub enum ViewMode {
     Continuous,
     /// Only `current_page` is shown, and navigation goes page by page.
     ///
-    /// Manual scrolling is not clamped to the current page.
+    /// Scrolling stays within the current page, and scrolling past its edge flips the page.
     SinglePage,
 }
 
@@ -478,6 +487,16 @@ pub struct PdfView {
     view_mode: ViewMode,
     /// View-only page rotation, not persisted.
     rotation: PageRotation,
+    page_flip: PageFlip,
+}
+
+/// Scrolling past the edge of the page in single-page mode.
+#[derive(Default)]
+struct PageFlip {
+    overscroll: f32,
+    last_scroll_at: Option<Instant>,
+    /// Set after a flip until the gesture ends.
+    flipped: bool,
 }
 
 impl PdfView {
@@ -521,6 +540,7 @@ impl PdfView {
             suppress_initial_fit_to_view: false,
             view_mode: ViewMode::Continuous,
             rotation: PageRotation::None,
+            page_flip: PageFlip::default(),
         }
     }
 
@@ -599,6 +619,7 @@ impl PdfView {
             suppress_initial_fit_to_view: false,
             view_mode: ViewMode::Continuous,
             rotation: PageRotation::None,
+            page_flip: PageFlip::default(),
         }
     }
 
@@ -1181,11 +1202,12 @@ impl PdfView {
         let doc_y = -offset.y + center_y;
 
         let gap = px(PAGE_GAP);
+        let laid_out_pages = self.laid_out_pages(page_count);
         let mut current_top = px(0.0);
-        let mut target_page = page_count.saturating_sub(1);
+        let mut target_page = laid_out_pages.end.saturating_sub(1);
         let mut local_y = px(0.0);
 
-        for i in 0..page_count {
+        for i in laid_out_pages.clone() {
             let page_height = px(self.display_page_size(&pdf, i).height * old_zoom);
             if doc_y < current_top + page_height + gap {
                 target_page = i;
@@ -1196,7 +1218,7 @@ impl PdfView {
         }
 
         let mut new_current_top = px(0.0);
-        for i in 0..target_page {
+        for i in laid_out_pages.start..target_page {
             new_current_top += px(self.display_page_size(&pdf, i).height * self.zoom_level) + gap;
         }
 
@@ -1221,8 +1243,106 @@ impl PdfView {
         self.jump_to_page(page_index, cx);
     }
 
+    /// Tracks scrolling in single-page mode and flips the page once the scrolling goes far
+    /// enough past the edge of the current one.
+    ///
+    /// `delta_y` is positive when scrolling up, like `ScrollWheelEvent` deltas. Returns whether
+    /// the page flipped.
+    fn scroll_single_page(
+        &mut self,
+        delta_y: f32,
+        touch_phase: gpui::TouchPhase,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let pdf = self.pdf(cx);
+        let Some(viewport) = self.container_bounds else {
+            return false;
+        };
+        let Some(range) = single_page_scroll_range(
+            &pdf,
+            self.current_page,
+            self.zoom_level,
+            self.rotation,
+            viewport.size.height.as_f32(),
+        ) else {
+            return false;
+        };
+
+        let gesture_started = touch_phase == gpui::TouchPhase::Started
+            || self
+                .page_flip
+                .last_scroll_at
+                .is_none_or(|last| now.saturating_duration_since(last) > PAGE_FLIP_GESTURE_GAP);
+        self.page_flip.last_scroll_at = Some(now);
+        if gesture_started {
+            self.page_flip = PageFlip {
+                last_scroll_at: Some(now),
+                ..PageFlip::default()
+            };
+        }
+
+        let scroll_y = -self.scroll_handle.offset().y.as_f32();
+        let at_edge = (delta_y < 0.0 && scroll_y >= *range.end() - 0.5)
+            || (delta_y > 0.0 && scroll_y <= *range.start() + 0.5);
+        let overscroll = if at_edge { -delta_y } else { 0.0 };
+        if overscroll == 0.0 {
+            self.page_flip.overscroll = 0.0;
+            return false;
+        }
+        if self.page_flip.flipped {
+            return false;
+        }
+        if overscroll.signum() != self.page_flip.overscroll.signum() {
+            self.page_flip.overscroll = 0.0;
+        }
+        self.page_flip.overscroll += overscroll;
+        if self.page_flip.overscroll.abs() < PAGE_FLIP_OVERSCROLL {
+            return false;
+        }
+
+        self.page_flip.overscroll = 0.0;
+        if overscroll > 0.0 {
+            if self.current_page + 1 < pdf.metadata.page_count {
+                self.page_flip.flipped = true;
+                self.jump_to_page(self.current_page + 1, cx);
+            }
+        } else if let Some(previous_page) = self.current_page.checked_sub(1) {
+            self.page_flip.flipped = true;
+            // going back lands on the end of the previous page, where reading left off.
+            if let Some(previous_range) = single_page_scroll_range(
+                &pdf,
+                previous_page,
+                self.zoom_level,
+                self.rotation,
+                viewport.size.height.as_f32(),
+            ) {
+                let mut offset = self.scroll_handle.offset();
+                offset.y = px(-previous_range.end());
+                self.scroll_handle.set_offset(offset);
+            }
+            self.current_page = previous_page;
+            cx.notify();
+        }
+        self.page_flip.flipped
+    }
+
+    /// Returns the pages laid out in the scrolled content, which is only the shown page in
+    /// single-page mode.
+    fn laid_out_pages(&self, page_count: usize) -> std::ops::Range<usize> {
+        match self.view_mode {
+            ViewMode::Continuous => 0..page_count,
+            ViewMode::SinglePage => self.current_page..(self.current_page + 1).min(page_count),
+        }
+    }
+
     /// Returns the on-screen top of a page in the scrolled document, in pixels.
+    ///
+    /// In single-page mode a page is laid out alone once shown, so its top is always 0.
     fn page_top(&self, pdf: &Pdf, page_index: usize) -> f32 {
+        if self.view_mode == ViewMode::SinglePage {
+            return 0.0;
+        }
         (0..page_index)
             .map(|index| self.display_page_size(pdf, index).height * self.zoom_level + PAGE_GAP)
             .sum()
@@ -1285,13 +1405,8 @@ impl PdfView {
             return; // out of bounds
         }
 
-        let mut total_y_offset = 0.0;
         let zoom = self.zoom_level;
-
-        // sum the heights and gaps of all pages before the target page.
-        for page_index in 0..target.page_index {
-            total_y_offset += self.display_page_size(&pdf, page_index).height * zoom + PAGE_GAP;
-        }
+        let mut total_y_offset = self.page_top(&pdf, target.page_index);
 
         // add the offset within the target page.
         let point = self.display_target_point(&pdf, &target);
@@ -1351,11 +1466,14 @@ impl PdfView {
             return;
         }
 
-        let zoom = self.zoom_level;
-        let mut target_y = 0.0;
-        for page_index in 0..target.page_index {
-            target_y += self.display_page_size(&pdf, page_index).height * zoom + PAGE_GAP;
+        // single-page mode must switch pages even when the target sits where the viewport is.
+        if self.view_mode == ViewMode::SinglePage && target.page_index != self.current_page {
+            self.jump_to_target(target, mode, cx);
+            return;
         }
+
+        let zoom = self.zoom_level;
+        let mut target_y = self.page_top(&pdf, target.page_index);
         let point = self.display_target_point(&pdf, &target);
         target_y += point.y * zoom;
         let target_x = point.x * zoom;
@@ -1490,6 +1608,25 @@ impl Element for PdfContentElement {
 
         let gap = px(PAGE_GAP);
 
+        // the scroll container clamps the offset too, but only after the hit regions below were
+        // placed with the unclamped one.
+        if view_mode == ViewMode::SinglePage
+            && let Some(range) = single_page_scroll_range(
+                &pdf,
+                current_page,
+                zoom_level,
+                rotation,
+                bounds.size.height.as_f32(),
+            )
+        {
+            let mut offset = scroll_handle.offset();
+            let scroll_y = (-offset.y.as_f32()).clamp(*range.start(), *range.end());
+            if scroll_y != -offset.y.as_f32() {
+                offset.y = px(-scroll_y);
+                scroll_handle.set_offset(offset);
+            }
+        }
+
         let scroll_x = scroll_handle.offset().x.abs();
         let scroll_y = scroll_handle.offset().y.abs();
         let viewport_top = scroll_y;
@@ -1559,7 +1696,7 @@ impl Element for PdfContentElement {
                 .update(cx, |this, cx| this.clear_stale_pdf(cx));
         }
 
-        if current_page != best_page {
+        if current_page != best_page && view_mode == ViewMode::Continuous {
             let view = self.pdf_view.clone();
             view.update(cx, |this, _| {
                 this.current_page = best_page;
@@ -2113,13 +2250,25 @@ impl Element for PdfContentElement {
         window.on_mouse_event({
             let pdf_view = self.pdf_view.downgrade();
             move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase != DispatchPhase::Capture
-                    || !(event.modifiers.control || event.modifiers.platform)
-                    || !bounds.contains(&event.position)
-                {
+                if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
                     return;
                 }
                 let delta = f32::from(event.delta.pixel_delta(window.line_height()).y);
+                if !(event.modifiers.control || event.modifiers.platform) {
+                    let now = cx.background_executor().now();
+                    let flipped = pdf_view
+                        .update(cx, |this, cx| {
+                            this.view_mode == ViewMode::SinglePage
+                                && this.scroll_single_page(delta, event.touch_phase, now, cx)
+                        })
+                        .log_err()
+                        .unwrap_or(false);
+                    // the flip already moved the viewport, so the new page does not scroll too.
+                    if flipped {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 let zoom_factor = if delta > 0.0 {
                     1.0 + delta * 0.01
                 } else {
@@ -2153,6 +2302,20 @@ impl Element for PdfContentElement {
 
         element.paint(window, cx);
     }
+}
+
+/// Returns the vertical scroll offsets that keep `page_index` in view in single-page mode, where
+/// it is the only page laid out.
+fn single_page_scroll_range(
+    pdf: &Pdf,
+    page_index: usize,
+    zoom: f32,
+    rotation: PageRotation,
+    viewport_height: f32,
+) -> Option<RangeInclusive<f32>> {
+    let page = pdf.metadata.pages.get(page_index)?;
+    let height = rotation.display_size(page.size).height * zoom;
+    Some(0.0..=(height - viewport_height).max(0.0))
 }
 
 pub enum PdfViewEvent {
@@ -2287,6 +2450,7 @@ impl Item for PdfView {
             suppress_initial_fit_to_view: false,
             view_mode: ViewMode::Continuous,
             rotation: PageRotation::None,
+            page_flip: PageFlip::default(),
         })))
     }
 
@@ -4310,6 +4474,120 @@ mod tests {
         });
         cx.run_until_parked();
         assert!((zoom_level(cx) - 0.75).abs() < 0.001, "{}", zoom_level(cx));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn single_page_view_stays_on_the_page_and_flips_once_per_gesture(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.restore_view_state(6.0, 0, cx);
+            view.toggle_single_page_view(&ToggleSinglePageView, window, cx);
+        });
+        cx.run_until_parked();
+
+        let position = cx
+            .debug_bounds("pdf-page-0")
+            .unwrap_or_else(|| panic!("page 0 should be laid out"))
+            .center();
+        let scroll = |cx: &mut gpui::VisualTestContext, delta_y: f32, phase: gpui::TouchPhase| {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta_y))),
+                touch_phase: phase,
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        };
+        let state = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                let viewport = view.container_bounds.expect("view should be laid out");
+                let range = single_page_scroll_range(
+                    &view.pdf(cx),
+                    view.current_page,
+                    view.zoom_level,
+                    view.rotation,
+                    viewport.size.height.as_f32(),
+                )
+                .expect("current page should exist");
+                (
+                    view.current_page,
+                    -view.scroll_handle.offset().y.as_f32(),
+                    range,
+                )
+            })
+        };
+
+        // one long gesture, as a trackpad fling with momentum sends.
+        scroll(cx, -40.0, gpui::TouchPhase::Started);
+        for _ in 0..200 {
+            scroll(cx, -40.0, gpui::TouchPhase::Moved);
+            let (page, scroll_y, range) = state(cx);
+            assert!(
+                range.contains(&scroll_y),
+                "page {page} scrolled to {scroll_y}, outside {range:?}"
+            );
+        }
+        let (page, _, range) = state(cx);
+        assert_eq!(
+            page, 1,
+            "scrolling past the end should flip to the next page"
+        );
+        assert!(
+            *range.end() > 0.0,
+            "the page should be taller than the viewport to exercise scrolling within it"
+        );
+
+        // the same gesture turning around must not flip back.
+        for _ in 0..200 {
+            scroll(cx, 40.0, gpui::TouchPhase::Moved);
+        }
+        let (page, scroll_y, range) = state(cx);
+        assert_eq!(page, 1, "a gesture flips at most one page");
+        assert_eq!(scroll_y, *range.start());
+
+        cx.executor().advance_clock(PAGE_FLIP_GESTURE_GAP * 2);
+        for _ in 0..2 {
+            scroll(cx, 40.0, gpui::TouchPhase::Moved);
+        }
+        let (page, scroll_y, range) = state(cx);
+        assert_eq!(page, 0, "a new gesture should flip back");
+        assert_eq!(
+            scroll_y,
+            *range.end(),
+            "flipping back should land on the end of the previous page"
+        );
+
+        // offsets are relative to the shown page, since it is the only one laid out.
+        let target = PdfTarget {
+            page_index: 1,
+            point: Point { x: 0.0, y: 15.0 },
+            block_bottom_y: None,
+            line_height: None,
+        };
+        let target_y = view.update(cx, |view, cx| {
+            view.jump_to_target(target.clone(), ScrollMode::Top, cx);
+            view.display_target_point(&view.pdf(cx), &target).y
+        });
+        cx.run_until_parked();
+        let (page, scroll_y, _) = state(cx);
+        assert_eq!(page, 1);
+        assert_eq!(scroll_y, target_y * 6.0 - DEFAULT_OFFSET);
     }
 
     #[allow(clippy::await_holding_lock)]
