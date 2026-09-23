@@ -2396,15 +2396,12 @@ impl Element for PdfContentElement {
                     if m.page_index == page_idx {
                         let is_active = Some(match_idx) == active_match;
 
+                        // the colors of Chrome's PDF viewer. A border would cover the glyph edges,
+                        // since the boxes end exactly at descenders.
                         let bg_color = if is_active {
-                            gpui::rgba(0xff990066) // Active Match (Orange-ish)
+                            gpui::rgba(0xff963299)
                         } else {
-                            gpui::rgba(0xffff0044) // Inactive Match (Yellow-ish)
-                        };
-                        let border_color = if is_active {
-                            gpui::rgba(0xff9900ff)
-                        } else {
-                            gpui::rgba(0xffff0088)
+                            gpui::rgba(0xffff0066)
                         };
 
                         for bound in &m.bounds {
@@ -2417,10 +2414,7 @@ impl Element for PdfContentElement {
                                     .left(bound.origin.x)
                                     .w(bound.size.width)
                                     .h(bound.size.height)
-                                    .bg(bg_color)
-                                    .border_1()
-                                    .border_color(border_color)
-                                    .rounded_sm(),
+                                    .bg(bg_color),
                             );
                         }
                     }
