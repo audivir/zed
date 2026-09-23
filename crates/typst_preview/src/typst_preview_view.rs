@@ -665,6 +665,17 @@ impl TypstPreviewView {
 
             this.set_editor(active_editor, window, cx);
 
+            // diagnostics come from this preview, so they go away with it. Deferred, since the
+            // view is often released while its workspace is being updated.
+            cx.on_release(|this, cx| {
+                let workspace = this.workspace.clone();
+                let mut published_paths = std::mem::take(&mut this.published_diagnostic_paths);
+                cx.defer(move |cx| {
+                    publish_project_diagnostics(&workspace, None, &[], &mut published_paths, cx);
+                });
+            })
+            .detach();
+
             // observe the workspace to react to typing in included files.
             if let Some(workspace_ent) = &workspace_handle.upgrade() {
                 let mut editors_to_observe = Vec::new();
@@ -1791,6 +1802,71 @@ mod tests {
         assert!(published_paths.is_empty());
         let summary = project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx));
         assert_eq!((summary.error_count, summary.warning_count), (0, 0));
+    }
+
+    #[gpui::test]
+    async fn closing_the_preview_clears_its_diagnostics(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/root"),
+            serde_json::json!({ "main.typ": "Hello #undefined_variable" }),
+        )
+        .await;
+        let project = project::Project::test(fs, [util::path!("/root").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from(util::path!("/root/main.typ")),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        let preview = workspace.update_in(cx, |workspace, window, cx| {
+            TypstPreviewView::create_typst_view(workspace, editor, false, window, cx)
+        });
+        let error_count = |cx: &mut gpui::VisualTestContext| {
+            project.read_with(cx, |project, cx| {
+                project.diagnostic_summary(false, cx).error_count
+            })
+        };
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if error_count(cx) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(error_count(cx), 1, "the compile error should be published");
+
+        drop(preview);
+        // release observers run when the app next flushes its effects.
+        cx.update(|_, _| {});
+        cx.run_until_parked();
+        assert_eq!(
+            error_count(cx),
+            0,
+            "closing the preview should clear its diagnostics"
+        );
     }
 
     #[test]
