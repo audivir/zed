@@ -455,7 +455,7 @@ pub struct PdfView {
     source: PdfSource,
     stale_pdf: Option<Arc<Pdf>>,
     stale_page_cache: HashMap<usize, PageData>,
-    last_search_query: Option<(SharedString, bool, Vec<PdfSearchResult>)>,
+    last_search_query: Option<(PdfSearchKey, Vec<PdfSearchResult>)>,
     /// Error of the last failed search, shown until the next search succeeds or is cleared.
     search_error: Option<SharedString>,
     project: Option<Entity<Project>>,
@@ -2363,6 +2363,14 @@ fn single_page_scroll_range(
     Some(0.0..=(height - viewport_height).max(0.0))
 }
 
+/// Query and options of a document search, to reuse its results when repeated.
+#[derive(Clone, PartialEq)]
+struct PdfSearchKey {
+    query: SharedString,
+    match_case: bool,
+    whole_word: bool,
+}
+
 pub enum PdfViewEvent {
     TitleChanged,
     MatchesInvalidated,
@@ -2831,7 +2839,7 @@ impl SearchableItem for PdfView {
     fn supported_options(&self) -> SearchOptions {
         SearchOptions {
             case: true,
-            word: false,
+            word: true,
             regex: false,
             replacement: false,
             selection: false,
@@ -2957,12 +2965,14 @@ impl SearchableItem for PdfView {
         cx: &mut Context<Self>,
     ) -> Task<Vec<Self::Match>> {
         let pdf = self.pdf(cx);
-        let search_string: SharedString = query.as_str().to_string().into();
-        let match_case = query.case_sensitive();
+        let key = PdfSearchKey {
+            query: query.as_str().to_string().into(),
+            match_case: query.case_sensitive(),
+            whole_word: query.whole_word(),
+        };
 
-        if let Some((last_query, last_case, last_matches)) = &self.last_search_query
-            && last_query == &search_string
-            && *last_case == match_case
+        if let Some((last_key, last_matches)) = &self.last_search_query
+            && last_key == &key
         {
             return Task::ready(last_matches.clone());
         }
@@ -2971,24 +2981,31 @@ impl SearchableItem for PdfView {
             // debounce the expensive search; typing again drops this task.
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
 
-            let search_string_bg = search_string.to_string();
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    crate::pdf_renderer::PdfRenderer::new(
-                        pdf.id,
-                        pdf.bytes.clone(),
-                        pdf.password.clone(),
-                    )
-                    .search_document(&search_string_bg, match_case, pdf.metadata.clone())
-                    .await
+                .spawn({
+                    let key = key.clone();
+                    async move {
+                        crate::pdf_renderer::PdfRenderer::new(
+                            pdf.id,
+                            pdf.bytes.clone(),
+                            pdf.password.clone(),
+                        )
+                        .search_document(
+                            &key.query,
+                            key.match_case,
+                            key.whole_word,
+                            pdf.metadata.clone(),
+                        )
+                        .await
+                    }
                 })
                 .await;
 
             this.update(cx, |view, cx| match result {
                 Ok(matches) => {
                     view.search_error = None;
-                    view.last_search_query = Some((search_string, match_case, matches.clone()));
+                    view.last_search_query = Some((key, matches.clone()));
                     cx.notify();
                     matches
                 }
@@ -3820,7 +3837,9 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.current_page), 1);
 
-        view.update_in(cx, |view, window, cx| view.first_page(&FirstPage, window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.first_page(&FirstPage, window, cx)
+        });
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.current_page), 0);
     }

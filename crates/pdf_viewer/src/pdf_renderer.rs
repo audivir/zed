@@ -1013,6 +1013,7 @@ impl PdfRenderer {
         &self,
         query: &str,
         match_case: bool,
+        whole_word: bool,
         metadata: Arc<DocumentMetadata>,
     ) -> Result<Vec<PdfSearchResult>> {
         let start = Instant::now();
@@ -1028,7 +1029,9 @@ impl PdfRenderer {
         .map_err(|e| anyhow!("Failed to read PDF bytes: {:?}", e))?;
 
         let mut results = Vec::new();
-        let search_options = PdfSearchOptions::new().match_case(match_case);
+        let search_options = PdfSearchOptions::new()
+            .match_case(match_case)
+            .match_whole_word(whole_word);
 
         for (page_index, page) in document.pages().iter().enumerate() {
             let Some(page_metadata) = metadata.pages.get(page_index) else {
@@ -1167,6 +1170,32 @@ mod tests {
         assert_eq!(format_pdf_date("D:2024"), "2024");
         assert_eq!(format_pdf_date("D:202401"), "2024-01");
         assert_eq!(format_pdf_date("yesterday"), "yesterday");
+    }
+
+    #[test]
+    fn whole_word_search_skips_matches_inside_longer_words() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (id, bytes) = fixture("whole_words.pdf");
+        evict_document(id);
+        let renderer = PdfRenderer::new(id, bytes, None);
+        let metadata = Arc::new(
+            futures::executor::block_on(renderer.get_metadata(None)).expect("fixture should open"),
+        );
+
+        let search = |whole_word| {
+            futures::executor::block_on(renderer.search_document(
+                "cat",
+                false,
+                whole_word,
+                metadata.clone(),
+            ))
+            .expect("search should succeed")
+            .len()
+        };
+        assert_eq!(search(false), 3);
+        assert_eq!(search(true), 2);
+
+        evict_document(id);
     }
 
     #[test]
