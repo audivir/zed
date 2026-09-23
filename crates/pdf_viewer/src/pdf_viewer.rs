@@ -84,6 +84,9 @@ const DEFAULT_OFFSET: f32 = 40.0;
 const PRERENDER_PAGES: usize = 3;
 const THUMBNAIL_SIDEBAR_WIDTH: f32 = 140.0;
 const THUMBNAIL_ROW_HEIGHT: f32 = 150.0;
+/// Thumbnail rows kept rendered on each side of the visible ones, so short scrolls in the sidebar
+/// do not re-render thumbnails.
+const THUMBNAIL_CACHE_MARGIN: usize = 32;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
@@ -829,6 +832,10 @@ impl PdfView {
                     "pdf-thumbnails-list",
                     page_count,
                     cx.processor(move |view, range: std::ops::Range<usize>, window, cx| {
+                        view.pdf(cx).evict_thumbnails_outside(
+                            range.start.saturating_sub(THUMBNAIL_CACHE_MARGIN)
+                                ..range.end + THUMBNAIL_CACHE_MARGIN,
+                        );
                         range
                             .map(|page_idx| view.render_thumbnail_row(page_idx, window, cx))
                             .collect::<Vec<_>>()

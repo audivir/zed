@@ -360,6 +360,14 @@ impl Pdf {
         self.text_only_cache.write().extend(reused_text);
     }
 
+    /// Drops thumbnails of pages outside `pages`, so scrolling through the thumbnails of a long
+    /// document does not keep every one of them in memory.
+    pub fn evict_thumbnails_outside(&self, pages: std::ops::Range<usize>) {
+        self.thumbnail_cache
+            .write()
+            .retain(|page_idx, _| pages.contains(page_idx));
+    }
+
     /// Returns the text spans of `page_idx` from `page_cache` or `text_only_cache`.
     pub fn text_spans_for_page(&self, page_idx: usize) -> Option<Arc<Vec<PdfTextSpan>>> {
         if let Some(data) = self.page_cache.read().get(&page_idx) {
@@ -727,6 +735,36 @@ mod tests {
         assert!(
             second.is_none(),
             "expected a cached thumbnail to short-circuit rather than re-render"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn thumbnails_outside_the_kept_range_are_evicted(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        for page_idx in 0..2 {
+            let task = cx.update(|cx| pdf.clone().request_thumbnail(cx, page_idx, |_| {}));
+            task.expect("uncached thumbnail should render").await;
+        }
+
+        pdf.evict_thumbnails_outside(1..2);
+        assert_eq!(
+            pdf.thumbnail_cache
+                .read()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
         );
     }
 
