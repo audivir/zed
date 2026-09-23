@@ -2159,8 +2159,6 @@ impl Element for PdfContentElement {
                 .w(width)
                 .h(height)
                 .bg(cx.theme().colors().panel_background)
-                .border_1()
-                .border_color(cx.theme().colors().border)
                 .shadow_sm()
                 .relative()
                 .debug_selector(|| format!("pdf-page-{page_idx}"))
@@ -2457,6 +2455,18 @@ impl Element for PdfContentElement {
                         .rounded_xs(),
                 );
             }
+
+            // a border on the page itself would inset the image by its width and scale the bitmap
+            // down, blurring it.
+            child_element = child_element.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .border_1()
+                    .border_color(cx.theme().colors().border),
+            );
 
             children.push(child_element);
             current_render_top += height + gap;
