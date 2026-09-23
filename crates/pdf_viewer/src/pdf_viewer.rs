@@ -1179,6 +1179,43 @@ impl PdfView {
         self.jump_to_page(page_index, cx);
     }
 
+    /// Returns the on-screen top of a page in the scrolled document, in pixels.
+    fn page_top(&self, pdf: &Pdf, page_index: usize) -> f32 {
+        (0..page_index)
+            .map(|index| self.display_page_size(pdf, index).height * self.zoom_level + PAGE_GAP)
+            .sum()
+    }
+
+    /// Returns the viewport scroll position relative to the top-left corner of the current
+    /// page, in points, so it survives zoom changes.
+    pub fn scroll_position_in_page(&self, cx: &App) -> Point<f32> {
+        let pdf = self.pdf(cx);
+        let offset = self.scroll_handle.offset();
+        Point {
+            x: -offset.x.as_f32() / self.zoom_level,
+            y: (-offset.y.as_f32() - self.page_top(&pdf, self.current_page)) / self.zoom_level,
+        }
+    }
+
+    /// Scrolls so the viewport starts at a position relative to the top-left corner of a page,
+    /// as returned by [`Self::scroll_position_in_page`].
+    pub fn scroll_to_position_in_page(
+        &mut self,
+        page_index: usize,
+        position: Point<f32>,
+        cx: &mut Context<Self>,
+    ) {
+        let pdf = self.pdf(cx);
+        if page_index >= pdf.metadata.page_count {
+            return;
+        }
+        let y = (self.page_top(&pdf, page_index) + position.y * self.zoom_level).max(0.0);
+        let x = (position.x * self.zoom_level).max(0.0);
+        self.scroll_handle.set_offset(gpui::point(px(-x), px(-y)));
+        self.current_page = page_index;
+        cx.notify();
+    }
+
     /// Scrolls to the top of a page.
     pub fn jump_to_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
         // the page point that lands in the top-left corner of the rotated page.
@@ -2283,12 +2320,19 @@ impl SerializableItem for PdfView {
             cx.update(|window, cx| {
                 Ok(cx.new(|cx| {
                     let mut view = PdfView::new(pdf_item, project, window, cx);
-                    if let Some((zoom_level, current_page)) = view_state {
-                        view.restore_view_state(
-                            zoom_level as f32,
-                            current_page.max(0) as usize,
-                            cx,
-                        );
+                    if let Some((zoom_level, current_page, page_offset)) = view_state {
+                        let current_page = current_page.max(0) as usize;
+                        view.restore_view_state(zoom_level as f32, current_page, cx);
+                        if let Some((x, y)) = page_offset {
+                            view.scroll_to_position_in_page(
+                                current_page,
+                                Point {
+                                    x: x as f32,
+                                    y: y as f32,
+                                },
+                                cx,
+                            );
+                        }
                     }
                     view
                 }))
@@ -2321,13 +2365,24 @@ impl SerializableItem for PdfView {
         let pdf_path = pdf_item.read(cx).abs_path(cx)?;
         let zoom_level = self.zoom_level as f64;
         let current_page = self.current_page as i64;
+        // rotation is not persisted, so positions on a rotated page would not match on restore.
+        let position =
+            (self.rotation == PageRotation::None).then(|| self.scroll_position_in_page(cx));
+        let page_offset = position.map(|position| (position.x as f64, position.y as f64));
 
         let db = PdfViewerDb::global(cx);
         Some(cx.background_spawn({
             async move {
                 log::debug!("Saving pdf at path {pdf_path:?}");
-                db.save_pdf_view_state(item_id, workspace_id, pdf_path, zoom_level, current_page)
-                    .await
+                db.save_pdf_view_state(
+                    item_id,
+                    workspace_id,
+                    pdf_path,
+                    zoom_level,
+                    current_page,
+                    page_offset,
+                )
+                .await
             }
         }))
     }
@@ -3075,6 +3130,10 @@ mod persistence {
                 ALTER TABLE pdf_viewers ADD COLUMN zoom_level REAL;
                 ALTER TABLE pdf_viewers ADD COLUMN current_page INTEGER;
             ),
+            sql!(
+                ALTER TABLE pdf_viewers ADD COLUMN page_offset_x REAL;
+                ALTER TABLE pdf_viewers ADD COLUMN page_offset_y REAL;
+            ),
         ];
     }
 
@@ -3089,11 +3148,12 @@ mod persistence {
                 workspace_id: WorkspaceId,
                 pdf_path: PathBuf,
                 zoom_level: f64,
-                current_page: i64
+                current_page: i64,
+                page_offset: Option<(f64, f64)>
             ) -> Result<()> {
                 INSERT OR REPLACE INTO pdf_viewers
-                    (item_id, workspace_id, pdf_path, zoom_level, current_page)
-                VALUES (?, ?, ?, ?, ?)
+                    (item_id, workspace_id, pdf_path, zoom_level, current_page, page_offset_x, page_offset_y)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             }
         }
 
@@ -3105,10 +3165,10 @@ mod persistence {
             }
         }
 
-        // returns `(zoom_level, current_page)` if saved.
+        // returns `(zoom_level, current_page, (page_offset_x, page_offset_y))` if saved.
         query! {
-            pub fn get_pdf_view_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(f64, i64)>> {
-                SELECT zoom_level, current_page
+            pub fn get_pdf_view_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(f64, i64, Option<(f64, f64)>)>> {
+                SELECT zoom_level, current_page, page_offset_x, page_offset_y
                 FROM pdf_viewers
                 WHERE item_id = ? AND workspace_id = ?
             }
@@ -3595,6 +3655,77 @@ mod tests {
                 "expected the selection to cover the whole two-page document, not just \
                  whatever page(s) happened to already be rendered on initial layout"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn view_state_round_trips_through_the_database(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let workspace_db = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+        let workspace_id = workspace_db.next_id().await.unwrap();
+        let db = cx.update(|cx| PdfViewerDb::global(cx));
+        let path = std::path::PathBuf::from("/tmp/document.pdf");
+
+        db.save_pdf_view_state(1, workspace_id, path.clone(), 1.5, 3, Some((12.0, -4.0)))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_pdf_path(1, workspace_id).unwrap(),
+            Some(path.clone())
+        );
+        assert_eq!(
+            db.get_pdf_view_state(1, workspace_id).unwrap(),
+            Some((1.5, 3, Some((12.0, -4.0))))
+        );
+
+        // views saved while rotated store no offset.
+        db.save_pdf_view_state(1, workspace_id, path, 1.5, 3, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_pdf_view_state(1, workspace_id).unwrap(),
+            Some((1.5, 3, None))
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn scroll_position_in_page_survives_a_zoom_change(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        cx.run_until_parked();
+
+        let position = Point { x: 12.0, y: 150.0 };
+        view.update_in(cx, |view, _window, cx| {
+            view.restore_view_state(2.0, 1, cx);
+            view.scroll_to_position_in_page(1, position, cx);
+            assert_eq!(view.current_page, 1);
+            let saved = view.scroll_position_in_page(cx);
+            assert!((saved.x - position.x).abs() < 0.01 && (saved.y - position.y).abs() < 0.01);
+
+            // a restore at another zoom level lands on the same spot of the page.
+            view.restore_view_state(3.0, 1, cx);
+            view.scroll_to_position_in_page(1, saved, cx);
+            let restored = view.scroll_position_in_page(cx);
+            assert!(
+                (restored.x - position.x).abs() < 0.01 && (restored.y - position.y).abs() < 0.01,
+                "{restored:?}"
+            );
+            let page_size = view.display_page_size(&pdf, 0);
+            let expected_scroll_y = page_size.height * 3.0 + PAGE_GAP + position.y * 3.0;
+            assert!((-view.scroll_handle.offset().y.as_f32() - expected_scroll_y).abs() < 0.01);
         });
     }
 
