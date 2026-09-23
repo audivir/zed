@@ -1097,6 +1097,8 @@ impl PdfView {
 
     fn render_outline_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pdf = self.pdf(cx);
+        let current_path =
+            current_outline_path(&pdf.metadata.chapters, self.current_page).unwrap_or_default();
         v_flex()
             .id("pdf-outline-sidebar")
             .w(px(240.0))
@@ -1120,7 +1122,9 @@ impl PdfView {
                     .chapters
                     .iter()
                     .enumerate()
-                    .map(|(index, chapter)| self.render_outline_node(chapter, vec![index], 0, cx)),
+                    .map(|(index, chapter)| {
+                        self.render_outline_node(chapter, vec![index], 0, &current_path, cx)
+                    }),
             )
     }
 
@@ -1129,10 +1133,14 @@ impl PdfView {
         chapter: &PdfChapter,
         path: Vec<usize>,
         depth: usize,
+        current_path: &[usize],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let has_children = !chapter.children.is_empty();
         let expanded = has_children && self.is_outline_node_expanded(&path);
+        // a collapsed entry stands in for the current entry inside it.
+        let is_current = !current_path.is_empty()
+            && (current_path == path.as_slice() || (!expanded && current_path.starts_with(&path)));
         let target = chapter.target.clone();
         let title = chapter
             .title
@@ -1149,6 +1157,9 @@ impl PdfView {
             .pr_1()
             .py_0p5()
             .cursor_pointer()
+            .when(is_current, |this| {
+                this.bg(cx.theme().colors().element_selected)
+            })
             .hover(|style| style.bg(cx.theme().colors().element_hover))
             .child(div().w(px(14.0)).flex_none().when(has_children, |this| {
                 this.child(
@@ -1188,7 +1199,7 @@ impl PdfView {
                 .children(chapter.children.iter().enumerate().map(|(i, child)| {
                     let mut child_path = path.clone();
                     child_path.push(i);
-                    self.render_outline_node(child, child_path, depth + 1, cx)
+                    self.render_outline_node(child, child_path, depth + 1, current_path, cx)
                 }))
                 .into_any_element()
         } else {
@@ -2565,6 +2576,37 @@ fn single_page_scroll_range(
     let page = pdf.metadata.pages.get(page_index)?;
     let height = rotation.display_size(page.size).height * zoom;
     Some(0.0..=(height - viewport_height).max(0.0))
+}
+
+/// Returns the path of the last outline entry, in document order, that starts at or before
+/// `page_index`, which is the section being read.
+fn current_outline_path(chapters: &[PdfChapter], page_index: usize) -> Option<Vec<usize>> {
+    let mut current = None;
+    let mut stack: Vec<(Vec<usize>, &PdfChapter)> = chapters
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, chapter)| (vec![index], chapter))
+        .collect();
+    while let Some((path, chapter)) = stack.pop() {
+        if chapter.target.page_index > page_index {
+            continue;
+        }
+        stack.extend(
+            chapter
+                .children
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, child)| {
+                    let mut child_path = path.clone();
+                    child_path.push(index);
+                    (child_path, child)
+                }),
+        );
+        current = Some(path);
+    }
+    current
 }
 
 /// Query and options of a document search, to reuse its results when repeated.
@@ -4016,6 +4058,31 @@ mod tests {
         // two lines yield two rectangles.
         let rects = selection_highlight_rects(&spans, 2..8);
         assert_eq!(rects.len(), 2);
+    }
+
+    #[test]
+    fn current_outline_path_finds_the_section_being_read() {
+        let chapter = |page_index: usize, children: Vec<PdfChapter>| PdfChapter {
+            title: None,
+            target: PdfTarget {
+                page_index,
+                point: Point::default(),
+                block_bottom_y: None,
+                line_height: None,
+            },
+            children,
+        };
+        // chapter 1 on page 0 with sections on pages 2 and 5, chapter 2 on page 8.
+        let chapters = vec![
+            chapter(0, vec![chapter(2, vec![]), chapter(5, vec![])]),
+            chapter(8, vec![]),
+        ];
+
+        assert_eq!(current_outline_path(&chapters, 0), Some(vec![0]));
+        assert_eq!(current_outline_path(&chapters, 3), Some(vec![0, 0]));
+        assert_eq!(current_outline_path(&chapters, 7), Some(vec![0, 1]));
+        assert_eq!(current_outline_path(&chapters, 9), Some(vec![1]));
+        assert_eq!(current_outline_path(&[chapter(4, vec![])], 1), None);
     }
 
     #[test]
