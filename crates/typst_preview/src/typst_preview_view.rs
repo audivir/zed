@@ -3,7 +3,7 @@ use crate::{
     OpenFixedFollowingPreview, OpenFixedPreview, OpenFixedPreviewToTheSide, OpenFollowingPreview,
     OpenPreview, OpenPreviewToTheSide,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
@@ -19,7 +19,7 @@ use pdf_viewer::pdf::Pdf;
 use pdf_viewer::pdf_renderer::{PageMetadata, PdfTarget};
 use pdf_viewer::{PdfView, ScrollAnchor, ScrollMode};
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use text::Point as BufferPoint;
 use typst::World;
 use typst::layout::{Abs, Frame, FrameItem, Point as TypstPoint};
+use typst::syntax::package::PackageSpec;
 use typst::syntax::{LinkedNode, RootedPath, Side, Source, Span, SyntaxKind, VirtualRoot};
 use typst_layout::PagedDocument;
 use ui::prelude::*;
@@ -50,6 +51,10 @@ pub struct TypstPreviewView {
     pending_update_task: Option<Task<Result<()>>>,
     mode: TypstPreviewMode,
     project_resolution: bool,
+    /// Packages already downloaded or attempted, so a failing download is not retried on every
+    /// compile.
+    requested_packages: HashSet<PackageSpec>,
+    package_download_task: Option<Task<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,6 +72,7 @@ pub enum TypstCompileState {
     Rendering,
     Finished,
     Failed(String),
+    DownloadingPackages(Vec<PackageSpec>),
 }
 
 /// Language server ID for diagnostics published by the Typst preview itself.
@@ -548,6 +554,8 @@ impl TypstPreviewView {
                 pending_update_task: None,
                 mode,
                 project_resolution,
+                requested_packages: HashSet::default(),
+                package_download_task: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -1007,6 +1015,7 @@ impl TypstPreviewView {
 
                 struct CompileOutcome {
                     diagnostics: Vec<TypstDiagnostic>,
+                    missing_packages: Vec<PackageSpec>,
                     result: Result<(
                         Vec<u8>,
                         Arc<PagedDocument>,
@@ -1037,6 +1046,7 @@ impl TypstPreviewView {
                                 Err(e) => {
                                     return CompileOutcome {
                                         diagnostics: Vec::new(),
+                                        missing_packages: Vec::new(),
                                         result: Err(anyhow::anyhow!(
                                             "Failed to read {}: {}",
                                             main_file_path.display(),
@@ -1069,6 +1079,7 @@ impl TypstPreviewView {
                                 diagnostics.extend(resolve_typst_diagnostics(&world, &errors));
                                 return CompileOutcome {
                                     diagnostics,
+                                    missing_packages: world.take_missing_packages(),
                                     result: Err(anyhow::anyhow!(
                                         "Compilation failed:\n{:?}",
                                         errors
@@ -1086,6 +1097,7 @@ impl TypstPreviewView {
                                 Err(e) => {
                                     return CompileOutcome {
                                         diagnostics,
+                                        missing_packages: world.take_missing_packages(),
                                         result: Err(anyhow::anyhow!("PDF export failed:\n{:?}", e)),
                                     };
                                 }
@@ -1127,6 +1139,7 @@ impl TypstPreviewView {
                         let world_arc_ret = world_arc.clone();
                         CompileOutcome {
                             diagnostics,
+                            missing_packages: world.take_missing_packages(),
                             result: Ok((
                                 bytes,
                                 Arc::new(document),
@@ -1138,7 +1151,7 @@ impl TypstPreviewView {
                     })
                     .await;
 
-                view.update(cx, move |view, cx| {
+                view.update_in(cx, move |view, window, cx| {
                     view.compile_state = TypstCompileState::Rendering;
                     publish_editor_diagnostics(
                         active_editor.as_ref(),
@@ -1174,6 +1187,7 @@ impl TypstPreviewView {
                             cx.notify();
                         }
                     }
+                    view.download_missing_packages(compile_outcome.missing_packages, window, cx);
                     view.pending_update_task = None;
                 })
                 .ok();
@@ -1181,6 +1195,55 @@ impl TypstPreviewView {
 
             Ok(())
         })
+    }
+
+    /// Downloads `@preview` packages that imports need into the Typst package cache, then
+    /// compiles again.
+    fn download_missing_packages(
+        &mut self,
+        missing_packages: Vec<PackageSpec>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let packages = missing_packages
+            .into_iter()
+            .filter(|package| self.requested_packages.insert(package.clone()))
+            .collect::<Vec<_>>();
+        if packages.is_empty() {
+            return;
+        }
+
+        self.compile_state = TypstCompileState::DownloadingPackages(packages.clone());
+        cx.notify();
+        let http_client = cx.http_client();
+        self.package_download_task = Some(cx.spawn_in(window, async move |view, cx| {
+            let mut failures = Vec::new();
+            for package in &packages {
+                let result = match crate::typst_world::package_download_dir(package) {
+                    Some(destination) => {
+                        download_package(http_client.as_ref(), package, &destination).await
+                    }
+                    None => Err(anyhow::anyhow!("no Typst package cache directory")),
+                };
+                if let Err(error) = result {
+                    log::error!("failed to download Typst package {package}: {error:#}");
+                    failures.push(format!("{package}: {error:#}"));
+                }
+            }
+            view.update_in(cx, |view, window, cx| {
+                view.package_download_task = None;
+                if failures.is_empty() {
+                    view.update_typst_from_active_editor(false, false, window, cx);
+                } else {
+                    view.compile_state = TypstCompileState::Failed(format!(
+                        "Failed to download Typst packages:\n{}",
+                        failures.join("\n")
+                    ));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     fn selected_source_index(editor: &Editor, cx: &mut App) -> usize {
@@ -1434,6 +1497,17 @@ impl Render for TypstPreviewView {
                             "Compiling Typst...".to_string(),
                             cx.theme().colors().text_muted,
                         ),
+                        DownloadingPackages(packages) => (
+                            format!(
+                                "Downloading {}...",
+                                packages
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            cx.theme().colors().text_muted,
+                        ),
                         Uninitialized => (
                             "Waiting for input...".to_string(),
                             cx.theme().colors().text_muted,
@@ -1453,6 +1527,28 @@ impl Render for TypstPreviewView {
                 },
             )
     }
+}
+
+/// Downloads and unpacks an `@preview` package from the Typst package registry into
+/// `destination`.
+async fn download_package(
+    http_client: &dyn http_client::HttpClient,
+    package: &PackageSpec,
+    destination: &Path,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("package directory has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
+    let url = crate::typst_world::package_download_url(package);
+    http_client::github_download::download_server_binary(
+        http_client,
+        &url,
+        None,
+        destination,
+        http_client::github::AssetKind::TarGz,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1481,6 +1577,58 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    #[gpui::test]
+    async fn download_package_unpacks_the_registry_archive(cx: &mut gpui::TestAppContext) {
+        use async_compression::futures::bufread::GzipEncoder;
+        use futures::{AsyncReadExt as _, io::BufReader};
+
+        let mut tar_bytes = Vec::new();
+        let mut archive = async_tar::Builder::new(&mut tar_bytes);
+        for (name, contents) in [
+            ("typst.toml", "[package]\nname = \"demo\"\n"),
+            ("lib.typ", "#let greet = [hi]"),
+        ] {
+            let mut header = async_tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            archive
+                .append_data(&mut header, name, contents.as_bytes())
+                .await
+                .unwrap();
+        }
+        archive.into_inner().await.unwrap();
+        let mut gzipped = Vec::new();
+        GzipEncoder::new(BufReader::new(tar_bytes.as_slice()))
+            .read_to_end(&mut gzipped)
+            .await
+            .unwrap();
+
+        let http_client = http_client::FakeHttpClient::create(move |request| {
+            let gzipped = gzipped.clone();
+            async move {
+                assert_eq!(
+                    request.uri().to_string(),
+                    "https://packages.typst.org/preview/demo-1.0.0.tar.gz"
+                );
+                Ok(http_client::Response::new(gzipped.into()))
+            }
+        });
+        let package: PackageSpec = "@preview/demo:1.0.0".parse().unwrap();
+        let root = ScratchDir::new("download_package");
+        let destination = root.join("preview/demo/1.0.0");
+
+        cx.background_executor.allow_parking();
+        download_package(http_client.as_ref(), &package, &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("lib.typ")).unwrap(),
+            "#let greet = [hi]"
+        );
+        assert!(destination.join("typst.toml").exists());
     }
 
     #[test]

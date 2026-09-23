@@ -1,12 +1,13 @@
 use chrono::{Datelike, Local};
 use editor::MultiBufferSnapshot;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Datetime, Duration};
+use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -109,6 +110,8 @@ pub struct TypstSystemWorld {
     pub file_overrides: HashMap<PathBuf, MultiBufferSnapshot>,
     pub sources: RwLock<HashMap<FileId, Source>>,
     disk_files: RwLock<HashMap<PathBuf, DiskFile>>,
+    /// `@preview` packages that imports asked for but that are not installed locally.
+    missing_packages: parking_lot::Mutex<HashSet<PackageSpec>>,
 }
 
 /// Container for file bytes read from disk, keyed by their modification time and size.
@@ -146,6 +149,7 @@ impl TypstSystemWorld {
             file_overrides: Default::default(),
             sources: RwLock::new(Default::default()),
             disk_files: RwLock::new(Default::default()),
+            missing_packages: Default::default(),
         };
 
         log::debug!("Initialized TypstWorld in {:?}", start.elapsed());
@@ -212,9 +216,17 @@ impl TypstSystemWorld {
         &self.main_source
     }
 
+    /// Returns the `@preview` packages that the last compilations could not find locally.
+    pub fn take_missing_packages(&self) -> Vec<PackageSpec> {
+        self.missing_packages.lock().drain().collect()
+    }
+
     pub fn resolve_path(&self, id: FileId) -> FileResult<PathBuf> {
         let root = match id.root() {
             VirtualRoot::Package(package) => package_dir(package).ok_or_else(|| {
+                if package.namespace == "preview" {
+                    self.missing_packages.lock().insert(package.clone());
+                }
                 FileError::Package(typst::diag::PackageError::NotFound(package.clone()))
             })?,
             VirtualRoot::Project => self.root.clone(),
@@ -316,56 +328,77 @@ impl typst_ide::IdeWorld for TypstSystemWorld {
     }
 }
 
-fn package_dir(spec: &typst::syntax::package::PackageSpec) -> Option<PathBuf> {
-    let subdir = format!("{}/{}/{}", spec.namespace, spec.name, spec.version);
+fn package_dir(spec: &PackageSpec) -> Option<PathBuf> {
+    let subdir = package_subdir(spec);
+    package_roots()
+        .into_iter()
+        .map(|root| root.join(&subdir))
+        .find(|path| path.exists())
+}
 
+/// Returns where a downloaded package is stored, following the Typst CLI, so both share their
+/// package cache.
+pub fn package_download_dir(spec: &PackageSpec) -> Option<PathBuf> {
+    Some(
+        package_roots()
+            .into_iter()
+            .next()?
+            .join(package_subdir(spec)),
+    )
+}
+
+/// Returns the URL of the archive of an `@preview` package on the Typst package registry.
+pub fn package_download_url(spec: &PackageSpec) -> String {
+    format!(
+        "https://packages.typst.org/{}/{}-{}.tar.gz",
+        spec.namespace, spec.name, spec.version
+    )
+}
+
+fn package_subdir(spec: &PackageSpec) -> String {
+    format!("{}/{}/{}", spec.namespace, spec.name, spec.version)
+}
+
+/// Returns the package directories searched in order, with the download cache first.
+fn package_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     if let Ok(cache_dir) = std::env::var("TYPST_PACKAGE_CACHE_DIR") {
-        let p = PathBuf::from(cache_dir).join(&subdir);
-        if p.exists() {
-            return Some(p);
-        }
+        roots.push(PathBuf::from(cache_dir));
     }
 
-    let home = std::env::var("HOME")
+    let Some(home) = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
+        .ok()
+    else {
+        return roots;
+    };
 
-    let mut paths = Vec::new();
-    if cfg!(target_os = "macos") {
-        paths.push(format!("{home}/Library/Caches/typst/packages"));
-        paths.push(format!("{home}/Library/Application Support/typst/packages"));
+    let paths = if cfg!(target_os = "macos") {
+        vec![
+            format!("{home}/Library/Caches/typst/packages"),
+            format!("{home}/Library/Application Support/typst/packages"),
+        ]
     } else if cfg!(target_os = "windows") {
-        paths.push(
+        vec![
             std::env::var("LOCALAPPDATA")
                 .ok()
                 .unwrap_or_else(|| format!("{home}/AppData/Local"))
                 + "/typst/packages",
-        );
-        paths.push(
             std::env::var("APPDATA")
                 .ok()
                 .unwrap_or_else(|| format!("{home}/AppData/Roaming"))
                 + "/typst/packages",
-        );
+        ]
     } else {
-        paths.push(
+        vec![
             std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{home}/.cache"))
                 + "/typst/packages",
-        );
-        paths.push(
             std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"))
                 + "/typst/packages",
-        );
-    }
-
-    for dir in paths {
-        let p = PathBuf::from(dir).join(&subdir);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
-    None
+        ]
+    };
+    roots.extend(paths.into_iter().map(PathBuf::from));
+    roots
 }
 
 #[cfg(test)]
@@ -408,6 +441,39 @@ mod tests {
         assert_eq!(
             world.file(id).unwrap().as_slice(),
             b"second version".as_slice()
+        );
+    }
+
+    #[test]
+    fn missing_preview_packages_are_recorded_for_download() {
+        let dir = ScratchDir::new("typst_world_missing_package_test");
+        let mut world = TypstSystemWorld::new(dir.0.clone());
+        world.update_main(
+            concat!(
+                "#import \"@preview/zed-surely-missing-package:0.1.2\": *\n",
+                "#import \"@local/zed-surely-missing-package:0.1.2\": *\n",
+            )
+            .into(),
+            &dir.0.join("main.typ"),
+        );
+
+        let compiled = typst::compile::<typst_layout::PagedDocument>(&world);
+        assert!(compiled.output.is_err());
+        let missing = world.take_missing_packages();
+        assert_eq!(
+            missing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["@preview/zed-surely-missing-package:0.1.2"],
+            "only the registry namespace can be downloaded"
+        );
+        assert!(world.take_missing_packages().is_empty());
+        assert_eq!(
+            package_download_url(&missing[0]),
+            "https://packages.typst.org/preview/zed-surely-missing-package-0.1.2.tar.gz"
+        );
+        assert!(
+            package_download_dir(&missing[0])
+                .unwrap()
+                .ends_with("preview/zed-surely-missing-package/0.1.2")
         );
     }
 

@@ -20564,10 +20564,14 @@ name = "typst_preview"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compression",
+ "async-tar",
  "chrono",
  "editor",
  "fontdb",
+ "futures 0.3.34",
  "gpui",
+ "http_client",
  "language",
  "log",
  "parking_lot",
