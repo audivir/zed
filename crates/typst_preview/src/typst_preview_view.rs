@@ -12,13 +12,15 @@ use gpui::{
 };
 use language::{
     Diagnostic, DiagnosticEntry, DiagnosticMessage, DiagnosticSet, DiagnosticSeverity,
-    HighlightedText, LanguageServerId,
+    DiagnosticSourceKind, HighlightedText, LanguageServerId, PointUtf16,
 };
 use parking_lot::Mutex;
 use pdf_viewer::pdf::Pdf;
 use pdf_viewer::pdf_renderer::{PageMetadata, PdfTarget};
 use pdf_viewer::{PdfView, ScrollAnchor, ScrollMode};
+use project::lsp_store::DocumentDiagnosticsUpdate;
 use std::any::TypeId;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -56,6 +58,8 @@ pub struct TypstPreviewView {
     /// compile.
     requested_packages: HashSet<PackageSpec>,
     package_download_task: Option<Task<()>>,
+    /// Files that currently show diagnostics from this preview, cleared on the next compile.
+    published_diagnostic_paths: HashSet<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,6 +94,8 @@ struct TypstDiagnostic {
     message: String,
     file_path: Option<PathBuf>,
     range: Option<Range<usize>>,
+    /// `range` as UTF-16 points, for files without an open buffer to convert offsets.
+    point_range: Option<Range<PointUtf16>>,
 }
 
 /// Resolves the span of each diagnostic to a file path and byte range.
@@ -109,22 +115,119 @@ fn resolve_typst_diagnostics(
             let location = diagnostic.span.id().and_then(|file_id| {
                 let path = world.resolve_path(file_id).ok()?;
                 let range = typst::WorldExt::range(world, diagnostic.span)?;
-                Some((path, range))
+                let point_range = world.source(file_id).ok().and_then(|source| {
+                    Some(
+                        byte_to_point_utf16(&source, range.start)?
+                            ..byte_to_point_utf16(&source, range.end)?,
+                    )
+                });
+                Some((path, range, point_range))
             });
+            let (file_path, range, point_range) = match location {
+                Some((path, range, point_range)) => (Some(path), Some(range), point_range),
+                None => (None, None, None),
+            };
             TypstDiagnostic {
                 severity,
                 message: diagnostic.message.to_string(),
-                file_path: location.as_ref().map(|(path, _)| path.clone()),
-                range: location.map(|(_, range)| range),
+                file_path,
+                range,
+                point_range,
             }
         })
         .collect()
 }
 
+fn byte_to_point_utf16(source: &Source, byte: usize) -> Option<PointUtf16> {
+    let lines = source.lines();
+    let line = lines.byte_to_line(byte)?;
+    let line_start = lines.line_to_byte(line)?;
+    let column = lines.byte_to_utf16(byte)? - lines.byte_to_utf16(line_start)?;
+    Some(PointUtf16::new(line as u32, column as u32))
+}
+
+/// Publishes `diagnostics` to the project, so they show in open buffers, the status bar, and the
+/// diagnostics panel, including those in imported files.
+///
+/// Clears the diagnostics of files in `published_paths` that no longer have any and records the
+/// newly published files there. Remote projects fall back to the buffer of `editor`.
+fn publish_project_diagnostics(
+    workspace: &WeakEntity<Workspace>,
+    editor: Option<&Entity<Editor>>,
+    diagnostics: &[TypstDiagnostic],
+    published_paths: &mut HashSet<PathBuf>,
+    cx: &mut App,
+) {
+    let Some(project) = workspace
+        .upgrade()
+        .map(|workspace| workspace.read(cx).project().clone())
+    else {
+        return;
+    };
+    if !project.read(cx).is_local() {
+        publish_editor_diagnostics(editor, diagnostics, cx);
+        return;
+    }
+
+    let mut diagnostics_by_path: HashMap<PathBuf, Vec<lsp::Diagnostic>> = HashMap::default();
+    for diagnostic in diagnostics {
+        let (Some(path), Some(point_range)) = (&diagnostic.file_path, &diagnostic.point_range)
+        else {
+            continue;
+        };
+        let position = |point: PointUtf16| lsp::Position::new(point.row, point.column);
+        let severity = if diagnostic.severity == DiagnosticSeverity::ERROR {
+            lsp::DiagnosticSeverity::ERROR
+        } else {
+            lsp::DiagnosticSeverity::WARNING
+        };
+        diagnostics_by_path
+            .entry(path.clone())
+            .or_default()
+            .push(lsp::Diagnostic {
+                range: lsp::Range::new(position(point_range.start), position(point_range.end)),
+                severity: Some(severity),
+                source: Some("Typst".to_string()),
+                message: lsp::DiagnosticMessage::String(diagnostic.message.clone()),
+                ..Default::default()
+            });
+    }
+    for path in published_paths.drain() {
+        diagnostics_by_path.entry(path).or_default();
+    }
+
+    let mut updates = Vec::new();
+    for (path, diagnostics) in diagnostics_by_path {
+        let Ok(uri) = lsp::Uri::from_file_path(&path) else {
+            continue;
+        };
+        if !diagnostics.is_empty() {
+            published_paths.insert(path);
+        }
+        updates.push(DocumentDiagnosticsUpdate {
+            diagnostics: lsp::PublishDiagnosticsParams {
+                uri,
+                diagnostics,
+                version: None,
+            },
+            result_id: None,
+            registration_id: None,
+            server_id: TYPST_PREVIEW_DIAGNOSTICS_SERVER_ID,
+            disk_based_sources: Cow::Borrowed(&[]),
+        });
+    }
+    project.read(cx).lsp_store().update(cx, |lsp_store, cx| {
+        lsp_store
+            .merge_lsp_diagnostics(DiagnosticSourceKind::Pushed, updates, |_, _, _| false, cx)
+            .context("publishing Typst diagnostics")
+            .log_err();
+    });
+}
+
 /// Publishes `diagnostics` as squiggles on the buffer of `editor`, replacing the previous set.
 ///
-/// Only diagnostics for the file of the editor apply. Others, such as those in imported files,
-/// remain visible in the warnings banner of the preview.
+/// Only diagnostics for the file of the editor apply, since remote projects accept no diagnostics
+/// from the client.
 fn publish_editor_diagnostics(
     editor: Option<&Entity<Editor>>,
     diagnostics: &[TypstDiagnostic],
@@ -557,6 +660,7 @@ impl TypstPreviewView {
                 project_resolution,
                 requested_packages: HashSet::default(),
                 package_download_task: None,
+                published_diagnostic_paths: HashSet::default(),
             };
 
             this.set_editor(active_editor, window, cx);
@@ -1154,9 +1258,11 @@ impl TypstPreviewView {
 
                 view.update_in(cx, move |view, window, cx| {
                     view.compile_state = TypstCompileState::Rendering;
-                    publish_editor_diagnostics(
+                    publish_project_diagnostics(
+                        &view.workspace,
                         active_editor.as_ref(),
                         &compile_outcome.diagnostics,
+                        &mut view.published_diagnostic_paths,
                         cx,
                     );
                     match compile_outcome.result {
@@ -1633,6 +1739,60 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    async fn diagnostics_are_published_to_the_project_and_cleared(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/root"),
+            serde_json::json!({
+                "main.typ": "#include \"chapter.typ\"",
+                "chapter.typ": "#undefined",
+            }),
+        )
+        .await;
+        let project = project::Project::test(fs, [util::path!("/root").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().downgrade()
+            })
+            .unwrap();
+
+        let chapter = PathBuf::from(util::path!("/root/chapter.typ"));
+        let diagnostics = vec![TypstDiagnostic {
+            severity: DiagnosticSeverity::ERROR,
+            message: "unknown variable: undefined".to_string(),
+            file_path: Some(chapter.clone()),
+            range: Some(1..10),
+            point_range: Some(PointUtf16::new(0, 1)..PointUtf16::new(0, 10)),
+        }];
+        let mut published_paths = HashSet::default();
+        cx.update(|cx| {
+            publish_project_diagnostics(&workspace, None, &diagnostics, &mut published_paths, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(published_paths, HashSet::from_iter([chapter]));
+        let summary = project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx));
+        assert_eq!((summary.error_count, summary.warning_count), (1, 0));
+
+        // a clean compile clears the previously published file.
+        cx.update(|cx| {
+            publish_project_diagnostics(&workspace, None, &[], &mut published_paths, cx)
+        });
+        cx.run_until_parked();
+        assert!(published_paths.is_empty());
+        let summary = project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx));
+        assert_eq!((summary.error_count, summary.warning_count), (0, 0));
+    }
+
     #[test]
     fn export_path_sits_next_to_the_main_file() {
         let root = ScratchDir::new("export_path");
@@ -1787,7 +1947,7 @@ mod tests {
         let root = ScratchDir::new("diagnostics_included_file_error");
         let main_path = root.join("main.typ");
         let other_path = root.join("other.typ");
-        std::fs::write(&other_path, "Hello #undefined_var\n").unwrap();
+        std::fs::write(&other_path, "Hello ä\n#undefined_var\n").unwrap();
 
         let mut world = TypstSystemWorld::new(root.0.clone());
         world.update_main("#include \"other.typ\"\n".into(), &main_path);
@@ -1808,6 +1968,11 @@ mod tests {
                 .iter()
                 .map(|d| (&d.file_path, &d.message))
                 .collect::<Vec<_>>()
+        );
+        // the second line, after the `#`, measured in UTF-16 units.
+        assert_eq!(
+            in_other_file.and_then(|d| d.point_range.clone()),
+            Some(PointUtf16::new(1, 1)..PointUtf16::new(1, 14))
         );
     }
 
