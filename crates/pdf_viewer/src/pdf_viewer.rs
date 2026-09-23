@@ -2165,6 +2165,10 @@ impl Element for PdfContentElement {
                 .relative()
                 .debug_selector(|| format!("pdf-page-{page_idx}"))
                 .on_mouse_down(MouseButton::Left, move |e, window, cx| {
+                    // plain clicks are left to text selection, like go-to-definition in editors.
+                    if !e.modifiers.secondary() {
+                        return;
+                    }
                     if let Some(handler) = &page_click_handler {
                         let point = page_point_at(
                             e.position,

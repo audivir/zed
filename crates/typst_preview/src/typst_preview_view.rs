@@ -433,6 +433,29 @@ impl TypstPreviewView {
         }
     }
 
+    /// Returns the pane to open a source file of the preview in: the previewed editor's pane,
+    /// else any pane other than the preview's, else a new pane left of the preview.
+    fn source_pane(
+        workspace: &mut Workspace,
+        preview_pane: Option<&Entity<Pane>>,
+        source_editor: Option<&Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Pane> {
+        if let Some(pane) = source_editor.and_then(|editor| workspace.pane_for(editor))
+            && Some(&pane) != preview_pane
+        {
+            return pane;
+        }
+        let Some(preview_pane) = preview_pane else {
+            return workspace.active_pane().clone();
+        };
+        if let Some(pane) = workspace.panes().iter().find(|pane| *pane != preview_pane) {
+            return pane.clone();
+        }
+        workspace.split_pane(preview_pane.clone(), SplitDirection::Left, window, cx)
+    }
+
     pub fn register(workspace: &mut Workspace, _window: &mut Window, _cx: &mut Context<Workspace>) {
         workspace.register_action(move |workspace, _: &OpenPreview, window, cx| {
             if let Some(editor) = Self::resolve_active_item_as_typst_editor(workspace, cx) {
@@ -983,6 +1006,7 @@ impl TypstPreviewView {
                     });
                 }
                 view.rendered_page_hashes = Some((pdf.id, page_hashes));
+                let preview = cx.weak_entity();
                 view.pdf_view.update(cx, |pv, cx| {
                     pv.update_pdf(pdf, cx);
                     let document_clone = document.clone();
@@ -1037,30 +1061,52 @@ impl TypstPreviewView {
                                         return;
                                     }
 
-                                    // open without focusing it.
+                                    // open without focusing it, next to the previewed editor rather than
+                                    // as a tab beside the preview.
+                                    let open_task = workspace.update(cx, |ws, cx| {
+                                        let preview_pane = preview
+                                            .upgrade()
+                                            .and_then(|preview| ws.pane_for(&preview));
+                                        let source_editor = preview.upgrade().and_then(|preview| {
+                                            preview
+                                                .read(cx)
+                                                .active_editor
+                                                .as_ref()
+                                                .map(|state| state.editor.clone())
+                                        });
+                                        let pane = Self::source_pane(
+                                            ws,
+                                            preview_pane.as_ref(),
+                                            source_editor.as_ref(),
+                                            window,
+                                            cx,
+                                        );
+                                        match ws
+                                            .project()
+                                            .read(cx)
+                                            .find_project_path(&normalized_path, cx)
+                                        {
+                                            Some(project_path) => ws.open_path(
+                                                project_path,
+                                                Some(pane.downgrade()),
+                                                false,
+                                                window,
+                                                cx,
+                                            ),
+                                            None => ws.open_abs_path(
+                                                normalized_path,
+                                                workspace::OpenOptions {
+                                                    focus: Some(false),
+                                                    ..Default::default()
+                                                },
+                                                window,
+                                                cx,
+                                            ),
+                                        }
+                                    });
                                     window
                                         .spawn(cx, async move |cx| {
-                                            cx.background_executor()
-                                                .timer(std::time::Duration::from_millis(10))
-                                                .await;
-
-                                            let open_task_res = cx.update(|window, cx| {
-                                                workspace.update(cx, |ws, cx| {
-                                                    ws.open_abs_path(
-                                                        normalized_path,
-                                                        workspace::OpenOptions {
-                                                            focus: Some(false),
-                                                            ..Default::default()
-                                                        },
-                                                        window,
-                                                        cx,
-                                                    )
-                                                })
-                                            });
-
-                                            if let Ok(open_task) = open_task_res
-                                                && let Ok(item) = open_task.await
-                                            {
+                                            if let Ok(item) = open_task.await {
                                                 cx.update(|window, cx| {
                                                     if let Some(new_editor) =
                                                         item.act_as::<Editor>(cx)
