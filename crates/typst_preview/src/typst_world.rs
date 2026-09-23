@@ -185,6 +185,11 @@ impl TypstSystemWorld {
         Ok((bytes, true))
     }
 
+    /// Returns whether a compile read `path` from disk.
+    pub fn has_read(&self, path: &Path) -> bool {
+        self.disk_files.read().contains_key(path)
+    }
+
     /// Replaces the main source with the given editor text.
     pub fn update_main(&mut self, text: SharedString, file_path: &Path) {
         let rel_path = file_path

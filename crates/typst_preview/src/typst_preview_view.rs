@@ -705,12 +705,55 @@ impl TypstPreviewView {
                     this.workspace_updated(item, window, cx);
                 })
                 .detach();
+
+                // recompile when files the document reads change on disk, like images edited in
+                // another application.
+                cx.subscribe_in(
+                    workspace.project(),
+                    window,
+                    |this, project, event, window, cx| {
+                        if let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event
+                            && this.disk_changes_affect_document(project, *worktree_id, changes, cx)
+                        {
+                            this.update_typst_from_active_editor(true, false, window, cx);
+                        }
+                    },
+                )
+                .detach();
             } else {
                 log::error!("Failed to listen to workspace updates");
             }
 
             this
         })
+    }
+
+    fn disk_changes_affect_document(
+        &self,
+        project: &Entity<project::Project>,
+        worktree_id: project::WorktreeId,
+        changes: &project::UpdatedEntriesSet,
+        cx: &App,
+    ) -> bool {
+        let Some(world) = &self.world else {
+            return false;
+        };
+        let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return false;
+        };
+        let worktree = worktree.read(cx);
+        // a running compile holds the world and may have read a file before it changed.
+        let Some(world) = world.try_lock() else {
+            return true;
+        };
+        let compile_failed = matches!(self.compile_state, TypstCompileState::Failed(_));
+        changes_affect_world(
+            &world,
+            compile_failed,
+            changes
+                .iter()
+                .map(|(path, _, change)| (worktree.absolutize(path), *change)),
+        )
     }
 
     fn workspace_updated(
@@ -1720,6 +1763,26 @@ fn export_path(world: &TypstSystemWorld) -> Option<PathBuf> {
     Some(main_path.with_extension("pdf"))
 }
 
+/// Returns whether any of the changed paths on disk were read by the last compile of `world`.
+///
+/// After a failed compile, new files count as well, since the failure may be a missing include
+/// or image.
+fn changes_affect_world(
+    world: &TypstSystemWorld,
+    compile_failed: bool,
+    mut changes: impl Iterator<Item = (PathBuf, project::PathChange)>,
+) -> bool {
+    changes.any(|(path, change)| match change {
+        project::PathChange::Loaded => false,
+        project::PathChange::Added | project::PathChange::AddedOrUpdated
+            if compile_failed && path.starts_with(&world.root) =>
+        {
+            true
+        }
+        _ => world.has_read(&path),
+    })
+}
+
 /// Exports `document` as a PDF created at `now`, as the Typst CLI does, unless the document sets
 /// its own date.
 ///
@@ -2057,6 +2120,35 @@ mod tests {
         let created = pdf.metadata.properties.created.clone();
         let expected = now.format("%Y-%m-%d %H:%M:%S %:z").to_string();
         assert_eq!(created.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn only_changes_to_files_the_document_read_trigger_a_recompile() {
+        let root = ScratchDir::new("disk_changes");
+        let main_path = root.join("main.typ");
+        std::fs::write(root.join("chapter.typ"), "Chapter").unwrap();
+        let mut world = TypstSystemWorld::new(root.0.clone());
+        world.update_main("#include \"chapter.typ\"".into(), &main_path);
+        typst::compile::<PagedDocument>(&world)
+            .output
+            .expect("document should compile");
+
+        let affects = |path: &str, change, compile_failed| {
+            changes_affect_world(
+                &world,
+                compile_failed,
+                std::iter::once((root.join(path), change)),
+            )
+        };
+        assert!(affects("chapter.typ", project::PathChange::Updated, false));
+        assert!(!affects(
+            "unrelated.typ",
+            project::PathChange::Updated,
+            false
+        ));
+        assert!(!affects("chapter.typ", project::PathChange::Loaded, false));
+        assert!(!affects("image.png", project::PathChange::Added, false));
+        assert!(affects("image.png", project::PathChange::Added, true));
     }
 
     #[test]
