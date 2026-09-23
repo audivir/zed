@@ -11,8 +11,8 @@ use anyhow::{Context as _, Error, Result};
 use collections::{HashMap, HashSet};
 use editor::{Editor, EditorSettings};
 use gpui::{
-    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId,
+    AnyElement, App, Bounds, Context, DismissEvent, DispatchPhase, Element, ElementId, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId,
     InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement,
     PinchEvent, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, Size, Style, Styled,
     Subscription, Task, WeakEntity, Window, actions, div, img, px, size, uniform_list,
@@ -28,7 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 use theme_settings::ThemeSettings;
-use ui::{Banner, FluentBuilder as _, ScrollAxes, Severity, Tooltip, WithScrollbar, prelude::*};
+use ui::{
+    Banner, ContextMenu, FluentBuilder as _, ScrollAxes, Severity, Tooltip, WithScrollbar,
+    prelude::*,
+};
 use util::ResultExt as _;
 use util::paths::PathExt;
 use workspace::{
@@ -501,6 +504,7 @@ pub struct PdfView {
     /// Whether pages render with inverted lightness, not persisted.
     inverted_colors: bool,
     page_flip: PageFlip,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
 }
 
 /// Scrolling past the edge of the page in single-page mode.
@@ -555,6 +559,7 @@ impl PdfView {
             rotation: PageRotation::None,
             inverted_colors: false,
             page_flip: PageFlip::default(),
+            context_menu: None,
         }
     }
 
@@ -635,6 +640,7 @@ impl PdfView {
             rotation: PageRotation::None,
             inverted_colors: false,
             page_flip: PageFlip::default(),
+            context_menu: None,
         }
     }
 
@@ -805,6 +811,52 @@ impl PdfView {
         };
         // re-snap to the page top so the view is not left mid-scroll in either mode.
         self.jump_to_page(self.current_page, cx);
+    }
+
+    fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let has_selection = self.text_selection.is_some();
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            menu.context(self.focus_handle.clone())
+                .action_disabled_when(!has_selection, "Copy", Box::new(Copy))
+                .action("Select All", Box::new(SelectAll))
+                .separator()
+                .action("Rotate Clockwise", Box::new(RotatePageClockwise))
+                .action_checked(
+                    "Invert Colors",
+                    Box::new(ToggleInvertedColors),
+                    self.inverted_colors,
+                )
+                .action_checked(
+                    "Single-Page View",
+                    Box::new(ToggleSinglePageView),
+                    self.view_mode == ViewMode::SinglePage,
+                )
+                .separator()
+                .action("Document Properties", Box::new(ShowDocumentProperties))
+                .action("Open in Default App", Box::new(OpenInDefaultApp))
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
+                if this.context_menu.as_ref().is_some_and(|context_menu| {
+                    context_menu.0.focus_handle(cx).contains_focused(window, cx)
+                }) {
+                    window.focus(&this.focus_handle, cx);
+                }
+                this.context_menu.take();
+                cx.notify();
+            },
+        );
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
     }
 
     fn toggle_inverted_colors(
@@ -2594,6 +2646,7 @@ impl Item for PdfView {
             rotation: PageRotation::None,
             inverted_colors: self.inverted_colors,
             page_flip: PageFlip::default(),
+            context_menu: None,
         })))
     }
 
@@ -2852,6 +2905,21 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::rotate_page_clockwise))
             .on_action(cx.listener(Self::open_in_default_app))
             .on_action(cx.listener(Self::toggle_inverted_colors))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.deploy_context_menu(event.position, window, cx);
+                }),
+            )
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                gpui::deferred(
+                    gpui::anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
             .on_action(cx.listener(Self::show_document_properties))
             .when(!has_load_error && !needs_password, |this| {
                 let show_outline = self.show_outline;
@@ -4082,6 +4150,42 @@ mod tests {
             2,
             "whole words skip the one inside concatenate"
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn right_click_opens_a_context_menu_with_view_actions(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/solid_red.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, _window, cx| view.restore_view_state(1.0, 0, cx));
+        cx.run_until_parked();
+
+        let position = cx
+            .debug_bounds("pdf-page-0")
+            .unwrap_or_else(|| panic!("page 0 should be laid out"))
+            .center();
+        cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let menu = view.read_with(cx, |view, _| {
+            view.context_menu.as_ref().map(|(menu, _, _)| menu.clone())
+        });
+        let menu = menu.expect("right-clicking a page should open the context menu");
+
+        // the menu dispatches to the view, so its entries reach the view's action handlers.
+        menu.update_in(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(ToggleInvertedColors), cx)
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.inverted_colors));
     }
 
     #[allow(clippy::await_holding_lock)]
