@@ -2098,24 +2098,34 @@ impl Element for PdfContentElement {
             if let Some(data) = active_data {
                 let mut link_layer = div().absolute().top_0().left_0().size_full();
 
-                for link in data.links.iter() {
+                for (link_idx, link) in data.links.iter().enumerate() {
                     let action = link.action.clone();
                     let view_weak = self.pdf_view.downgrade();
 
                     let bounds = to_display_bounds(link.bounds);
+                    let tooltip: SharedString = match &link.action {
+                        PdfLinkAction::External(url) => url.clone().into(),
+                        PdfLinkAction::Internal(target) => {
+                            format!("Go to Page {}", target.page_index + 1).into()
+                        }
+                    };
 
                     link_layer = link_layer.child(
                         div()
+                            .id(ElementId::named_usize(
+                                format!("pdf-link-{page_idx}"),
+                                link_idx,
+                            ))
                             .absolute()
                             .top(bounds.origin.y)
                             .left(bounds.origin.x)
                             .w(bounds.size.width)
                             .h(bounds.size.height)
-                            .bg(gpui::rgba(0xff000044))
-                            .border_1()
-                            .border_color(gpui::rgba(0xff0000ff))
+                            .rounded_xs()
                             .cursor_pointer()
+                            // translucent, since theme hover colors may hide the link text.
                             .hover(|style| style.bg(gpui::rgba(0x0060df22)))
+                            .tooltip(Tooltip::text(tooltip))
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                                 log::debug!("Clicked {:?}", action);
                                 match action.clone() {
