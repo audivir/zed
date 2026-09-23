@@ -17,7 +17,9 @@ actions!(
         /// Opens a preview for the active Typst document in a split pane.
         OpenFixedPreviewToTheSide,
         /// Opens a following preview that always compiles the active file directly.
-        OpenFixedFollowingPreview
+        OpenFixedFollowingPreview,
+        /// Writes the compiled PDF of the previewed document next to its main file.
+        ExportPdf
     ]
 );
 

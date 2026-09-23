@@ -1,7 +1,7 @@
 use crate::typst_world::TypstSystemWorld;
 use crate::{
-    OpenFixedFollowingPreview, OpenFixedPreview, OpenFixedPreviewToTheSide, OpenFollowingPreview,
-    OpenPreview, OpenPreviewToTheSide,
+    ExportPdf, OpenFixedFollowingPreview, OpenFixedPreview, OpenFixedPreviewToTheSide,
+    OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide,
 };
 use anyhow::{Context as _, Result};
 use editor::scroll::Autoscroll;
@@ -31,6 +31,7 @@ use typst::syntax::package::PackageSpec;
 use typst::syntax::{LinkedNode, RootedPath, Side, Source, Span, SyntaxKind, VirtualRoot};
 use typst_layout::PagedDocument;
 use ui::prelude::*;
+use util::ResultExt as _;
 use workspace::item::{Item, ItemBufferKind, ItemHandle};
 use workspace::searchable::{SearchEvent, SearchableItemHandle};
 use workspace::{Pane, SplitDirection, ToolbarItemLocation, Workspace};
@@ -1246,6 +1247,52 @@ impl TypstPreviewView {
         }));
     }
 
+    fn export_path(&self) -> Option<PathBuf> {
+        export_path(&self.world.as_ref()?.lock())
+    }
+
+    fn export_pdf(&mut self, _: &ExportPdf, _window: &mut Window, cx: &mut Context<Self>) {
+        let pdf = self.pdf_view.read(cx).pdf(cx);
+        let export_path = self.export_path();
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| {
+            let result = async {
+                anyhow::ensure!(
+                    pdf.metadata.page_count > 0,
+                    "the Typst document has not compiled yet"
+                );
+                let path = export_path.context("the Typst document has no main file")?;
+                let write_path = path.clone();
+                cx.background_spawn(
+                    async move { std::fs::write(&write_path, pdf.bytes.as_slice()) },
+                )
+                .await
+                .with_context(|| format!("writing {}", path.display()))?;
+                anyhow::Ok(path)
+            }
+            .await;
+
+            let message = match result {
+                Ok(path) => format!("Exported {}", path.display()),
+                Err(error) => format!("Failed to export PDF: {error:#}"),
+            };
+            workspace
+                .update(cx, |workspace, cx| {
+                    struct TypstExportToast;
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::unique::<TypstExportToast>(),
+                            message,
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
     fn selected_source_index(editor: &Editor, cx: &mut App) -> usize {
         editor
             .selections
@@ -1460,6 +1507,7 @@ impl Render for TypstPreviewView {
             .id("TypstPreview")
             .key_context("TypstPreview")
             .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(Self::export_pdf))
             .size_full()
             .bg(bg_color)
             .child(
@@ -1529,6 +1577,12 @@ impl Render for TypstPreviewView {
     }
 }
 
+/// Returns where the exported PDF goes, next to the main file, as the Typst CLI does.
+fn export_path(world: &TypstSystemWorld) -> Option<PathBuf> {
+    let main_path = world.resolve_path(world.main()).ok()?;
+    Some(main_path.with_extension("pdf"))
+}
+
 /// Downloads and unpacks an `@preview` package from the Typst package registry into
 /// `destination`.
 async fn download_package(
@@ -1577,6 +1631,14 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    #[test]
+    fn export_path_sits_next_to_the_main_file() {
+        let root = ScratchDir::new("export_path");
+        let mut world = TypstSystemWorld::new(root.0.clone());
+        world.update_main("= Hello".into(), &root.join("chapters/intro.typ"));
+        assert_eq!(export_path(&world), Some(root.join("chapters/intro.pdf")));
     }
 
     #[gpui::test]
