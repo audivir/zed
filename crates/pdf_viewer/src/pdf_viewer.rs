@@ -1319,13 +1319,10 @@ impl PdfView {
                 .page_flip
                 .last_scroll_at
                 .is_none_or(|last| now.saturating_duration_since(last) > PAGE_FLIP_GESTURE_GAP);
-        self.page_flip.last_scroll_at = Some(now);
         if gesture_started {
-            self.page_flip = PageFlip {
-                last_scroll_at: Some(now),
-                ..PageFlip::default()
-            };
+            self.page_flip = PageFlip::default();
         }
+        self.page_flip.last_scroll_at = Some(now);
 
         let scroll_y = -self.scroll_handle.offset().y.as_f32();
         let at_edge = (delta_y < 0.0 && scroll_y >= *range.end() - 0.5)
