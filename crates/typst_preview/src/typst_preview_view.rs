@@ -1391,22 +1391,20 @@ impl TypstPreviewView {
     }
 
     fn export_pdf(&mut self, _: &ExportPdf, _window: &mut Window, cx: &mut Context<Self>) {
-        let pdf = self.pdf_view.read(cx).pdf(cx);
+        let document = self.document.clone();
         let export_path = self.export_path();
         let workspace = self.workspace.clone();
         cx.spawn(async move |_, cx| {
             let result = async {
-                anyhow::ensure!(
-                    pdf.metadata.page_count > 0,
-                    "the Typst document has not compiled yet"
-                );
+                let document = document.context("the Typst document has not compiled yet")?;
                 let path = export_path.context("the Typst document has no main file")?;
                 let write_path = path.clone();
-                cx.background_spawn(
-                    async move { std::fs::write(&write_path, pdf.bytes.as_slice()) },
-                )
-                .await
-                .with_context(|| format!("writing {}", path.display()))?;
+                cx.background_spawn(async move {
+                    let bytes = export_bytes(&document, chrono::Local::now())?;
+                    std::fs::write(&write_path, bytes)
+                        .with_context(|| format!("writing {}", write_path.display()))
+                })
+                .await?;
                 anyhow::Ok(path)
             }
             .await;
@@ -1722,6 +1720,34 @@ fn export_path(world: &TypstSystemWorld) -> Option<PathBuf> {
     Some(main_path.with_extension("pdf"))
 }
 
+/// Exports `document` as a PDF created at `now`, as the Typst CLI does, unless the document sets
+/// its own date.
+///
+/// The preview leaves the date out, so its bytes stay the same between compiles.
+fn export_bytes(document: &PagedDocument, now: chrono::DateTime<chrono::Local>) -> Result<Vec<u8>> {
+    use chrono::{Datelike as _, Timelike as _};
+
+    let timestamp = typst::foundations::Datetime::from_ymd_hms(
+        now.year(),
+        now.month().try_into()?,
+        now.day().try_into()?,
+        now.hour().try_into()?,
+        now.minute().try_into()?,
+        now.second().try_into()?,
+    )
+    .and_then(|datetime| {
+        typst_pdf::Timestamp::new_local(datetime, now.offset().local_minus_utc() / 60)
+    });
+    typst_pdf::pdf(
+        document,
+        &typst_pdf::PdfOptions {
+            timestamp,
+            ..Default::default()
+        },
+    )
+    .map_err(|errors| anyhow::anyhow!("PDF export failed:\n{errors:?}"))
+}
+
 /// Downloads and unpacks an `@preview` package from the Typst package registry into
 /// `destination`.
 async fn download_package(
@@ -2010,6 +2036,27 @@ mod tests {
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, active_path);
+    }
+
+    #[gpui::test]
+    async fn exported_pdfs_carry_their_creation_date(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let root = ScratchDir::new("export_date");
+        let main_path = root.join("main.typ");
+        let mut world = TypstSystemWorld::new(root.0.clone());
+        world.update_main("Hello".into(), &main_path);
+        let document = typst::compile::<PagedDocument>(&world)
+            .output
+            .expect("document should compile");
+
+        let now = chrono::DateTime::parse_from_rfc3339("2024-03-05T06:07:08+02:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let bytes = export_bytes(&document, now).unwrap();
+        let pdf = Pdf::from_bytes(bytes, None, None).await;
+        let created = pdf.metadata.properties.created.clone();
+        let expected = now.format("%Y-%m-%d %H:%M:%S %:z").to_string();
+        assert_eq!(created.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
