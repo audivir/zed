@@ -3339,6 +3339,7 @@ impl Render for PdfViewToolbarControls {
         let is_single_page = pdf_view.read(cx).view_mode == ViewMode::SinglePage;
         let is_rotated = pdf_view.read(cx).rotation != PageRotation::None;
         let inverted_colors = pdf_view.read(cx).inverted_colors;
+        let fit_mode = pdf_view.read(cx).fit_mode;
 
         h_flex()
             .w_full()
@@ -3589,6 +3590,7 @@ impl Render for PdfViewToolbarControls {
             .child(
                 IconButton::new("fit-to-width", IconName::ArrowRightLeft)
                     .icon_size(IconSize::Small)
+                    .toggle_state(fit_mode == Some(FitMode::Width))
                     .tooltip(|_window, cx| Tooltip::for_action("Fit to Width", &FitToWidth, cx))
                     .on_click({
                         let pdf_view = pdf_view.downgrade();
@@ -3604,6 +3606,7 @@ impl Render for PdfViewToolbarControls {
             .child(
                 IconButton::new("fit-to-view", IconName::Maximize)
                     .icon_size(IconSize::Small)
+                    .toggle_state(fit_mode == Some(FitMode::Page))
                     .tooltip(|_window, cx| Tooltip::for_action("Fit to View", &FitToView, cx))
                     .on_click({
                         let pdf_view = pdf_view.downgrade();
