@@ -2858,6 +2858,17 @@ impl Terminal {
     }
 
     pub fn try_keystroke(&mut self, keystroke: &Keystroke, option_as_meta: bool) -> bool {
+        self.try_key_down(keystroke, option_as_meta, false)
+    }
+
+    /// Like `try_keystroke`, but reports a held key as a repeat to programs that requested event
+    /// types through the Kitty keyboard protocol.
+    pub fn try_key_down(
+        &mut self,
+        keystroke: &Keystroke,
+        option_as_meta: bool,
+        is_held: bool,
+    ) -> bool {
         if self.vi_mode_enabled {
             self.vi_motion(keystroke);
             return true;
@@ -2866,7 +2877,15 @@ impl Terminal {
         let kitty_encoding = self.ghostty.as_ref().and_then(|ghostty| {
             ghostty
                 .lock()
-                .encode_kitty_key(keystroke, option_as_meta, libghostty_vt::key::Action::Press)
+                .encode_kitty_key(
+                    keystroke,
+                    option_as_meta,
+                    if is_held {
+                        libghostty_vt::key::Action::Repeat
+                    } else {
+                        libghostty_vt::key::Action::Press
+                    },
+                )
                 .log_err()
                 .flatten()
         });

@@ -1083,7 +1083,7 @@ impl TerminalView {
         if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
             self.clear_bell(cx);
             self.blink_manager.update(cx, BlinkManager::pause_blinking);
-            self.process_keystroke(&keystroke, cx);
+            self.process_keystroke(&keystroke, false, cx);
         }
     }
 
@@ -1367,13 +1367,22 @@ impl TerminalView {
     /// In vi mode, explicitly triggers a re-render because vi navigation (like j/k)
     /// updates the cursor locally without sending data to the shell, so there's no
     /// shell output to automatically trigger a re-render.
-    fn process_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+    fn process_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        is_held: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.read_only && !self.terminal.read(cx).vi_mode_enabled() {
             return false;
         }
         let (handled, vi_mode_enabled) = self.terminal.update(cx, |term, cx| {
             (
-                term.try_keystroke(keystroke, TerminalSettings::get_global(cx).option_as_meta),
+                term.try_key_down(
+                    keystroke,
+                    TerminalSettings::get_global(cx).option_as_meta,
+                    is_held,
+                ),
                 term.vi_mode_enabled(),
             )
         });
@@ -1396,7 +1405,7 @@ impl TerminalView {
             return;
         }
 
-        if self.process_keystroke(&event.keystroke, cx) {
+        if self.process_keystroke(&event.keystroke, event.is_held, cx) {
             cx.stop_propagation();
         }
     }

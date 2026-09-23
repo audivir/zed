@@ -3728,6 +3728,15 @@ mod tests {
             release(&mut terminal, "escape").as_deref(),
             Some("\x1b[27;1:3u")
         );
+        let repeat = terminal
+            .encode_kitty_key(
+                &gpui::Keystroke::parse("ctrl-c").unwrap(),
+                false,
+                key::Action::Repeat,
+            )
+            .unwrap()
+            .map(|bytes| String::from_utf8(bytes).unwrap());
+        assert_eq!(repeat.as_deref(), Some("\x1b[99;5:2u"));
 
         terminal.write(b"\x1b[<u");
         assert_eq!(encode(&mut terminal, "ctrl-c"), None);
