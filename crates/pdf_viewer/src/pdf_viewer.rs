@@ -529,6 +529,10 @@ pub struct PdfView {
     pub extra_context_menu_actions: Vec<(SharedString, Box<dyn gpui::Action>)>,
     /// URL of the link a right-click landed on, recorded before the context menu opens.
     context_menu_link: Option<String>,
+    thumbnail_scroll_handle: gpui::UniformListScrollHandle,
+    /// Page last scrolled into view in the thumbnail sidebar, so the sidebar only follows page
+    /// changes and otherwise keeps where the user scrolled it.
+    revealed_thumbnail: std::cell::Cell<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -593,6 +597,8 @@ impl PdfView {
             fit_mode: None,
             extra_context_menu_actions: Vec::new(),
             context_menu_link: None,
+            thumbnail_scroll_handle: Default::default(),
+            revealed_thumbnail: Default::default(),
         }
     }
 
@@ -677,6 +683,8 @@ impl PdfView {
             fit_mode: None,
             extra_context_menu_actions: Vec::new(),
             context_menu_link: None,
+            thumbnail_scroll_handle: Default::default(),
+            revealed_thumbnail: Default::default(),
         }
     }
 
@@ -999,6 +1007,11 @@ impl PdfView {
 
     fn render_thumbnail_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let page_count = self.pdf(cx).metadata.page_count;
+        if self.revealed_thumbnail.get() != Some(self.current_page) && page_count > 0 {
+            self.revealed_thumbnail.set(Some(self.current_page));
+            self.thumbnail_scroll_handle
+                .scroll_to_item(self.current_page, gpui::ScrollStrategy::Nearest);
+        }
 
         div()
             .id("pdf-thumbnail-sidebar")
@@ -1022,6 +1035,7 @@ impl PdfView {
                             .collect::<Vec<_>>()
                     }),
                 )
+                .track_scroll(&self.thumbnail_scroll_handle)
                 .size_full(),
             )
     }
@@ -2840,6 +2854,8 @@ impl Item for PdfView {
             fit_mode: None,
             extra_context_menu_actions: Vec::new(),
             context_menu_link: None,
+            thumbnail_scroll_handle: Default::default(),
+            revealed_thumbnail: Default::default(),
         })))
     }
 
@@ -4543,6 +4559,42 @@ mod tests {
             cx.read_from_clipboard().and_then(|item| item.text()),
             Some("https://zed.dev/".to_string())
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn thumbnail_sidebar_follows_the_current_page(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        // tall enough for a single thumbnail row.
+        cx.simulate_resize(size(px(600.), px(THUMBNAIL_ROW_HEIGHT + 20.)));
+        view.update_in(cx, |view, window, cx| {
+            view.restore_view_state(1.0, 0, cx);
+            view.toggle_thumbnails(&ToggleThumbnails, window, cx);
+        });
+        cx.run_until_parked();
+        let scrolled_to_end = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.thumbnail_scroll_handle.is_scrolled_to_end()
+            })
+        };
+        assert_eq!(scrolled_to_end(cx), Some(false));
+
+        view.update_in(cx, |view, window, cx| view.last_page(&LastPage, window, cx));
+        cx.run_until_parked();
+        assert_eq!(scrolled_to_end(cx), Some(true));
     }
 
     #[allow(clippy::await_holding_lock)]
