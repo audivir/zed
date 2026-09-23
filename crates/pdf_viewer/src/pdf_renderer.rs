@@ -1078,44 +1078,38 @@ impl PdfRenderer {
                     let mut bounds_vec = Vec::new();
 
                     for segment in match_segments.iter() {
-                        let mut min_left = f32::MAX;
-                        let mut max_right = f32::MIN;
-                        let mut min_bottom = f32::MAX;
-                        let mut max_top = f32::MIN;
-                        let mut has_bounds = false;
-
-                        let text = segment.text();
-                        let Ok(segment_chars) = segment.chars() else {
-                            continue;
-                        };
-                        for text_char in segment_chars.iter().take(text.len()) {
-                            // segments can end in a space pdfium adds after the match, which
-                            // would widen the highlight. Inner spaces lie between visible
-                            // characters, so they stay covered.
-                            if text_char
-                                .unicode_string()
-                                .is_some_and(|text| text.trim().is_empty())
-                            {
-                                continue;
-                            }
-                            if let Ok(rect) = text_char.loose_bounds() {
-                                min_left = min_left.min(rect.left().value);
-                                max_right = max_right.max(rect.right().value);
-                                min_bottom = min_bottom.min(rect.bottom().value);
-                                max_top = max_top.max(rect.top().value);
-                                has_bounds = true;
+                        // the segment rect spans exactly the matched characters, including
+                        // spaces in the query, but hugs the ink vertically. `chars()` returns
+                        // every character touching the rect, neighbors included, so only
+                        // characters centered inside it contribute their font-height boxes.
+                        let rect = segment.bounds();
+                        let left = rect.left().value;
+                        let right = rect.right().value;
+                        let mut bottom = rect.bottom().value;
+                        let mut top = rect.top().value;
+                        if let Ok(segment_chars) = segment.chars() {
+                            for text_char in segment_chars.iter() {
+                                let Ok(char_rect) = text_char.loose_bounds() else {
+                                    continue;
+                                };
+                                let center =
+                                    (char_rect.left().value + char_rect.right().value) / 2.0;
+                                if (left..=right).contains(&center) {
+                                    bottom = bottom.min(char_rect.bottom().value);
+                                    top = top.max(char_rect.top().value);
+                                }
                             }
                         }
 
-                        if has_bounds {
+                        if right > left && top > bottom {
                             bounds_vec.push(Bounds {
                                 origin: Point {
-                                    x: min_left - page_bounds.origin.x,
-                                    y: page_bounds.origin.y - max_top,
+                                    x: left - page_bounds.origin.x,
+                                    y: page_bounds.origin.y - top,
                                 },
                                 size: Size {
-                                    width: max_right - min_left,
-                                    height: max_top - min_bottom,
+                                    width: right - left,
+                                    height: top - bottom,
                                 },
                             });
                         }
@@ -1241,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn search_highlights_end_at_the_last_matched_character() {
+    fn search_highlights_cover_exactly_the_matched_characters() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (id, bytes) = fixture("whole_words.pdf");
         evict_document(id);
@@ -1251,27 +1245,52 @@ mod tests {
         );
         let spans = futures::executor::block_on(renderer.extract_text_only(0, metadata.clone()))
             .expect("fixture should have a text layer");
-        let t_right_edges: Vec<f32> = spans
-            .iter()
-            .filter(|span| span.text == "t")
-            .map(|span| span.bounds.origin.x + span.bounds.size.width)
-            .collect();
+        let text: String = spans.iter().map(|span| span.text.as_str()).collect();
 
-        let results = futures::executor::block_on(renderer.search_document(
-            "cat",
-            false,
-            true,
-            metadata.clone(),
-        ))
-        .expect("search should succeed");
-        assert!(!results.is_empty());
-        for result in &results {
-            for bounds in &result.bounds {
-                let right = bounds.origin.x + bounds.size.width;
+        // an outer space of a query also matches a line start, so it has no fixed match text.
+        for query in ["cat", "cat con"] {
+            let results = futures::executor::block_on(renderer.search_document(
+                query,
+                false,
+                false,
+                metadata.clone(),
+            ))
+            .expect("search should succeed");
+            assert!(!results.is_empty(), "{query:?} should match");
+
+            let mut expected: Vec<std::ops::Range<usize>> = text
+                .match_indices(query)
+                .map(|(start, matched)| start..start + matched.len())
+                .collect();
+            for result in &results {
+                let [bounds] = result.bounds.as_slice() else {
+                    panic!("{query:?} should match on one line");
+                };
+                let covered: Vec<usize> = spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, span)| {
+                        let center = span.bounds.center();
+                        bounds.contains(&center)
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                let range = covered.first().copied().unwrap_or_default()
+                    ..covered.last().map_or(0, |last| last + 1);
+                assert_eq!(covered.len(), range.len(), "{query:?} covers a gap");
+                let position = expected.iter().position(|matched| *matched == range);
                 assert!(
-                    t_right_edges.iter().any(|edge| (edge - right).abs() < 0.01),
-                    "highlight ends at {right}, past the last matched character"
+                    position.is_some(),
+                    "{query:?} highlight covers {:?} instead of a match",
+                    &text[range]
                 );
+                expected.remove(position.unwrap_or_default());
+
+                let tallest_span = spans[range]
+                    .iter()
+                    .map(|span| span.bounds.size.height)
+                    .fold(0.0, f32::max);
+                assert!(bounds.size.height >= tallest_span - 0.01);
             }
         }
 
