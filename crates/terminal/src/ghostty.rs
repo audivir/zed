@@ -130,6 +130,50 @@ impl PtySender {
     }
 }
 
+/// Scrollback and active screen text for search, mapping byte offsets back to grid points.
+///
+/// Positions are kept per row rather than per character, since most rows hold printable ASCII
+/// whose characters sit in consecutive columns. A per-character map costs about 16 bytes per
+/// character, which is tens of megabytes on long build logs.
+#[derive(Debug, PartialEq)]
+struct SearchText {
+    text: String,
+    rows: Vec<SearchTextRow>,
+    /// Column reported for the `\n` that ends each hard line.
+    newline_column: usize,
+}
+
+#[derive(Debug, PartialEq)]
+struct SearchTextRow {
+    /// Byte offset of the row in `SearchText::text`.
+    start: usize,
+    line: i32,
+    /// Column of each character, for rows whose characters do not sit in consecutive columns.
+    columns: Option<Vec<usize>>,
+}
+
+impl SearchText {
+    /// Returns the grid point of the character starting at `offset`.
+    fn point(&self, offset: usize) -> Option<crate::Point> {
+        let row_index = self
+            .rows
+            .partition_point(|row| row.start <= offset)
+            .checked_sub(1)?;
+        let row = self.rows.get(row_index)?;
+        if self.text.as_bytes().get(offset) == Some(&b'\n') {
+            return Some(crate::Point::new(row.line, self.newline_column));
+        }
+        let column = match &row.columns {
+            None => offset - row.start,
+            Some(columns) => {
+                let char_index = self.text.get(row.start..offset)?.chars().count();
+                *columns.get(char_index)?
+            }
+        };
+        Some(crate::Point::new(row.line, column))
+    }
+}
+
 /// Wrapper around a `libghostty-vt` terminal that parses PTY output and drives rendering.
 ///
 /// Shared as `Arc<parking_lot::Mutex<GhosttyTerminal>>` between the PTY parser thread and the
@@ -152,8 +196,8 @@ pub(super) struct GhosttyTerminal {
     current_selection: Option<crate::SelectionRange>,
     /// Vi-mode cursor position, or `None` when vi mode is disabled.
     current_vi_cursor: Option<crate::Point>,
-    /// Buffer text and point map for search, dropped whenever the grid changes.
-    search_text: Option<(String, Vec<crate::Point>)>,
+    /// Buffer text for search, dropped whenever the grid changes.
+    search_text: Option<SearchText>,
     /// Formatted selection text, dropped whenever the grid or the selection changes.
     selection_text: Option<Option<String>>,
     /// Decoded RGBA pixels keyed by image ID, with the image generation they were decoded from.
@@ -989,31 +1033,21 @@ impl GhosttyTerminal {
     /// patterns match per hard line.
     pub(super) fn search_matches(&mut self, regex: &regex::Regex) -> Result<Vec<crate::Range>> {
         if self.search_text.is_none() {
-            self.search_text = Some(self.buffer_text_with_point_map()?);
+            self.search_text = Some(self.buffer_search_text()?);
         }
-        let Some((text, points)) = self.search_text.as_ref() else {
+        let Some(search_text) = self.search_text.as_ref() else {
             return Ok(Vec::new());
         };
 
         let mut matches = Vec::new();
-        // matches arrive in order, so char offsets are counted incrementally.
-        let mut counted_bytes = 0;
-        let mut counted_chars = 0;
-        let mut char_offset = |byte_offset: usize| {
-            counted_chars += text[counted_bytes..byte_offset].chars().count();
-            counted_bytes = byte_offset;
-            counted_chars
-        };
-        for found in regex.find_iter(text) {
-            if found.start() == found.end() {
-                continue;
-            }
-            let start_char = char_offset(found.start());
-            let end_char = char_offset(found.end());
-            let Some(&start_point) = points.get(start_char) else {
+        for found in regex.find_iter(&search_text.text) {
+            let Some((last_char_offset, _)) = found.as_str().char_indices().next_back() else {
                 continue;
             };
-            let Some(&end_point) = points.get(end_char - 1) else {
+            let Some(start_point) = search_text.point(found.start()) else {
+                continue;
+            };
+            let Some(end_point) = search_text.point(found.start() + last_char_offset) else {
                 continue;
             };
             matches.push(crate::Range::new(start_point, end_point));
@@ -1021,8 +1055,8 @@ impl GhosttyTerminal {
         Ok(matches)
     }
 
-    /// Extracts the scrollback and active screen as text with a `Point` for every `char`.
-    fn buffer_text_with_point_map(&self) -> Result<(String, Vec<crate::Point>)> {
+    /// Extracts the scrollback and active screen as text that maps back to grid points.
+    fn buffer_search_text(&self) -> Result<SearchText> {
         let total_rows = self.terminal.total_rows()?;
         let viewport_rows = usize::from(self.terminal.rows()?);
         let cols = usize::from(self.terminal.cols()?);
@@ -1031,55 +1065,63 @@ impl GhosttyTerminal {
         let formatted = self.format_screen_rows(total_rows, cols)?;
 
         let mut text = String::new();
-        let mut points: Vec<crate::Point> = Vec::new();
+        let mut rows = Vec::with_capacity(total_rows);
         let mut grapheme_buf = [' '; 32];
 
         for absolute_row in 0..total_rows {
             let line = absolute_row as i32 - line_base;
             let row_ref = self.screen_grid_ref(0, absolute_row)?;
             let row_wrapped = row_ref.row()?.is_wrapped()?;
-            let row_start = points.len();
+            let row_start = text.len();
 
-            match formatted.get(absolute_row) {
+            let mut columns = match formatted.get(absolute_row) {
                 // printable ASCII cells are single-width without clusters, so characters map to
                 // consecutive columns.
                 Some(row_text)
                     if row_text.len() <= cols
                         && row_text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) =>
                 {
-                    for (column, character) in row_text.chars().enumerate() {
-                        text.push(character);
-                        points.push(crate::Point::new(line, column));
-                    }
+                    text.push_str(row_text);
                     if row_wrapped {
-                        for column in row_text.len()..cols {
-                            text.push(' ');
-                            points.push(crate::Point::new(line, column));
-                        }
+                        text.extend(std::iter::repeat_n(' ', cols - row_text.len()));
                     }
+                    None
                 }
-                _ => self.append_row_cells(
-                    absolute_row,
-                    line,
-                    cols,
-                    &mut grapheme_buf,
-                    &mut text,
-                    &mut points,
-                )?,
-            }
+                _ => {
+                    let mut columns = Vec::with_capacity(cols);
+                    self.append_row_cells(
+                        absolute_row,
+                        cols,
+                        &mut grapheme_buf,
+                        &mut text,
+                        &mut columns,
+                    )?;
+                    Some(columns)
+                }
+            };
 
             if !row_wrapped {
                 // trim trailing blanks of this row, so `$` matches right after real content.
                 // Wrapped rows are full, so only the current row can have trailing blanks.
-                while points.len() > row_start && text.ends_with(' ') {
+                while text.len() > row_start && text.ends_with(' ') {
                     text.pop();
-                    points.pop();
+                    if let Some(columns) = &mut columns {
+                        columns.pop();
+                    }
                 }
                 text.push('\n');
-                points.push(crate::Point::new(line, cols));
             }
+            rows.push(SearchTextRow {
+                start: row_start,
+                line,
+                columns,
+            });
         }
-        Ok((text, points))
+        Ok(SearchText {
+            text,
+            rows,
+            newline_column: cols,
+        })
     }
 
     fn screen_grid_ref(&self, column: usize, absolute_row: usize) -> Result<screen::GridRef<'_>> {
@@ -1116,14 +1158,14 @@ impl GhosttyTerminal {
     }
 
     /// Appends the cells of one row with exact column positions, one lookup per cell.
+    /// Appends the characters of a row to `text` and the column of each of them to `columns`.
     fn append_row_cells(
         &self,
         absolute_row: usize,
-        line: i32,
         cols: usize,
         grapheme_buf: &mut [char; 32],
         text: &mut String,
-        points: &mut Vec<crate::Point>,
+        columns: &mut Vec<usize>,
     ) -> Result<()> {
         for column in 0..cols {
             let grid_ref = self.screen_grid_ref(column, absolute_row)?;
@@ -1133,11 +1175,11 @@ impl GhosttyTerminal {
             let grapheme_count = grid_ref.graphemes(grapheme_buf)?;
             if grapheme_count == 0 {
                 text.push(' ');
-                points.push(crate::Point::new(line, column));
+                columns.push(column);
             } else {
                 for &character in &grapheme_buf[..grapheme_count.min(grapheme_buf.len())] {
                     text.push(character);
-                    points.push(crate::Point::new(line, column));
+                    columns.push(column);
                 }
             }
         }
@@ -1146,7 +1188,7 @@ impl GhosttyTerminal {
 
     /// Returns the scrollback and active screen as text, without a trailing newline.
     pub(super) fn buffer_text(&self) -> Result<String> {
-        let (mut text, _) = self.buffer_text_with_point_map()?;
+        let mut text = self.buffer_search_text()?.text;
         if text.ends_with('\n') {
             text.pop();
         }
@@ -1155,7 +1197,7 @@ impl GhosttyTerminal {
 
     /// Returns up to `line_count` of the last non-blank logical lines, top to bottom.
     pub(super) fn last_non_empty_lines(&self, line_count: usize) -> Result<Vec<String>> {
-        let (text, _) = self.buffer_text_with_point_map()?;
+        let text = self.buffer_search_text()?.text;
         let mut lines: Vec<String> = text
             .split('\n')
             .filter(|line| !line.is_empty())
@@ -3409,16 +3451,21 @@ mod tests {
                 .is_wrapped()
                 .unwrap();
             let row_start = points.len();
+            let mut columns = Vec::new();
             terminal
                 .append_row_cells(
                     absolute_row,
-                    line,
                     cols,
                     &mut grapheme_buf,
                     &mut text,
-                    &mut points,
+                    &mut columns,
                 )
                 .unwrap();
+            points.extend(
+                columns
+                    .into_iter()
+                    .map(|column| crate::Point::new(line, column)),
+            );
             if !row_wrapped {
                 while points.len() > row_start && text.ends_with(' ') {
                     text.pop();
@@ -3441,8 +3488,14 @@ mod tests {
              trailing   \r\nlast"
                 .as_bytes(),
         );
+        let search_text = terminal.buffer_search_text().unwrap();
+        let points = search_text
+            .text
+            .char_indices()
+            .map(|(offset, _)| search_text.point(offset).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
-            terminal.buffer_text_with_point_map().unwrap(),
+            (search_text.text, points),
             buffer_text_per_cell(&terminal)
         );
     }
