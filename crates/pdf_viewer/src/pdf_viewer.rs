@@ -524,6 +524,9 @@ pub struct PdfView {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// Fit the zoom follows when the viewport resizes, until the user zooms otherwise.
     fit_mode: Option<FitMode>,
+    /// Context menu entries added by views that embed this one, dispatched from the PDF view so
+    /// they reach the embedding view's action handlers.
+    pub extra_context_menu_actions: Vec<(SharedString, Box<dyn gpui::Action>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -586,6 +589,7 @@ impl PdfView {
             page_flip: PageFlip::default(),
             context_menu: None,
             fit_mode: None,
+            extra_context_menu_actions: Vec::new(),
         }
     }
 
@@ -668,6 +672,7 @@ impl PdfView {
             page_flip: PageFlip::default(),
             context_menu: None,
             fit_mode: None,
+            extra_context_menu_actions: Vec::new(),
         }
     }
 
@@ -866,6 +871,13 @@ impl PdfView {
                 .separator()
                 .action("Document Properties", Box::new(ShowDocumentProperties))
                 .action("Open in Default App", Box::new(OpenInDefaultApp))
+                .when(!self.extra_context_menu_actions.is_empty(), |menu| {
+                    self.extra_context_menu_actions
+                        .iter()
+                        .fold(menu.separator(), |menu, (label, action)| {
+                            menu.action(label.clone(), action.boxed_clone())
+                        })
+                })
         });
 
         window.focus(&context_menu.focus_handle(cx), cx);
@@ -2801,6 +2813,7 @@ impl Item for PdfView {
             page_flip: PageFlip::default(),
             context_menu: None,
             fit_mode: None,
+            extra_context_menu_actions: Vec::new(),
         })))
     }
 

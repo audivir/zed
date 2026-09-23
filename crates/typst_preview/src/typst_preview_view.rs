@@ -650,7 +650,13 @@ impl TypstPreviewView {
     ) -> Entity<Self> {
         cx.new(|cx| {
             let empty_pdf = Arc::new(Pdf::empty());
-            let pdf_view = cx.new(|cx| PdfView::from_pdf(empty_pdf, window, cx));
+            let pdf_view = cx.new(|cx| {
+                let mut pdf_view = PdfView::from_pdf(empty_pdf, window, cx);
+                pdf_view
+                    .extra_context_menu_actions
+                    .push(("Export PDF".into(), Box::new(ExportPdf)));
+                pdf_view
+            });
 
             let mut this = Self {
                 active_editor: None,
