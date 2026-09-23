@@ -1089,6 +1089,15 @@ impl PdfRenderer {
                             continue;
                         };
                         for text_char in segment_chars.iter().take(text.len()) {
+                            // segments can end in a space pdfium adds after the match, which
+                            // would widen the highlight. Inner spaces lie between visible
+                            // characters, so they stay covered.
+                            if text_char
+                                .unicode_string()
+                                .is_some_and(|text| text.trim().is_empty())
+                            {
+                                continue;
+                            }
                             if let Ok(rect) = text_char.loose_bounds() {
                                 min_left = min_left.min(rect.left().value);
                                 max_right = max_right.max(rect.right().value);
@@ -1227,6 +1236,44 @@ mod tests {
         };
         assert_eq!(search(false), 3);
         assert_eq!(search(true), 2);
+
+        evict_document(id);
+    }
+
+    #[test]
+    fn search_highlights_end_at_the_last_matched_character() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (id, bytes) = fixture("whole_words.pdf");
+        evict_document(id);
+        let renderer = PdfRenderer::new(id, bytes, None);
+        let metadata = Arc::new(
+            futures::executor::block_on(renderer.get_metadata(None)).expect("fixture should open"),
+        );
+        let spans = futures::executor::block_on(renderer.extract_text_only(0, metadata.clone()))
+            .expect("fixture should have a text layer");
+        let t_right_edges: Vec<f32> = spans
+            .iter()
+            .filter(|span| span.text == "t")
+            .map(|span| span.bounds.origin.x + span.bounds.size.width)
+            .collect();
+
+        let results = futures::executor::block_on(renderer.search_document(
+            "cat",
+            false,
+            true,
+            metadata.clone(),
+        ))
+        .expect("search should succeed");
+        assert!(!results.is_empty());
+        for result in &results {
+            for bounds in &result.bounds {
+                let right = bounds.origin.x + bounds.size.width;
+                assert!(
+                    t_right_edges.iter().any(|edge| (edge - right).abs() < 0.01),
+                    "highlight ends at {right}, past the last matched character"
+                );
+            }
+        }
 
         evict_document(id);
     }
