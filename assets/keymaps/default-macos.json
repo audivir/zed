@@ -1674,6 +1674,16 @@
     "bindings": {
       "cmd-c": "pdf_viewer::Copy",
       "cmd-a": "pdf_viewer::SelectAll",
+      "cmd-=": "pdf_viewer::ZoomIn",
+      "cmd-+": "pdf_viewer::ZoomIn",
+      "cmd--": "pdf_viewer::ZoomOut",
+      "cmd-0": "pdf_viewer::ResetZoom",
+      "cmd-1": "pdf_viewer::ZoomToActualSize",
+      "cmd-shift-0": "pdf_viewer::FitToView",
+      "pageup": "pdf_viewer::PreviousPage",
+      "pagedown": "pdf_viewer::NextPage",
+      "home": "pdf_viewer::FirstPage",
+      "end": "pdf_viewer::LastPage",
     },
   },
   {

@@ -66,6 +66,10 @@ actions!(
         NextPage,
         /// Goes to the previous page.
         PreviousPage,
+        /// Goes to the first page.
+        FirstPage,
+        /// Goes to the last page.
+        LastPage,
         /// Copies the selected text.
         Copy,
         /// Selects all text in the document.
@@ -1126,6 +1130,17 @@ impl PdfView {
     fn previous_page(&mut self, _: &PreviousPage, _window: &mut Window, cx: &mut Context<Self>) {
         let target = self.current_page.saturating_sub(1);
         self.jump_to_page(target, cx);
+    }
+
+    fn first_page(&mut self, _: &FirstPage, _window: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_page(0, cx);
+    }
+
+    fn last_page(&mut self, _: &LastPage, _window: &mut Window, cx: &mut Context<Self>) {
+        let page_count = self.pdf(cx).metadata.page_count;
+        if let Some(last_page) = page_count.checked_sub(1) {
+            self.jump_to_page(last_page, cx);
+        }
     }
 
     fn compute_fit_to_view_zoom(container_bounds: Bounds<Pixels>, page_size: Size<f32>) -> f32 {
@@ -2656,6 +2671,8 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::zoom_to_actual_size))
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::previous_page))
+            .on_action(cx.listener(Self::first_page))
+            .on_action(cx.listener(Self::last_page))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::select_all))
             .size_full()
@@ -3777,6 +3794,35 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn first_and_last_page_actions_jump_to_the_document_ends(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, _window, cx| view.restore_view_state(1.0, 0, cx));
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| view.last_page(&LastPage, window, cx));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.current_page), 1);
+
+        view.update_in(cx, |view, window, cx| view.first_page(&FirstPage, window, cx));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.current_page), 0);
     }
 
     #[allow(clippy::await_holding_lock)]
