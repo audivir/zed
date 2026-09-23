@@ -5,9 +5,10 @@ use image::{Frame, RgbaImage};
 use once_cell::sync::OnceCell;
 use pdfium_render::prelude::{
     PdfBitmap, PdfBitmapFormat, PdfBookmark, PdfColor, PdfDestination, PdfDocument,
-    PdfLink as PdfiumLink, PdfPage, PdfPageAnnotation, PdfPageAnnotationCommon,
-    PdfPageRenderRotation, PdfRect, PdfRenderConfig, PdfSearchDirection, PdfSearchOptions, Pdfium,
-    PdfiumError, PdfiumInternalError, PdfiumLibraryBindings,
+    PdfDocumentMetadataTagType, PdfDocumentVersion, PdfLink as PdfiumLink, PdfPage,
+    PdfPageAnnotation, PdfPageAnnotationCommon, PdfPageRenderRotation, PdfRect, PdfRenderConfig,
+    PdfSearchDirection, PdfSearchOptions, Pdfium, PdfiumError, PdfiumInternalError,
+    PdfiumLibraryBindings,
 };
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -206,6 +207,102 @@ pub struct DocumentMetadata {
     pub error: Option<String>,
     /// Whether opening failed because a password is missing or wrong.
     pub needs_password: bool,
+    pub properties: DocumentProperties,
+}
+
+/// Descriptive fields of the document information dictionary, with empty ones left out.
+///
+/// Leaves out the modification date, since pdfium-render 0.9 looks it up under
+/// `ModificationDate` rather than the `ModDate` key documents use.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DocumentProperties {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub subject: Option<String>,
+    pub keywords: Option<String>,
+    pub creator: Option<String>,
+    pub producer: Option<String>,
+    pub created: Option<String>,
+    pub version: Option<String>,
+}
+
+impl DocumentProperties {
+    fn from_document(document: &PdfDocument) -> Self {
+        let metadata = document.metadata();
+        let tag = |tag_type| {
+            metadata
+                .get(tag_type)
+                .map(|tag| tag.value().trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let version = match document.version() {
+            PdfDocumentVersion::Unset => None,
+            PdfDocumentVersion::Pdf1_0 => Some("1.0".to_string()),
+            PdfDocumentVersion::Pdf1_1 => Some("1.1".to_string()),
+            PdfDocumentVersion::Pdf1_2 => Some("1.2".to_string()),
+            PdfDocumentVersion::Pdf1_3 => Some("1.3".to_string()),
+            PdfDocumentVersion::Pdf1_4 => Some("1.4".to_string()),
+            PdfDocumentVersion::Pdf1_5 => Some("1.5".to_string()),
+            PdfDocumentVersion::Pdf1_6 => Some("1.6".to_string()),
+            PdfDocumentVersion::Pdf1_7 => Some("1.7".to_string()),
+            PdfDocumentVersion::Pdf2_0 => Some("2.0".to_string()),
+            PdfDocumentVersion::Other(version) => {
+                Some(format!("{}.{}", version / 10, version % 10))
+            }
+        };
+        Self {
+            title: tag(PdfDocumentMetadataTagType::Title),
+            author: tag(PdfDocumentMetadataTagType::Author),
+            subject: tag(PdfDocumentMetadataTagType::Subject),
+            keywords: tag(PdfDocumentMetadataTagType::Keywords),
+            creator: tag(PdfDocumentMetadataTagType::Creator),
+            producer: tag(PdfDocumentMetadataTagType::Producer),
+            created: tag(PdfDocumentMetadataTagType::CreationDate)
+                .map(|date| format_pdf_date(&date)),
+            version,
+        }
+    }
+}
+
+/// Formats a PDF date such as `D:20240131235959+01'00'` as `2024-01-31 23:59:59 +01:00`.
+///
+/// Dates that do not follow the format are returned unchanged.
+pub fn format_pdf_date(raw: &str) -> String {
+    let date = raw.strip_prefix("D:").unwrap_or(raw);
+    let digit_count = date.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count < 4 {
+        return raw.to_string();
+    }
+    let (numbers, zone) = date.split_at(digit_count);
+
+    let mut formatted = numbers[..4].to_string();
+    for (range, separator) in [
+        (4..6, '-'),
+        (6..8, '-'),
+        (8..10, ' '),
+        (10..12, ':'),
+        (12..14, ':'),
+    ] {
+        let Some(part) = numbers.get(range) else {
+            break;
+        };
+        formatted.push(separator);
+        formatted.push_str(part);
+    }
+
+    let mut zone_chars = zone.chars();
+    match zone_chars.next() {
+        Some('Z') => formatted.push_str(" UTC"),
+        Some(sign @ ('+' | '-')) => {
+            let offset = zone_chars.filter(char::is_ascii_digit).collect::<String>();
+            if let Some(hours) = offset.get(..2) {
+                let minutes = offset.get(2..4).unwrap_or("00");
+                formatted.push_str(&format!(" {sign}{hours}:{minutes}"));
+            }
+        }
+        _ => {}
+    }
+    formatted
 }
 
 impl DocumentMetadata {
@@ -217,6 +314,7 @@ impl DocumentMetadata {
             max_width: 0.0,
             error,
             needs_password: false,
+            properties: DocumentProperties::default(),
         }
     }
 
@@ -233,6 +331,7 @@ impl DocumentMetadata {
             max_width: 0.0,
             error: Some(error.to_string()),
             needs_password: true,
+            properties: DocumentProperties::default(),
         }
     }
 }
@@ -499,6 +598,7 @@ impl PdfRenderer {
             max_width,
             error: None,
             needs_password: false,
+            properties: DocumentProperties::from_document(document),
         };
 
         Ok(metadata)
@@ -997,6 +1097,51 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
         let id = gpui::hash(&bytes);
         (id, Arc::new(bytes))
+    }
+
+    #[test]
+    fn pdf_dates_are_formatted_for_display() {
+        assert_eq!(
+            format_pdf_date("D:20240131235959+01'00'"),
+            "2024-01-31 23:59:59 +01:00"
+        );
+        assert_eq!(
+            format_pdf_date("D:20240131235959-0530"),
+            "2024-01-31 23:59:59 -05:30"
+        );
+        assert_eq!(
+            format_pdf_date("D:20240131120000Z"),
+            "2024-01-31 12:00:00 UTC"
+        );
+        assert_eq!(format_pdf_date("D:2024"), "2024");
+        assert_eq!(format_pdf_date("D:202401"), "2024-01");
+        assert_eq!(format_pdf_date("yesterday"), "yesterday");
+    }
+
+    #[test]
+    fn get_metadata_reads_the_document_information() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (id, bytes) = fixture("solid_red.pdf");
+        evict_document(id);
+        let renderer = PdfRenderer::new(id, bytes, None);
+
+        let metadata =
+            futures::executor::block_on(renderer.get_metadata(None)).expect("fixture should open");
+        assert_eq!(
+            metadata.properties,
+            DocumentProperties {
+                title: Some("untitled".to_string()),
+                author: Some("anonymous".to_string()),
+                subject: Some("unspecified".to_string()),
+                keywords: None,
+                creator: Some("anonymous".to_string()),
+                producer: Some("ReportLab PDF Library - (opensource)".to_string()),
+                created: Some("2026-08-09 17:51:06 +02:00".to_string()),
+                version: Some("1.4".to_string()),
+            }
+        );
+
+        evict_document(id);
     }
 
     #[test]

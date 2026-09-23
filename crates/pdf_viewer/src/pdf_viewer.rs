@@ -1,4 +1,5 @@
 use crate::{
+    document_properties::DocumentPropertiesModal,
     pdf::Pdf,
     pdf_renderer::{
         PageData, PageRotation, PdfChapter, PdfLinkAction, PdfSearchResult, PdfTarget, PdfTextSpan,
@@ -41,6 +42,7 @@ use workspace::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
     },
 };
+mod document_properties;
 pub mod pdf;
 pub mod pdf_renderer;
 pub mod pdf_store;
@@ -77,7 +79,9 @@ actions!(
         /// Rotates the view 90 degrees clockwise without modifying the file.
         RotatePageClockwise,
         /// Opens the PDF in the default application of the system, for example to print it.
-        OpenInDefaultApp
+        OpenInDefaultApp,
+        /// Shows the title, author, and other properties of the document.
+        ShowDocumentProperties
     ]
 );
 
@@ -817,6 +821,24 @@ impl PdfView {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn show_document_properties(
+        &mut self,
+        _: &ShowDocumentProperties,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = Workspace::for_window(window, cx) else {
+            return;
+        };
+        let pdf = self.pdf(cx);
+        let page_index = self.current_page;
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |_window, cx| {
+                DocumentPropertiesModal::new(&pdf, page_index, cx)
+            });
+        });
     }
 
     /// Returns a file holding the document, writing generated documents such as Typst previews,
@@ -2702,6 +2724,7 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::toggle_single_page_view))
             .on_action(cx.listener(Self::rotate_page_clockwise))
             .on_action(cx.listener(Self::open_in_default_app))
+            .on_action(cx.listener(Self::show_document_properties))
             .when(!has_load_error && !needs_password, |this| {
                 let show_outline = self.show_outline;
                 let show_thumbnails = self.show_thumbnails;
@@ -3050,6 +3073,27 @@ impl Render for PdfViewToolbarControls {
             .w_full()
             .justify_end()
             .gap_1()
+            .child(
+                IconButton::new("document-properties", IconName::Info)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action("Document Properties", &ShowDocumentProperties, cx)
+                    })
+                    .on_click({
+                        let pdf_view = pdf_view.downgrade();
+                        move |_, window, cx| {
+                            if let Some(view) = pdf_view.upgrade() {
+                                view.update(cx, |this, cx| {
+                                    this.show_document_properties(
+                                        &ShowDocumentProperties,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }
+                        }
+                    }),
+            )
             .child(
                 IconButton::new("open-in-default-app", IconName::ArrowUpRight)
                     .icon_size(IconSize::Small)
@@ -3724,6 +3768,64 @@ mod tests {
             cx.set_global(store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
+        });
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn document_properties_open_in_a_modal(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/solid_red.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        assert_eq!(
+            crate::document_properties::property_rows(&pdf, 0),
+            vec![
+                ("Title", "untitled".to_string()),
+                ("Author", "anonymous".to_string()),
+                ("Subject", "unspecified".to_string()),
+                ("Created", "2026-08-09 17:51:06 +02:00".to_string()),
+                ("Application", "anonymous".to_string()),
+                (
+                    "PDF Producer",
+                    "ReportLab PDF Library - (opensource)".to_string()
+                ),
+                ("PDF Version", "1.4".to_string()),
+                ("Pages", "1".to_string()),
+                ("Page Size", "35 × 35 mm".to_string()),
+                (
+                    "File Size",
+                    util::size::format_file_size(pdf.bytes.len() as u64, true)
+                ),
+            ]
+        );
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let view = cx.new_window_entity(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+
+        view.update_in(cx, |view, window, cx| {
+            view.show_document_properties(&ShowDocumentProperties, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .active_modal::<DocumentPropertiesModal>(cx)
+                    .is_some()
+            );
         });
     }
 

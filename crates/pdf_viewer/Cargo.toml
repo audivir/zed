@@ -41,8 +41,10 @@ once_cell = "1.21"
 db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 theme_settings = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
 
 [features]
 test-support = ["gpui/test-support", "editor/test-support"]
