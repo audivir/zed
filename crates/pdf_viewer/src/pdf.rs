@@ -1,5 +1,5 @@
 use crate::pdf_renderer::{
-    DocumentMetadata, PageData, PageMetadata, PageRotation, PdfRenderer, PdfTextSpan,
+    DocumentMetadata, PageData, PageMetadata, PageRotation, PdfLinkAction, PdfRenderer, PdfTextSpan,
 };
 use anyhow::{Result, bail};
 use collections::{HashMap, HashSet};
@@ -317,6 +317,49 @@ impl Pdf {
         }))
     }
 
+    /// Copies the renders and text of `previous` for the pages where `unchanged` holds.
+    ///
+    /// Lets a recompiled document show its untouched pages without rasterizing them again. Pages
+    /// with internal links are skipped, since the pages their links point to may have moved.
+    pub fn reuse_rendered_pages(&self, previous: &Pdf, unchanged: impl Fn(usize) -> bool) {
+        let reusable = |page_idx: usize| {
+            let same_size = self
+                .metadata
+                .pages
+                .get(page_idx)
+                .zip(previous.metadata.pages.get(page_idx))
+                .is_some_and(|(page, previous_page)| page.size == previous_page.size);
+            same_size && unchanged(page_idx)
+        };
+        let has_internal_links = |data: &PageData| {
+            data.links
+                .iter()
+                .any(|link| matches!(link.action, PdfLinkAction::Internal(_)))
+        };
+
+        for (source, destination) in [
+            (&previous.page_cache, &self.page_cache),
+            (&previous.thumbnail_cache, &self.thumbnail_cache),
+        ] {
+            let reused = source
+                .read()
+                .iter()
+                .filter(|(page_idx, data)| reusable(**page_idx) && !has_internal_links(data))
+                .map(|(page_idx, data)| (*page_idx, data.clone()))
+                .collect::<Vec<_>>();
+            destination.write().extend(reused);
+        }
+
+        let reused_text = previous
+            .text_only_cache
+            .read()
+            .iter()
+            .filter(|(page_idx, _)| reusable(**page_idx))
+            .map(|(page_idx, text_spans)| (*page_idx, text_spans.clone()))
+            .collect::<Vec<_>>();
+        self.text_only_cache.write().extend(reused_text);
+    }
+
     /// Returns the text spans of `page_idx` from `page_cache` or `text_only_cache`.
     pub fn text_spans_for_page(&self, page_idx: usize) -> Option<Arc<Vec<PdfTextSpan>>> {
         if let Some(data) = self.page_cache.read().get(&page_idx) {
@@ -519,6 +562,71 @@ mod tests {
         assert!(
             second.is_none(),
             "expected a cached page at the same resolution to short-circuit"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn reuse_rendered_pages_copies_unchanged_pages_without_internal_links(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let previous = Arc::new(Pdf::from_bytes(bytes.clone(), None, None).await);
+        assert_eq!(previous.metadata.page_count, 2);
+        for page_idx in 0..2 {
+            let task = cx.update(|cx| {
+                previous.clone().request_page(
+                    cx,
+                    page_idx,
+                    1.0,
+                    0.0,
+                    PageRotation::None,
+                    gpui::Priority::High,
+                    |_| {},
+                )
+            });
+            task.expect("uncached page should render").await;
+        }
+
+        let pdf = Pdf::from_bytes(bytes, None, None).await;
+        pdf.reuse_rendered_pages(&previous, |page_idx| page_idx == 1);
+        assert_eq!(
+            pdf.page_cache.read().keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        if let Some(data) = previous.page_cache.write().get_mut(&1) {
+            data.links = Arc::new(vec![crate::pdf_renderer::PdfLink {
+                bounds: gpui::Bounds::default(),
+                action: PdfLinkAction::Internal(crate::pdf_renderer::PdfTarget {
+                    page_index: 0,
+                    point: gpui::Point::default(),
+                    block_bottom_y: None,
+                    line_height: None,
+                }),
+            }]);
+        }
+        let pdf = Pdf::from_bytes(Vec::new(), None, None).await;
+        pdf.reuse_rendered_pages(&previous, |_| true);
+        assert!(
+            pdf.page_cache.read().is_empty(),
+            "pages of another size must not be reused"
+        );
+        let pdf = Pdf::from_bytes(previous.bytes.to_vec(), None, None).await;
+        pdf.reuse_rendered_pages(&previous, |_| true);
+        assert_eq!(
+            pdf.page_cache.read().keys().copied().collect::<Vec<_>>(),
+            vec![0],
+            "a page linking into the document must be rendered again"
         );
     }
 

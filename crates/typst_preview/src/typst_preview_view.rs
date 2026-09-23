@@ -60,6 +60,8 @@ pub struct TypstPreviewView {
     package_download_task: Option<Task<()>>,
     /// Files that currently show diagnostics from this preview, cleared on the next compile.
     published_diagnostic_paths: HashSet<PathBuf>,
+    /// Id of the `Pdf` shown in the preview and the hashes of the Typst pages it was made from.
+    rendered_page_hashes: Option<(u64, Vec<u128>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,6 +98,11 @@ struct TypstDiagnostic {
     range: Option<Range<usize>>,
     /// `range` as UTF-16 points, for files without an open buffer to convert offsets.
     point_range: Option<Range<PointUtf16>>,
+}
+
+/// Hashes each page so renders of pages that did not change between compiles can be reused.
+fn page_hashes(document: &PagedDocument) -> Vec<u128> {
+    document.pages().iter().map(typst::utils::hash128).collect()
 }
 
 /// Resolves the span of each diagnostic to a file path and byte range.
@@ -661,6 +668,7 @@ impl TypstPreviewView {
                 requested_packages: HashSet::default(),
                 package_download_task: None,
                 published_diagnostic_paths: HashSet::default(),
+                rendered_page_hashes: None,
             };
 
             this.set_editor(active_editor, window, cx);
@@ -903,6 +911,7 @@ impl TypstPreviewView {
         document: Arc<PagedDocument>,
         new_world_arc: Arc<Mutex<TypstSystemWorld>>,
         pages: Vec<PageMetadata>,
+        page_hashes: Vec<u128>,
         max_width: f32,
         selection_start: usize,
         should_reveal: bool,
@@ -916,6 +925,15 @@ impl TypstPreviewView {
         cx.spawn(async move |view, cx| {
             let pdf = Arc::new(Pdf::from_bytes(bytes, Some((pages, max_width)), None).await);
             view.update(cx, |view, cx| {
+                let previous_pdf = view.pdf_view.read(cx).pdf(cx);
+                if let Some((previous_id, previous_hashes)) = &view.rendered_page_hashes
+                    && *previous_id == previous_pdf.id
+                {
+                    pdf.reuse_rendered_pages(&previous_pdf, |page_idx| {
+                        previous_hashes.get(page_idx) == page_hashes.get(page_idx)
+                    });
+                }
+                view.rendered_page_hashes = Some((pdf.id, page_hashes));
                 view.pdf_view.update(cx, |pv, cx| {
                     pv.update_pdf(pdf, cx);
                     let document_clone = document.clone();
@@ -1137,6 +1155,7 @@ impl TypstPreviewView {
                         Arc<PagedDocument>,
                         Arc<Mutex<TypstSystemWorld>>,
                         Vec<PageMetadata>,
+                        Vec<u128>,
                         f32,
                     )>,
                 }
@@ -1224,6 +1243,7 @@ impl TypstPreviewView {
 
                         let mut max_width = 0.0f32;
                         let mut pages = Vec::with_capacity(document.pages().len());
+                        let page_hashes = page_hashes(&document);
 
                         for (i, page) in document.pages().iter().enumerate() {
                             let w = page.frame.width().to_pt() as f32;
@@ -1261,6 +1281,7 @@ impl TypstPreviewView {
                                 Arc::new(document),
                                 world_arc_ret,
                                 pages,
+                                page_hashes,
                                 max_width,
                             )),
                         }
@@ -1277,7 +1298,7 @@ impl TypstPreviewView {
                         cx,
                     );
                     match compile_outcome.result {
-                        Ok((bytes, document, new_world_arc, pages, max_width)) => {
+                        Ok((bytes, document, new_world_arc, pages, page_hashes, max_width)) => {
                             let warnings = compile_outcome
                                 .diagnostics
                                 .iter()
@@ -1290,6 +1311,7 @@ impl TypstPreviewView {
                                 document,
                                 new_world_arc,
                                 pages,
+                                page_hashes,
                                 max_width,
                                 selection_start,
                                 should_reveal_selection,
@@ -1988,6 +2010,29 @@ mod tests {
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, active_path);
+    }
+
+    #[test]
+    fn editing_one_page_only_changes_its_hash() {
+        let root = ScratchDir::new("page_hashes");
+        let main_path = root.join("main.typ");
+        let mut world = TypstSystemWorld::new(root.0.clone());
+
+        let mut compile = |source: &str| {
+            world.update_main(source.to_string().into(), &main_path);
+            let document = typst::compile::<PagedDocument>(&world)
+                .output
+                .expect("document should compile");
+            page_hashes(&document)
+        };
+        let before = compile("First page\n#pagebreak()\nSecond page\n#pagebreak()\nThird page\n");
+        let after =
+            compile("First page\n#pagebreak()\nSecond page, edited\n#pagebreak()\nThird page\n");
+
+        assert_eq!(before.len(), 3);
+        assert_eq!(before[0], after[0]);
+        assert_ne!(before[1], after[1]);
+        assert_eq!(before[2], after[2]);
     }
 
     #[test]
