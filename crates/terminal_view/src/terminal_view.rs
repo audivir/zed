@@ -562,6 +562,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let link = self
+            .terminal
+            .update(cx, |terminal, _| terminal.url_at_position(position));
         let assistant_enabled = self
             .workspace
             .upgrade()
@@ -569,6 +572,16 @@ impl TerminalView {
             .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
+                .when_some(link, |menu, url| {
+                    let copied_url = url.clone();
+                    menu.entry("Open Link", None, move |_, cx| cx.open_url(&url))
+                        .entry("Copy Link Address", None, move |_, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copied_url.clone(),
+                            ))
+                        })
+                        .separator()
+                })
                 .when(self.shows_workspace_actions(), |menu| {
                     menu.action("New Terminal", Box::new(NewTerminal::default()))
                         .action(

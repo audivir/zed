@@ -2310,6 +2310,20 @@ impl Terminal {
         }
     }
 
+    /// Returns the URL at a window position, like a hovered link but without the modifier key.
+    pub fn url_at_position(&mut self, position: GpuiPoint<Pixels>) -> Option<String> {
+        if !self.last_content.terminal_bounds.bounds.contains(&position) {
+            return None;
+        }
+        let point = grid_point(
+            position,
+            self.last_content.terminal_bounds,
+            self.last_content.display_offset,
+        );
+        let hyperlink = self.find_hyperlink_at_point(point)?;
+        (hyperlink.is_url && !hyperlink.text.starts_with("file://")).then_some(hyperlink.text)
+    }
+
     fn find_hyperlink_at_point(&mut self, point: Point) -> Option<HyperlinkMatch> {
         let ghostty = self.ghostty.as_ref()?;
         match ghostty.lock().hyperlink_at(
@@ -4845,6 +4859,27 @@ mod tests {
                 terminal.take_pty_write_log(),
                 vec![b"primary selection".to_vec()]
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_url_at_position_finds_links_without_a_modifier(cx: &mut TestAppContext) {
+        let terminal = init_terminal_test(
+            cx,
+            b"Visit \x1b]8;;https://zed.dev/\x1b\\here\x1b]8;;\x1b\\ now\r\nsee https://example.com/docs\r\n",
+        );
+        terminal.update(cx, |terminal, _| {
+            assert_eq!(
+                terminal.url_at_position(point(px(70.), px(5.))).as_deref(),
+                Some("https://zed.dev/")
+            );
+            assert_eq!(
+                terminal
+                    .url_at_position(point(px(100.), px(25.)))
+                    .as_deref(),
+                Some("https://example.com/docs")
+            );
+            assert_eq!(terminal.url_at_position(point(px(10.), px(5.))), None);
         });
     }
 
