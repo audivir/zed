@@ -527,6 +527,8 @@ pub struct PdfView {
     /// Context menu entries added by views that embed this one, dispatched from the PDF view so
     /// they reach the embedding view's action handlers.
     pub extra_context_menu_actions: Vec<(SharedString, Box<dyn gpui::Action>)>,
+    /// URL of the link a right-click landed on, recorded before the context menu opens.
+    context_menu_link: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -590,6 +592,7 @@ impl PdfView {
             context_menu: None,
             fit_mode: None,
             extra_context_menu_actions: Vec::new(),
+            context_menu_link: None,
         }
     }
 
@@ -673,6 +676,7 @@ impl PdfView {
             context_menu: None,
             fit_mode: None,
             extra_context_menu_actions: Vec::new(),
+            context_menu_link: None,
         }
     }
 
@@ -852,8 +856,15 @@ impl PdfView {
         cx: &mut Context<Self>,
     ) {
         let has_selection = self.text_selection.is_some();
+        let link = self.context_menu_link.take();
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
+                .when_some(link, |menu, url| {
+                    menu.entry("Copy Link Address", None, move |_, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()))
+                    })
+                    .separator()
+                })
                 .action_disabled_when(!has_selection, "Copy", Box::new(Copy))
                 .action("Select All", Box::new(SelectAll))
                 .separator()
@@ -2320,6 +2331,20 @@ impl Element for PdfContentElement {
                             // translucent, since theme hover colors may hide the link text.
                             .hover(|style| style.bg(gpui::rgba(0x0060df22)))
                             .tooltip(Tooltip::text(tooltip))
+                            .on_mouse_down(MouseButton::Right, {
+                                let view_weak = self.pdf_view.downgrade();
+                                let url = match &link.action {
+                                    PdfLinkAction::External(url) => Some(url.clone()),
+                                    PdfLinkAction::Internal(_) => None,
+                                };
+                                move |_, _window, cx| {
+                                    if let Some(view) = view_weak.upgrade() {
+                                        view.update(cx, |this, _| {
+                                            this.context_menu_link = url.clone()
+                                        });
+                                    }
+                                }
+                            })
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                                 log::debug!("Clicked {:?}", action);
                                 match action.clone() {
@@ -2814,6 +2839,7 @@ impl Item for PdfView {
             context_menu: None,
             fit_mode: None,
             extra_context_menu_actions: Vec::new(),
+            context_menu_link: None,
         })))
     }
 
@@ -4472,6 +4498,51 @@ mod tests {
         });
         let expected = KEYBOARD_SCROLL_STEP + viewport_height * (1.0 - VIEWPORT_SCROLL_OVERLAP);
         assert!((scroll_y(cx) - expected).abs() < 0.01, "{}", scroll_y(cx));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn right_clicking_a_link_offers_to_copy_its_address(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/external_link.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, _window, cx| view.restore_view_state(1.0, 0, cx));
+        cx.run_until_parked();
+
+        // the link spans x 20..120 and y 20..60 from the bottom of the 200pt page.
+        let page_origin = cx
+            .debug_bounds("pdf-page-0")
+            .unwrap_or_else(|| panic!("page 0 should be laid out"))
+            .origin;
+        let link_center = page_origin + gpui::point(px(70.), px(160.));
+        cx.simulate_mouse_down(link_center, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let menu = view
+            .read_with(cx, |view, _| {
+                view.context_menu.as_ref().map(|(menu, _, _)| menu.clone())
+            })
+            .expect("right-clicking a link should open the context menu");
+
+        menu.update_in(cx, |menu, window, cx| {
+            menu.select_first(&menu::SelectFirst, window, cx);
+            menu.confirm(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("https://zed.dev/".to_string())
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
