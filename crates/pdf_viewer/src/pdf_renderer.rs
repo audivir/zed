@@ -99,6 +99,74 @@ impl PageRotation {
         matches!(self, PageRotation::Clockwise90 | PageRotation::Clockwise270)
     }
 
+    /// Returns the on-screen size of a page with the given unrotated size.
+    pub fn display_size(self, page_size: Size<f32>) -> Size<f32> {
+        if self.swaps_dimensions() {
+            Size {
+                width: page_size.height,
+                height: page_size.width,
+            }
+        } else {
+            page_size
+        }
+    }
+
+    /// Maps a point in unrotated page coordinates to the rotated, on-screen page.
+    pub fn to_display_point(self, point: Point<f32>, page_size: Size<f32>) -> Point<f32> {
+        let Size { width, height } = page_size;
+        match self {
+            PageRotation::None => point,
+            PageRotation::Clockwise90 => Point {
+                x: height - point.y,
+                y: point.x,
+            },
+            PageRotation::Clockwise180 => Point {
+                x: width - point.x,
+                y: height - point.y,
+            },
+            PageRotation::Clockwise270 => Point {
+                x: point.y,
+                y: width - point.x,
+            },
+        }
+    }
+
+    /// Maps a point on the rotated, on-screen page back to unrotated page coordinates.
+    pub fn to_page_point(self, point: Point<f32>, page_size: Size<f32>) -> Point<f32> {
+        let Size { width, height } = page_size;
+        match self {
+            PageRotation::None => point,
+            PageRotation::Clockwise90 => Point {
+                x: point.y,
+                y: height - point.x,
+            },
+            PageRotation::Clockwise180 => Point {
+                x: width - point.x,
+                y: height - point.y,
+            },
+            PageRotation::Clockwise270 => Point {
+                x: width - point.y,
+                y: point.x,
+            },
+        }
+    }
+
+    /// Maps a rectangle in unrotated page coordinates to the rotated, on-screen page.
+    pub fn to_display_bounds(self, bounds: Bounds<f32>, page_size: Size<f32>) -> Bounds<f32> {
+        let first = self.to_display_point(bounds.origin, page_size);
+        let second = self.to_display_point(bounds.bottom_right(), page_size);
+        Bounds::from_corners(
+            Point {
+                x: first.x.min(second.x),
+                y: first.y.min(second.y),
+            },
+            Point {
+                x: first.x.max(second.x),
+                y: first.y.max(second.y),
+            },
+        )
+    }
+
     fn to_pdfium(self) -> PdfPageRenderRotation {
         match self {
             PageRotation::None => PdfPageRenderRotation::None,
@@ -876,6 +944,49 @@ impl PdfRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_maps_page_points_to_the_display_and_back() {
+        let page_size = Size {
+            width: 100.0,
+            height: 200.0,
+        };
+        let point = Point { x: 10.0, y: 30.0 };
+        let cases = [
+            (PageRotation::None, Point { x: 10.0, y: 30.0 }),
+            (PageRotation::Clockwise90, Point { x: 170.0, y: 10.0 }),
+            (PageRotation::Clockwise180, Point { x: 90.0, y: 170.0 }),
+            (PageRotation::Clockwise270, Point { x: 30.0, y: 90.0 }),
+        ];
+        for (rotation, expected) in cases {
+            let display = rotation.to_display_point(point, page_size);
+            assert_eq!(display, expected, "{rotation:?}");
+            let display_size = rotation.display_size(page_size);
+            assert!(display.x <= display_size.width && display.y <= display_size.height);
+            assert_eq!(
+                rotation.to_page_point(display, page_size),
+                point,
+                "{rotation:?}"
+            );
+        }
+
+        let bounds = Bounds {
+            origin: point,
+            size: Size {
+                width: 20.0,
+                height: 5.0,
+            },
+        };
+        let rotated = PageRotation::Clockwise90.to_display_bounds(bounds, page_size);
+        assert_eq!(rotated.origin, Point { x: 165.0, y: 10.0 });
+        assert_eq!(
+            rotated.size,
+            Size {
+                width: 5.0,
+                height: 20.0
+            }
+        );
+    }
 
     // tests load the same fixture and would share one cached document, so they run serialized
     // and evict before and after each test.

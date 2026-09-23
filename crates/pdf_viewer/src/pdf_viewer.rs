@@ -244,7 +244,13 @@ fn selection_to_text(
 }
 
 /// Screen bounds and text spans of a page, captured in `prepaint` for drag hit-testing.
-type SelectionHitRegion = (usize, Bounds<Pixels>, Arc<Vec<PdfTextSpan>>);
+struct SelectionHitRegion {
+    page_index: usize,
+    bounds: Bounds<Pixels>,
+    text_spans: Arc<Vec<PdfTextSpan>>,
+    /// Unrotated page size in points, which maps rotated screen points back to page points.
+    page_size: Size<f32>,
+}
 
 /// Converts a window-space drag point into a `TextPosition`.
 ///
@@ -254,25 +260,37 @@ fn hit_test_selection_point(
     regions: &[SelectionHitRegion],
     point: Point<Pixels>,
     zoom: f32,
+    rotation: PageRotation,
 ) -> Option<TextPosition> {
     let region = regions
         .iter()
-        .find(|(_, bounds, _)| bounds.contains(&point))
+        .find(|region| region.bounds.contains(&point))
         .or_else(|| {
-            regions.iter().min_by(|(_, a, _), (_, b, _)| {
-                vertical_distance(*a, point).total_cmp(&vertical_distance(*b, point))
+            regions.iter().min_by(|a, b| {
+                vertical_distance(a.bounds, point).total_cmp(&vertical_distance(b.bounds, point))
             })
         })?;
-    let (page_index, bounds, text_spans) = region;
-    let local = Point {
-        x: f32::from(point.x - bounds.origin.x) / zoom,
-        y: f32::from(point.y - bounds.origin.y) / zoom,
-    };
-    let char_index = nearest_char_index(text_spans, local)?;
+    let local = page_point_at(point, region.bounds, zoom, rotation, region.page_size);
+    let char_index = nearest_char_index(&region.text_spans, local)?;
     Some(TextPosition {
-        page_index: *page_index,
+        page_index: region.page_index,
         char_index,
     })
+}
+
+/// Converts a window-space point into unrotated page coordinates in points.
+fn page_point_at(
+    point: Point<Pixels>,
+    page_bounds: Bounds<Pixels>,
+    zoom: f32,
+    rotation: PageRotation,
+    page_size: Size<f32>,
+) -> Point<f32> {
+    let display = Point {
+        x: f32::from(point.x - page_bounds.origin.x) / zoom,
+        y: f32::from(point.y - page_bounds.origin.y) / zoom,
+    };
+    rotation.to_page_point(display, page_size)
 }
 
 fn vertical_distance(bounds: Bounds<Pixels>, point: Point<Pixels>) -> f32 {
@@ -510,6 +528,31 @@ impl PdfView {
     }
 
     /// Returns the current PDF regardless of its source.
+    /// Returns the on-screen size of a page in points, after the view rotation.
+    fn display_page_size(&self, pdf: &Pdf, page_index: usize) -> Size<f32> {
+        self.rotation
+            .display_size(pdf.get_page_size(page_index).unwrap_or_default())
+    }
+
+    /// Returns the widest on-screen page width in points, after the view rotation.
+    fn display_max_width(&self, pdf: &Pdf) -> f32 {
+        if self.rotation.swaps_dimensions() {
+            pdf.metadata
+                .pages
+                .iter()
+                .map(|page| page.size.height)
+                .fold(0.0, f32::max)
+        } else {
+            pdf.metadata.max_width
+        }
+    }
+
+    /// Returns the on-screen offset of a target within its page, in points.
+    fn display_target_point(&self, pdf: &Pdf, target: &PdfTarget) -> Point<f32> {
+        let page_size = pdf.get_page_size(target.page_index).unwrap_or_default();
+        self.rotation.to_display_point(target.point, page_size)
+    }
+
     pub fn pdf(&self, cx: &App) -> Arc<Pdf> {
         match &self.source {
             PdfSource::Item(item) => item.read(cx).pdf.clone(),
@@ -730,9 +773,6 @@ impl PdfView {
         cx: &mut Context<Self>,
     ) {
         self.rotation = self.rotation.rotated_clockwise();
-        // selection, search highlights, and links are not rotation-aware yet.
-        self.text_selection = None;
-        self.is_selecting_text = false;
         // a quarter turn swaps the page dimensions, so re-snap the scroll position.
         self.jump_to_page(self.current_page, cx);
         cx.notify();
@@ -963,7 +1003,8 @@ impl PdfView {
 
     fn fit_to_view(&mut self, _: &FitToView, _window: &mut Window, cx: &mut Context<Self>) {
         let pdf = self.pdf(cx);
-        let page_size = pdf.get_page_size(self.current_page).ok();
+        let page_size = (self.current_page < pdf.metadata.page_count)
+            .then(|| self.display_page_size(&pdf, self.current_page));
         if let Some((bounds, size)) = self.container_bounds.zip(page_size) {
             let new_zoom = PdfView::compute_fit_to_view_zoom(bounds, size);
             self.set_zoom(new_zoom, None, cx);
@@ -972,7 +1013,8 @@ impl PdfView {
 
     fn fit_to_width(&mut self, _: &FitToWidth, _window: &mut Window, cx: &mut Context<Self>) {
         let pdf = self.pdf(cx);
-        let page_size = pdf.get_page_size(self.current_page).ok();
+        let page_size = (self.current_page < pdf.metadata.page_count)
+            .then(|| self.display_page_size(&pdf, self.current_page));
         if let Some((bounds, size)) = self.container_bounds.zip(page_size) {
             let container_width: f32 = bounds.size.width.into();
             let scale_x = container_width / size.width;
@@ -1082,8 +1124,9 @@ impl PdfView {
             .container_bounds
             .map(|b| b.size.width)
             .unwrap_or(px(0.0));
-        let old_max_width = px(pdf.metadata.max_width * old_zoom);
-        let new_max_width = px(pdf.metadata.max_width * self.zoom_level);
+        let max_width = self.display_max_width(&pdf);
+        let old_max_width = px(max_width * old_zoom);
+        let new_max_width = px(max_width * self.zoom_level);
 
         let old_base_offset_x = (viewport_width - old_max_width).max(px(0.0)) / 2.0;
         let new_base_offset_x = (viewport_width - new_max_width).max(px(0.0)) / 2.0;
@@ -1101,7 +1144,7 @@ impl PdfView {
         let mut local_y = px(0.0);
 
         for i in 0..page_count {
-            let page_height = px(pdf.get_page_size(i).unwrap_or_default().height * old_zoom);
+            let page_height = px(self.display_page_size(&pdf, i).height * old_zoom);
             if doc_y < current_top + page_height + gap {
                 target_page = i;
                 local_y = doc_y - current_top;
@@ -1112,8 +1155,7 @@ impl PdfView {
 
         let mut new_current_top = px(0.0);
         for i in 0..target_page {
-            new_current_top +=
-                px(pdf.get_page_size(i).unwrap_or_default().height * self.zoom_level) + gap;
+            new_current_top += px(self.display_page_size(&pdf, i).height * self.zoom_level) + gap;
         }
 
         let new_doc_y = new_current_top + local_y * zoom_ratio;
@@ -1139,10 +1181,13 @@ impl PdfView {
 
     /// Scrolls to the top of a page.
     pub fn jump_to_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        // the page point that lands in the top-left corner of the rotated page.
+        let page_size = self.pdf(cx).get_page_size(page_index).unwrap_or_default();
+        let point = self.rotation.to_page_point(Point::default(), page_size);
         self.jump_to_target(
             PdfTarget {
                 page_index,
-                point: Point::default(),
+                point,
                 block_bottom_y: None,
                 line_height: None,
             },
@@ -1165,13 +1210,14 @@ impl PdfView {
         let zoom = self.zoom_level;
 
         // sum the heights and gaps of all pages before the target page.
-        for page in pdf.metadata.pages.iter().take(target.page_index) {
-            total_y_offset += page.size.height * zoom + PAGE_GAP;
+        for page_index in 0..target.page_index {
+            total_y_offset += self.display_page_size(&pdf, page_index).height * zoom + PAGE_GAP;
         }
 
         // add the offset within the target page.
-        total_y_offset += target.point.y * zoom;
-        let x_offset = target.point.x * zoom;
+        let point = self.display_target_point(&pdf, &target);
+        total_y_offset += point.y * zoom;
+        let x_offset = point.x * zoom;
 
         // scroll offsets are negative.
         let mut scroll_y = total_y_offset;
@@ -1228,11 +1274,12 @@ impl PdfView {
 
         let zoom = self.zoom_level;
         let mut target_y = 0.0;
-        for page in pdf.metadata.pages.iter().take(target.page_index) {
-            target_y += page.size.height * zoom + PAGE_GAP;
+        for page_index in 0..target.page_index {
+            target_y += self.display_page_size(&pdf, page_index).height * zoom + PAGE_GAP;
         }
-        target_y += target.point.y * zoom;
-        let target_x = target.point.x * zoom;
+        let point = self.display_target_point(&pdf, &target);
+        target_y += point.y * zoom;
+        let target_x = point.x * zoom;
 
         if let Some(bounds) = self.container_bounds {
             let scroll = self.scroll_handle.offset();
@@ -1350,16 +1397,7 @@ impl Element for PdfContentElement {
         let first_page = pdf.metadata.pages.first()?;
 
         // a quarter turn swaps the on-screen page box so the rotated image fills it.
-        let display_page_size = |size: Size<f32>| {
-            if rotation.swaps_dimensions() {
-                Size {
-                    width: size.height,
-                    height: size.width,
-                }
-            } else {
-                size
-            }
-        };
+        let display_page_size = |size: Size<f32>| rotation.display_size(size);
 
         // a restored zoom takes priority over the initial fit-to-view.
         let initial_zoom_level = (first_layout && !suppress_initial_fit_to_view)
@@ -1582,15 +1620,35 @@ impl Element for PdfContentElement {
             let zoom = zoom_level;
 
             let active_data = page_data.as_ref().or(stale_data.as_ref());
-            // selection, links, and search highlights use unrotated page coordinates, so they are
-            // disabled while rotated.
-            let interactive_layers_supported = rotation == PageRotation::None;
-            if interactive_layers_supported && let Some(data) = active_data {
-                selection_hit_regions.push((page_idx, global_page_bounds, data.text_spans.clone()));
+            // text, links, and matches use unrotated page coordinates in points.
+            let page_size = pdf
+                .metadata
+                .pages
+                .get(page_idx)
+                .map(|page| page.size)
+                .unwrap_or_default();
+            let to_display_bounds = |bounds: Bounds<f32>| {
+                let bounds = rotation.to_display_bounds(bounds, page_size);
+                Bounds {
+                    origin: Point {
+                        x: px(bounds.origin.x * zoom_level),
+                        y: px(bounds.origin.y * zoom_level),
+                    },
+                    size: Size {
+                        width: px(bounds.size.width * zoom_level),
+                        height: px(bounds.size.height * zoom_level),
+                    },
+                }
+            };
+            if let Some(data) = active_data {
+                selection_hit_regions.push(SelectionHitRegion {
+                    page_index: page_idx,
+                    bounds: global_page_bounds,
+                    text_spans: data.text_spans.clone(),
+                    page_size,
+                });
             }
-            let text_spans_for_selection = interactive_layers_supported
-                .then(|| active_data.map(|data| data.text_spans.clone()))
-                .flatten();
+            let text_spans_for_selection = active_data.map(|data| data.text_spans.clone());
             let view_weak_for_selection = view_weak.clone();
 
             let mut child_element = div()
@@ -1605,15 +1663,16 @@ impl Element for PdfContentElement {
                 .debug_selector(|| format!("pdf-page-{page_idx}"))
                 .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                     if let Some(handler) = &page_click_handler {
-                        let local_x = e.position.x - global_page_bounds.origin.x;
-                        let local_y = e.position.y - global_page_bounds.origin.y;
-
-                        let pdf_x = local_x.as_f32() / zoom;
-                        let pdf_y = local_y.as_f32() / zoom;
-
+                        let point = page_point_at(
+                            e.position,
+                            global_page_bounds,
+                            zoom,
+                            rotation,
+                            page_size,
+                        );
                         if let Some(view) = view_weak.upgrade() {
                             view.update(cx, |_, cx| {
-                                handler(page_idx, Point { x: pdf_x, y: pdf_y }, window, cx);
+                                handler(page_idx, point, window, cx);
                             });
                         }
                     }
@@ -1622,10 +1681,8 @@ impl Element for PdfContentElement {
                     let Some(text_spans) = &text_spans_for_selection else {
                         return;
                     };
-                    let local = Point {
-                        x: (e.position.x - global_page_bounds.origin.x).as_f32() / zoom,
-                        y: (e.position.y - global_page_bounds.origin.y).as_f32() / zoom,
-                    };
+                    let local =
+                        page_point_at(e.position, global_page_bounds, zoom, rotation, page_size);
                     let Some(char_index) = nearest_char_index(text_spans, local) else {
                         return;
                     };
@@ -1740,42 +1797,36 @@ impl Element for PdfContentElement {
             {
                 let mut selection_layer = div().absolute().top_0().left_0().size_full();
                 for rect in selection_highlight_rects(&data.text_spans, range) {
-                    let top = px(rect.origin.y * zoom_level);
-                    let left = px(rect.origin.x * zoom_level);
-                    let w = px(rect.size.width * zoom_level);
-                    let h = px(rect.size.height * zoom_level);
+                    let rect = to_display_bounds(rect);
                     selection_layer = selection_layer.child(
                         div()
                             .absolute()
-                            .top(top)
-                            .left(left)
-                            .w(w)
-                            .h(h)
+                            .top(rect.origin.y)
+                            .left(rect.origin.x)
+                            .w(rect.size.width)
+                            .h(rect.size.height)
                             .bg(cx.theme().colors().element_selection_background),
                     );
                 }
                 child_element = child_element.child(selection_layer);
             }
 
-            if interactive_layers_supported && let Some(data) = active_data {
+            if let Some(data) = active_data {
                 let mut link_layer = div().absolute().top_0().left_0().size_full();
 
                 for link in data.links.iter() {
                     let action = link.action.clone();
                     let view_weak = self.pdf_view.downgrade();
 
-                    let top = px(link.bounds.origin.y * zoom_level);
-                    let left = px(link.bounds.origin.x * zoom_level);
-                    let w = px(link.bounds.size.width * zoom_level);
-                    let h = px(link.bounds.size.height * zoom_level);
+                    let bounds = to_display_bounds(link.bounds);
 
                     link_layer = link_layer.child(
                         div()
                             .absolute()
-                            .top(top)
-                            .left(left)
-                            .w(w)
-                            .h(h)
+                            .top(bounds.origin.y)
+                            .left(bounds.origin.x)
+                            .w(bounds.size.width)
+                            .h(bounds.size.height)
                             .bg(gpui::rgba(0xff000044))
                             .border_1()
                             .border_color(gpui::rgba(0xff0000ff))
@@ -1807,7 +1858,7 @@ impl Element for PdfContentElement {
                 child_element = child_element.child(link_layer);
             }
 
-            if interactive_layers_supported && !search_matches.is_empty() {
+            if !search_matches.is_empty() {
                 let mut highlight_layer = div().absolute().top_0().left_0().size_full();
 
                 for (match_idx, m) in search_matches.iter().enumerate() {
@@ -1826,18 +1877,15 @@ impl Element for PdfContentElement {
                         };
 
                         for bound in &m.bounds {
-                            let top = px(bound.origin.y * zoom_level);
-                            let left = px(bound.origin.x * zoom_level);
-                            let w = px(bound.size.width * zoom_level);
-                            let h = px(bound.size.height * zoom_level);
+                            let bound = to_display_bounds(*bound);
 
                             highlight_layer = highlight_layer.child(
                                 div()
                                     .absolute()
-                                    .top(top)
-                                    .left(left)
-                                    .w(w)
-                                    .h(h)
+                                    .top(bound.origin.y)
+                                    .left(bound.origin.x)
+                                    .w(bound.size.width)
+                                    .h(bound.size.height)
                                     .bg(bg_color)
                                     .border_1()
                                     .border_color(border_color)
@@ -1849,8 +1897,10 @@ impl Element for PdfContentElement {
                 child_element = child_element.child(highlight_layer);
             }
 
+            // the bar marks source lines, which only run horizontally on unrotated pages.
             if let Some((anchor, jump)) = &active_jump
                 && jump.page_index == page_idx
+                && rotation == PageRotation::None
             {
                 use ScrollAnchor::*;
 
@@ -1914,6 +1964,7 @@ impl Element for PdfContentElement {
                                 &selection_hit_regions,
                                 event.position,
                                 zoom_level,
+                                rotation,
                             ) else {
                                 return;
                             };
@@ -3290,9 +3341,9 @@ mod tests {
     #[test]
     fn hit_test_selection_point_falls_back_to_nearest_region_outside_all_of_them() {
         let page0 = Arc::new(two_line_fixture());
-        let regions: Vec<SelectionHitRegion> = vec![(
-            0,
-            Bounds {
+        let regions = vec![SelectionHitRegion {
+            page_index: 0,
+            bounds: Bounds {
                 origin: Point {
                     x: px(0.0),
                     y: px(0.0),
@@ -3302,8 +3353,12 @@ mod tests {
                     height: px(100.0),
                 },
             },
-            page0,
-        )];
+            text_spans: page0,
+            page_size: Size {
+                width: 100.0,
+                height: 100.0,
+            },
+        }];
 
         // inside the page bounds.
         let inside = hit_test_selection_point(
@@ -3313,6 +3368,7 @@ mod tests {
                 y: px(5.0),
             },
             1.0,
+            PageRotation::None,
         );
         assert_eq!(
             inside,
@@ -3330,6 +3386,7 @@ mod tests {
                 y: px(10_000.0),
             },
             1.0,
+            PageRotation::None,
         );
         assert!(below.is_some());
 
@@ -3340,7 +3397,8 @@ mod tests {
                     x: px(0.0),
                     y: px(0.0)
                 },
-                1.0
+                1.0,
+                PageRotation::None,
             ),
             None
         );
@@ -3443,7 +3501,7 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[gpui::test]
-    async fn rotating_clockwise_four_times_returns_to_unrotated_and_clears_selection(
+    async fn rotating_clockwise_four_times_returns_to_unrotated_and_keeps_selection(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx);
@@ -3461,7 +3519,7 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.rotation, PageRotation::None);
 
-            // rotation must drop the selection, since it is not rotation-aware.
+            // the selection is in page coordinates, so it survives rotation.
             view.text_selection = Some(TextSelection {
                 anchor: TextPosition {
                     page_index: 0,
@@ -3476,8 +3534,7 @@ mod tests {
 
             view.rotate_page_clockwise(&RotatePageClockwise, window, cx);
             assert_eq!(view.rotation, PageRotation::Clockwise90);
-            assert!(view.text_selection.is_none());
-            assert!(!view.is_selecting_text);
+            assert!(view.text_selection.is_some());
 
             view.rotate_page_clockwise(&RotatePageClockwise, window, cx);
             assert_eq!(view.rotation, PageRotation::Clockwise180);
@@ -3539,6 +3596,90 @@ mod tests {
                  whatever page(s) happened to already be rendered on initial layout"
             );
         });
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn double_click_selects_the_same_word_on_rotated_pages(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/two_pages_with_text.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let page_size = pdf.get_page_size(0).unwrap();
+
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, _window, cx| view.restore_view_state(1.0, 0, cx));
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        let text_spans = pdf
+            .text_spans_for_page(0)
+            .expect("page 0 should have rendered with real text by now");
+        let (target_index, expected_range) = (0..text_spans.len())
+            .map(|i| (i, word_range_at(&text_spans, i)))
+            .find(|(i, range)| {
+                range.len() > 1 && span_char_class(&text_spans[*i]) == CharClass::Word
+            })
+            .expect("fixture should contain at least one real word");
+        let target_center = text_spans[target_index].bounds.center();
+
+        for rotations in 1..=3 {
+            view.update_in(cx, |view, window, cx| {
+                view.text_selection = None;
+                view.rotate_page_clockwise(&RotatePageClockwise, window, cx);
+            });
+            cx.run_until_parked();
+            cx.run_until_parked();
+
+            let rotation = view.read_with(cx, |view, _| view.rotation);
+            let page_bounds = cx
+                .debug_bounds("pdf-page-0")
+                .unwrap_or_else(|| panic!("page 0 should be laid out after {rotations} turns"));
+            let display_size = rotation.display_size(page_size);
+            assert!(
+                (f32::from(page_bounds.size.width) - display_size.width).abs() < 2.0,
+                "the page box should match the rotated page size"
+            );
+            let display_center = rotation.to_display_point(target_center, page_size);
+            let click_point = Point {
+                x: page_bounds.origin.x + px(display_center.x),
+                y: page_bounds.origin.y + px(display_center.y),
+            };
+            cx.simulate_event(gpui::MouseDownEvent {
+                position: click_point,
+                modifiers: gpui::Modifiers::none(),
+                button: MouseButton::Left,
+                click_count: 2,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                position: click_point,
+                modifiers: gpui::Modifiers::none(),
+                button: MouseButton::Left,
+                click_count: 2,
+            });
+
+            view.update(cx, |view, _cx| {
+                let selection = view.text_selection.as_ref().unwrap_or_else(|| {
+                    panic!("double-click after {rotations} turns should select a word")
+                });
+                let (start, end) = selection.ordered();
+                assert_eq!(
+                    (start.page_index, start.char_index, end.char_index),
+                    (0, expected_range.start, expected_range.end - 1),
+                    "double-click after {rotations} turns selected the wrong word"
+                );
+            });
+        }
     }
 
     #[allow(clippy::await_holding_lock)]
