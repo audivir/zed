@@ -72,6 +72,35 @@ pub struct PdfLink {
     pub action: PdfLinkAction,
 }
 
+/// View-only settings a page render depends on besides its scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenderStyle {
+    pub rotation: PageRotation,
+    /// Inverts the lightness of the page, for reading in dark themes.
+    pub inverted: bool,
+}
+
+impl From<PageRotation> for RenderStyle {
+    fn from(rotation: PageRotation) -> Self {
+        Self {
+            rotation,
+            inverted: false,
+        }
+    }
+}
+
+/// Inverts the lightness of a pixel while keeping its hue, so white paper turns black while
+/// colored highlights and figures keep their colors.
+fn invert_lightness(pixel: &mut [u8; 4]) {
+    let [first, second, third, _alpha] = *pixel;
+    let max = first.max(second).max(third) as u16;
+    let min = first.min(second).min(third) as u16;
+    for channel in &mut pixel[..3] {
+        // stays within 0..=255, since every channel lies between `min` and `max`.
+        *channel = (*channel as u16 + 255 - max - min) as u8;
+    }
+}
+
 /// View-only rotation for the whole document, applied at render time.
 ///
 /// Never written back to the `/Rotate` attribute of the PDF.
@@ -364,8 +393,8 @@ pub struct PageData {
     ///
     /// Nonzero only for strips of pages taller than `MAX_RENDER_HEIGHT`.
     pub page_offset_pt: f32,
-    /// Rotation `image` was rasterized at; renders at another rotation are not reusable.
-    pub rotation: PageRotation,
+    /// Style `image` was rasterized with; renders in another style are not reusable.
+    pub style: RenderStyle,
     pub text_spans: Arc<Vec<PdfTextSpan>>,
     pub links: Arc<Vec<PdfLink>>,
 }
@@ -813,9 +842,9 @@ impl PdfRenderer {
         // page-space Y coordinate to center a strip on; ignored unless the page is rendered as a
         // strip.
         visible_center_y: f32,
-        // view-only rotation. Text and links stay in page space, so `prev_data` is reused for them
-        // at any rotation.
-        rotation: PageRotation,
+        // view-only rotation and colors. Text and links stay in page space, so `prev_data` is
+        // reused for them in any style.
+        style: RenderStyle,
         prev_data: Option<PageData>,
         metadata: Arc<DocumentMetadata>,
     ) -> Result<PageData> {
@@ -836,6 +865,7 @@ impl PdfRenderer {
             .get(page_index as i32)
             .map_err(|e| anyhow!("Page out of bounds: {:?}", e))?;
 
+        let rotation = style.rotation;
         // a quarter turn swaps output width and height.
         let (source_width_pt, source_height_pt) = if rotation.swaps_dimensions() {
             (page.height().value, page.width().value)
@@ -882,6 +912,9 @@ impl PdfRenderer {
         let mut bgra_bytes = bitmap.as_rgba_bytes();
         for pixel in bgra_bytes.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
+            if style.inverted {
+                invert_lightness(pixel);
+            }
         }
 
         let buffer = RgbaImage::from_raw(width, height, bgra_bytes)
@@ -908,7 +941,7 @@ impl PdfRenderer {
             scale,
             image_scale: effective_scale,
             page_offset_pt,
-            rotation,
+            style,
             text_spans,
             links,
         })
@@ -1294,7 +1327,7 @@ mod tests {
             0,
             1.0,
             0.0,
-            PageRotation::None,
+            PageRotation::None.into(),
             None,
             Arc::new(metadata),
         ));
@@ -1357,7 +1390,7 @@ mod tests {
             0,
             1.0,
             0.0,
-            PageRotation::None,
+            PageRotation::None.into(),
             None,
             Arc::new(metadata),
         ))
@@ -1396,7 +1429,7 @@ mod tests {
             0,
             1000.0,
             0.0,
-            PageRotation::None,
+            PageRotation::None.into(),
             None,
             Arc::new(metadata),
         ))
@@ -1425,7 +1458,7 @@ mod tests {
             0,
             1.0,
             0.0,
-            PageRotation::None,
+            PageRotation::None.into(),
             None,
             Arc::new(metadata),
         ))
@@ -1456,7 +1489,7 @@ mod tests {
             0,
             1.0,
             0.0,
-            PageRotation::None,
+            PageRotation::None.into(),
             None,
             Arc::new(metadata.clone()),
         ))
@@ -1465,7 +1498,7 @@ mod tests {
             0,
             1.0,
             page_height_pt,
-            PageRotation::None,
+            PageRotation::None.into(),
             None,
             Arc::new(metadata),
         ))
@@ -1508,7 +1541,7 @@ mod tests {
             0,
             1.0,
             0.0,
-            PageRotation::None,
+            PageRotation::None.into(),
             None,
             Arc::new(metadata),
         ))
@@ -1528,6 +1561,64 @@ mod tests {
         );
 
         evict_document(id);
+    }
+
+    #[test]
+    fn inverted_renders_turn_paper_dark_but_keep_colors() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (id, bytes) = fixture("left_half_blue.pdf");
+        evict_document(id);
+        let renderer = PdfRenderer::new(id, bytes, None);
+        let metadata = futures::executor::block_on(renderer.get_metadata(None)).unwrap();
+
+        let style = RenderStyle {
+            rotation: PageRotation::None,
+            inverted: true,
+        };
+        let page = futures::executor::block_on(renderer.process_page(
+            0,
+            1.0,
+            0.0,
+            style,
+            None,
+            Arc::new(metadata),
+        ))
+        .unwrap();
+        assert_eq!(page.style, style);
+
+        let width = page.image.size(0).width.0 as usize;
+        let height = page.image.size(0).height.0 as usize;
+        let buffer = page.image.as_bytes(0).unwrap();
+        let sample = |x: usize, y: usize| {
+            let offset = (y * width + x) * 4;
+            [buffer[offset], buffer[offset + 1], buffer[offset + 2]]
+        };
+        let [blue, green, red] = sample(width / 4, height / 2);
+        assert!(
+            blue > 200 && green < 50 && red < 50,
+            "blue should stay blue, got {:?}",
+            [blue, green, red]
+        );
+        assert_eq!(
+            sample(width * 3 / 4, height / 2),
+            [0, 0, 0],
+            "white turns black"
+        );
+
+        evict_document(id);
+    }
+
+    #[test]
+    fn inverting_lightness_keeps_hue() {
+        let invert = |mut pixel: [u8; 4]| {
+            invert_lightness(&mut pixel);
+            pixel
+        };
+        assert_eq!(invert([255, 255, 255, 255]), [0, 0, 0, 255]);
+        assert_eq!(invert([0, 0, 0, 255]), [255, 255, 255, 255]);
+        assert_eq!(invert([100, 100, 100, 128]), [155, 155, 155, 128]);
+        assert_eq!(invert([255, 0, 0, 255]), [255, 0, 0, 255]);
+        assert_eq!(invert([200, 250, 200, 255]), [5, 55, 5, 255]);
     }
 
     #[test]
@@ -1552,7 +1643,7 @@ mod tests {
             0,
             1.0,
             0.0,
-            PageRotation::Clockwise90,
+            PageRotation::Clockwise90.into(),
             None,
             Arc::new(metadata),
         ))

@@ -3,6 +3,7 @@ use crate::{
     pdf::Pdf,
     pdf_renderer::{
         PageData, PageRotation, PdfChapter, PdfLinkAction, PdfSearchResult, PdfTarget, PdfTextSpan,
+        RenderStyle,
     },
     pdf_store::{PdfItem, PdfItemEvent, open_pdf},
 };
@@ -82,6 +83,8 @@ actions!(
         ToggleSinglePageView,
         /// Rotates the view 90 degrees clockwise without modifying the file.
         RotatePageClockwise,
+        /// Inverts the lightness of the pages, for reading in dark themes.
+        ToggleInvertedColors,
         /// Opens the PDF in the default application of the system, for example to print it.
         OpenInDefaultApp,
         /// Shows the title, author, and other properties of the document.
@@ -495,6 +498,8 @@ pub struct PdfView {
     view_mode: ViewMode,
     /// View-only page rotation, not persisted.
     rotation: PageRotation,
+    /// Whether pages render with inverted lightness, not persisted.
+    inverted_colors: bool,
     page_flip: PageFlip,
 }
 
@@ -548,6 +553,7 @@ impl PdfView {
             suppress_initial_fit_to_view: false,
             view_mode: ViewMode::Continuous,
             rotation: PageRotation::None,
+            inverted_colors: false,
             page_flip: PageFlip::default(),
         }
     }
@@ -627,6 +633,7 @@ impl PdfView {
             suppress_initial_fit_to_view: false,
             view_mode: ViewMode::Continuous,
             rotation: PageRotation::None,
+            inverted_colors: false,
             page_flip: PageFlip::default(),
         }
     }
@@ -798,6 +805,23 @@ impl PdfView {
         };
         // re-snap to the page top so the view is not left mid-scroll in either mode.
         self.jump_to_page(self.current_page, cx);
+    }
+
+    fn toggle_inverted_colors(
+        &mut self,
+        _: &ToggleInvertedColors,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inverted_colors = !self.inverted_colors;
+        cx.notify();
+    }
+
+    fn render_style(&self) -> RenderStyle {
+        RenderStyle {
+            rotation: self.rotation,
+            inverted: self.inverted_colors,
+        }
     }
 
     fn rotate_page_clockwise(
@@ -1613,6 +1637,7 @@ impl Element for PdfContentElement {
             active_jump,
             view_mode,
             rotation,
+            render_style,
         ) = {
             let pdf_view = self.pdf_view.read(cx);
             (
@@ -1629,6 +1654,7 @@ impl Element for PdfContentElement {
                 pdf_view.active_jump.clone(),
                 pdf_view.view_mode,
                 pdf_view.rotation,
+                pdf_view.render_style(),
             )
         };
 
@@ -1799,7 +1825,7 @@ impl Element for PdfContentElement {
                     page_idx,
                     render_scale,
                     visible_center_y,
-                    rotation,
+                    render_style,
                     priority,
                     move |cx| {
                         if let Some(view) = pdf_view_weak.upgrade() {
@@ -2500,6 +2526,7 @@ impl Item for PdfView {
             suppress_initial_fit_to_view: false,
             view_mode: ViewMode::Continuous,
             rotation: PageRotation::None,
+            inverted_colors: self.inverted_colors,
             page_flip: PageFlip::default(),
         })))
     }
@@ -2754,6 +2781,7 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::toggle_single_page_view))
             .on_action(cx.listener(Self::rotate_page_clockwise))
             .on_action(cx.listener(Self::open_in_default_app))
+            .on_action(cx.listener(Self::toggle_inverted_colors))
             .on_action(cx.listener(Self::show_document_properties))
             .when(!has_load_error && !needs_password, |this| {
                 let show_outline = self.show_outline;
@@ -2926,7 +2954,7 @@ impl SearchableItem for PdfView {
                 page_idx,
                 render_scale,
                 visible_center_y,
-                self.rotation,
+                self.render_style(),
                 gpui::Priority::Low,
                 |_| {},
             ) {
@@ -3107,6 +3135,7 @@ impl Render for PdfViewToolbarControls {
         let show_thumbnails = pdf_view.read(cx).show_thumbnails;
         let is_single_page = pdf_view.read(cx).view_mode == ViewMode::SinglePage;
         let is_rotated = pdf_view.read(cx).rotation != PageRotation::None;
+        let inverted_colors = pdf_view.read(cx).inverted_colors;
 
         h_flex()
             .w_full()
@@ -3145,6 +3174,24 @@ impl Render for PdfViewToolbarControls {
                             if let Some(view) = pdf_view.upgrade() {
                                 view.update(cx, |this, cx| {
                                     this.open_in_default_app(&OpenInDefaultApp, window, cx)
+                                });
+                            }
+                        }
+                    }),
+            )
+            .child(
+                IconButton::new("toggle-inverted-colors", IconName::Reader)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(inverted_colors)
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action("Invert Colors", &ToggleInvertedColors, cx)
+                    })
+                    .on_click({
+                        let pdf_view = pdf_view.downgrade();
+                        move |_, window, cx| {
+                            if let Some(view) = pdf_view.upgrade() {
+                                view.update(cx, |this, cx| {
+                                    this.toggle_inverted_colors(&ToggleInvertedColors, window, cx)
                                 });
                             }
                         }
@@ -3808,6 +3855,37 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn inverting_colors_re_renders_pages_in_the_new_style(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/solid_red.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| PdfView::from_pdf(pdf.clone(), window, cx));
+        view.update_in(cx, |view, _window, cx| view.restore_view_state(1.0, 0, cx));
+        cx.run_until_parked();
+        let rendered_inverted = || {
+            pdf.page_cache
+                .read()
+                .get(&0)
+                .map(|data| data.style.inverted)
+        };
+        assert_eq!(rendered_inverted(), Some(false));
+
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_inverted_colors(&ToggleInvertedColors, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(rendered_inverted(), Some(true));
     }
 
     #[allow(clippy::await_holding_lock)]

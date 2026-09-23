@@ -1,5 +1,5 @@
 use crate::pdf_renderer::{
-    DocumentMetadata, PageData, PageMetadata, PageRotation, PdfLinkAction, PdfRenderer, PdfTextSpan,
+    DocumentMetadata, PageData, PageMetadata, PdfLinkAction, PdfRenderer, PdfTextSpan, RenderStyle,
 };
 use anyhow::{Result, bail};
 use collections::{HashMap, HashSet};
@@ -46,12 +46,12 @@ pub struct Pdf {
     pub page_cache: RwLock<HashMap<usize, PageData>>,
     /// Text extracted without rendering, used for pages missing from `page_cache`.
     pub text_only_cache: RwLock<HashMap<usize, Arc<Vec<PdfTextSpan>>>>,
-    /// Pages currently rendering, with their scale and rotation.
-    pub rendering_pages: Mutex<HashMap<usize, (f32, PageRotation)>>,
-    /// Pages whose last render failed, with the failing scale and rotation.
+    /// Pages currently rendering, with their scale and style.
+    pub rendering_pages: Mutex<HashMap<usize, (f32, RenderStyle)>>,
+    /// Pages whose last render failed, with the failing scale and style.
     ///
     /// Prevents retrying the same failing render every frame.
-    pub failed_pages: Mutex<HashMap<usize, (f32, PageRotation)>>,
+    pub failed_pages: Mutex<HashMap<usize, (f32, RenderStyle)>>,
     /// Rendered thumbnail images.
     ///
     /// Kept apart from `page_cache` since thumbnails and the main view need the same page at very
@@ -162,24 +162,24 @@ impl Pdf {
         page_idx: usize,
         requested_scale: f32,
         visible_center_y: f32,
-        rotation: PageRotation,
+        style: RenderStyle,
         priority: gpui::Priority,
         on_rendered: impl FnOnce(&mut App) + Send + 'static,
     ) -> Option<Task<()>> {
-        // reuse a cached render at this rotation and at least this scale that covers the point.
+        // reuse a cached render in this style and at least this scale that covers the point.
         let prev_page = {
             let cache = self.page_cache.read();
 
             if let Some(rendered) = cache.get(&page_idx) {
                 // tolerance for float precision.
                 if rendered.scale >= requested_scale * 0.99
-                    && rendered.rotation == rotation
+                    && rendered.style == style
                     && rendered.covers_page_y(visible_center_y)
                 {
                     return None; // We already have a good enough render, abort the task
                 }
-                // a render at another rotation has the wrong shape.
-                (rendered.rotation == rotation).then(|| rendered.clone())
+                // a render in another style has the wrong shape or colors.
+                (rendered.style == style).then(|| rendered.clone())
             } else {
                 None
             }
@@ -187,9 +187,9 @@ impl Pdf {
 
         {
             let failed = self.failed_pages.lock();
-            if let Some(&(failed_scale, failed_rotation)) = failed.get(&page_idx)
+            if let Some(&(failed_scale, failed_style)) = failed.get(&page_idx)
                 && failed_scale >= requested_scale * 0.99
-                && failed_rotation == rotation
+                && failed_style == style
             {
                 return None; // Already know this render fails at this resolution; don't retry every frame
             }
@@ -197,13 +197,13 @@ impl Pdf {
 
         {
             let mut rendering = self.rendering_pages.lock();
-            if let Some(&(rendering_scale, rendering_rotation)) = rendering.get(&page_idx)
+            if let Some(&(rendering_scale, rendering_style)) = rendering.get(&page_idx)
                 && rendering_scale >= requested_scale * 0.99
-                && rendering_rotation == rotation
+                && rendering_style == style
             {
                 return None; // Already queuing a render of equal or better resolution
             }
-            rendering.insert(page_idx, (requested_scale, rotation));
+            rendering.insert(page_idx, (requested_scale, style));
         }
 
         Some(cx.spawn(async move |cx| {
@@ -223,7 +223,7 @@ impl Pdf {
                             page_idx,
                             requested_scale,
                             visible_center_y,
-                            rotation,
+                            style,
                             prev_page,
                             pdf.metadata.clone(),
                         )
@@ -234,10 +234,10 @@ impl Pdf {
 
                             let mut cache = pdf.page_cache.write();
 
-                            // overwrite only a worse or stale-rotation render that landed first.
-                            let should_insert = cache.get(&page_idx).is_none_or(|c| {
-                                c.scale <= requested_scale || c.rotation != rotation
-                            });
+                            // overwrite only a worse or stale-style render that landed first.
+                            let should_insert = cache
+                                .get(&page_idx)
+                                .is_none_or(|c| c.scale <= requested_scale || c.style != style);
                             if should_insert {
                                 cache.insert(page_idx, new_page);
                                 log::debug!("Written to cache");
@@ -247,7 +247,7 @@ impl Pdf {
                             log::error!("Failed to render page {}: {:?}", page_idx, e);
                             pdf.failed_pages
                                 .lock()
-                                .insert(page_idx, (requested_scale, rotation));
+                                .insert(page_idx, (requested_scale, style));
                         }
                     }
                 })
@@ -292,7 +292,7 @@ impl Pdf {
                             page_idx,
                             THUMBNAIL_SCALE,
                             0.0,
-                            PageRotation::None,
+                            RenderStyle::default(),
                             None,
                             pdf.metadata.clone(),
                         )
@@ -414,6 +414,7 @@ impl Pdf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf_renderer::PageRotation;
     use gpui::TestAppContext;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -498,7 +499,7 @@ mod tests {
                     0,
                     1.0,
                     0.0,
-                    PageRotation::None,
+                    PageRotation::None.into(),
                     gpui::Priority::High,
                     |_| {},
                 )
@@ -540,7 +541,7 @@ mod tests {
                 0,
                 1.0,
                 0.0,
-                PageRotation::None,
+                PageRotation::None.into(),
                 gpui::Priority::High,
                 move |_| rendered_in_callback.store(true, Ordering::SeqCst),
             )
@@ -562,7 +563,7 @@ mod tests {
                 0,
                 1.0,
                 0.0,
-                PageRotation::None,
+                PageRotation::None.into(),
                 gpui::Priority::Low,
                 |_| {},
             )
@@ -597,7 +598,7 @@ mod tests {
                     page_idx,
                     1.0,
                     0.0,
-                    PageRotation::None,
+                    PageRotation::None.into(),
                     gpui::Priority::High,
                     |_| {},
                 )
@@ -658,7 +659,7 @@ mod tests {
                     0,
                     1.0,
                     0.0,
-                    PageRotation::None,
+                    PageRotation::None.into(),
                     gpui::Priority::High,
                     |_| {},
                 )
@@ -681,7 +682,7 @@ mod tests {
                     0,
                     1.0,
                     page_height_pt,
-                    PageRotation::None,
+                    PageRotation::None.into(),
                     gpui::Priority::High,
                     |_| {},
                 )
@@ -789,7 +790,7 @@ mod tests {
                     5,
                     1.0,
                     0.0,
-                    PageRotation::None,
+                    PageRotation::None.into(),
                     gpui::Priority::High,
                     |_| {},
                 )
@@ -810,7 +811,7 @@ mod tests {
                 5,
                 1.0,
                 0.0,
-                PageRotation::None,
+                PageRotation::None.into(),
                 gpui::Priority::High,
                 |_| {},
             )
