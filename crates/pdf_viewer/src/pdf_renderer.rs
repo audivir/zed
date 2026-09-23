@@ -497,7 +497,21 @@ pub fn evict_document(id: u64) {
 ///
 /// All access to `PDFIUM` must go through this, so documents dropped mid-render do not leak.
 async fn lock_pdfium_state() -> Result<futures::lock::MutexGuard<'static, PdfiumState>> {
-    let mut state = get_pdfium()?.lock().await;
+    let mutex = get_pdfium()?;
+    // GPUI test executors can leak a pending lock future when a test ends, and `futures` then
+    // hands every later wake-up to that leaked waiter, hanging the next test that waits for the
+    // lock. Polling with `try_lock` never registers a waiter.
+    #[cfg(test)]
+    let mut state = futures::future::poll_fn(|cx| match mutex.try_lock() {
+        Some(state) => std::task::Poll::Ready(state),
+        None => {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    #[cfg(not(test))]
+    let mut state = mutex.lock().await;
     let pending = std::mem::take(
         &mut *PENDING_EVICTIONS
             .lock()
