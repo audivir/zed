@@ -70,7 +70,9 @@ actions!(
         /// Toggles between continuous scrolling and single-page view.
         ToggleSinglePageView,
         /// Rotates the view 90 degrees clockwise without modifying the file.
-        RotatePageClockwise
+        RotatePageClockwise,
+        /// Opens the PDF in the default application of the system, for example to print it.
+        OpenInDefaultApp
     ]
 );
 
@@ -776,6 +778,39 @@ impl PdfView {
         // a quarter turn swaps the page dimensions, so re-snap the scroll position.
         self.jump_to_page(self.current_page, cx);
         cx.notify();
+    }
+
+    fn open_in_default_app(
+        &mut self,
+        _: &OpenInDefaultApp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.file_path_for_system(cx);
+        cx.spawn(async move |_, cx| {
+            let path = path.await?;
+            cx.update(|cx| cx.open_with_system(&path));
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Returns a file holding the document, writing generated documents such as Typst previews,
+    /// which only exist in memory, to a temporary file.
+    fn file_path_for_system(&self, cx: &mut Context<Self>) -> Task<Result<std::path::PathBuf>> {
+        if let PdfSource::Item(item) = &self.source
+            && let Some(abs_path) = item.read(cx).abs_path(cx)
+        {
+            return Task::ready(Ok(abs_path));
+        }
+
+        let pdf = self.pdf(cx);
+        let path = std::env::temp_dir().join(format!("zed-pdf-{:016x}.pdf", pdf.id));
+        cx.background_spawn(async move {
+            std::fs::write(&path, pdf.bytes.as_slice())
+                .with_context(|| format!("writing {path:?}"))?;
+            Ok(path)
+        })
     }
 
     fn render_thumbnail_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2495,6 +2530,7 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::toggle_thumbnails))
             .on_action(cx.listener(Self::toggle_single_page_view))
             .on_action(cx.listener(Self::rotate_page_clockwise))
+            .on_action(cx.listener(Self::open_in_default_app))
             .when(!has_load_error && !needs_password, |this| {
                 let show_outline = self.show_outline;
                 let show_thumbnails = self.show_thumbnails;
@@ -2843,6 +2879,23 @@ impl Render for PdfViewToolbarControls {
             .w_full()
             .justify_end()
             .gap_1()
+            .child(
+                IconButton::new("open-in-default-app", IconName::ArrowUpRight)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action("Open in Default App", &OpenInDefaultApp, cx)
+                    })
+                    .on_click({
+                        let pdf_view = pdf_view.downgrade();
+                        move |_, window, cx| {
+                            if let Some(view) = pdf_view.upgrade() {
+                                view.update(cx, |this, cx| {
+                                    this.open_in_default_app(&OpenInDefaultApp, window, cx)
+                                });
+                            }
+                        }
+                    }),
+            )
             .child(
                 IconButton::new("rotate-page-clockwise", IconName::RotateCw)
                     .icon_size(IconSize::Small)
@@ -3656,6 +3709,34 @@ mod tests {
                  whatever page(s) happened to already be rendered on initial layout"
             );
         });
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn in_memory_documents_are_written_to_a_file_for_the_default_app(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/solid_red.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes.clone(), None, None).await);
+        let expected_path = std::env::temp_dir().join(format!("zed-pdf-{:016x}.pdf", pdf.id));
+        std::fs::remove_file(&expected_path).ok();
+
+        let (view, cx) = cx.add_window_view(|window, cx| PdfView::from_pdf(pdf, window, cx));
+        let written_path = view
+            .update(cx, |view, cx| view.file_path_for_system(cx))
+            .await
+            .unwrap();
+
+        assert_eq!(written_path, expected_path);
+        assert_eq!(std::fs::read(&expected_path).unwrap(), bytes);
+        std::fs::remove_file(&expected_path).ok();
     }
 
     #[gpui::test]
