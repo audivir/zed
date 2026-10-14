@@ -1523,6 +1523,8 @@ fn initialize_pane(
             toolbar.add_item(image_view_toolbar, window, cx);
             let pdf_view_toolbar = cx.new(|_| pdf_viewer::PdfViewToolbarControls::new());
             toolbar.add_item(pdf_view_toolbar, window, cx);
+            let svg_preview_toolbar = cx.new(|_| svg_preview::SvgPreviewToolbarControls::new());
+            toolbar.add_item(svg_preview_toolbar, window, cx);
         })
     });
 }
