@@ -1837,7 +1837,6 @@ impl Element for TerminalElement {
             let scroll_top = terminal_view.scroll_top;
             let mouse_input_mode = terminal_view.mouse_input_mode();
 
-            window.paint_quad(fill(bounds, layout.background_color));
             let origin = layout.dimensions.bounds.origin - GpuiPoint::new(px(0.), scroll_top);
             let scale_factor = window.scale_factor();
             let snap_px = |value: Pixels| {

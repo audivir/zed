@@ -874,7 +874,7 @@ impl GhosttyTerminal {
         Ok((cells, modes, display_offset))
     }
 
-    fn modes(&self) -> Result<crate::Modes> {
+    pub(super) fn modes(&self) -> Result<crate::Modes> {
         use libghostty_vt::terminal::Mode;
 
         let mut modes = crate::Modes::empty();

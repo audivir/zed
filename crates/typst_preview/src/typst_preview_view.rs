@@ -955,7 +955,7 @@ impl TypstPreviewView {
             let toml_path = dir.join("typst.toml");
             if toml_path.exists()
                 && let Ok(toml_content) = std::fs::read_to_string(&toml_path)
-                && let Ok(manifest) = toml_content.parse::<toml::Value>()
+                && let Ok(manifest) = toml_content.parse::<toml::Table>()
                 && let Some(entrypoint) = manifest
                     .get("package")
                     .and_then(|p| p.get("entrypoint"))

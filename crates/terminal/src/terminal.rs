@@ -889,6 +889,7 @@ const PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum Event {
     TitleChanged,
     BreadcrumbsChanged,
+    OutputReplaced,
     CloseTerminal,
     Bell,
     Wakeup,
@@ -1027,6 +1028,39 @@ impl Default for TerminalBounds {
                 },
             },
         )
+    }
+}
+
+/// Creates the emulator of a display-only terminal, which has no PTY.
+///
+/// Construction only fails on allocation failure, which degrades to an inert terminal instead of
+/// making display-only terminals fallible.
+fn new_display_ghostty(
+    terminal_bounds: TerminalBounds,
+    scrolling_history: usize,
+    cursor_shape: SettingsCursorShape,
+    alternate_scroll: AlternateScroll,
+) -> Option<Arc<parking_lot::Mutex<ghostty::GhosttyTerminal>>> {
+    match ghostty::GhosttyTerminal::new(
+        terminal_bounds.num_columns().max(1) as u16,
+        terminal_bounds.num_lines().max(1) as u16,
+        scrolling_history,
+    ) {
+        Ok(mut ghostty) => {
+            if let Err(error) = ghostty.set_default_cursor_shape(cursor_shape.into()) {
+                log::error!("failed to set ghostty default cursor shape: {error}");
+            }
+            if matches!(alternate_scroll, AlternateScroll::Off)
+                && let Err(error) = ghostty.disable_alternate_scroll()
+            {
+                log::error!("failed to disable ghostty alternate scroll: {error}");
+            }
+            Some(Arc::new(parking_lot::Mutex::new(ghostty)))
+        }
+        Err(error) => {
+            log::error!("failed to create ghostty terminal for display-only terminal: {error}");
+            None
+        }
     }
 }
 
@@ -1223,29 +1257,12 @@ impl TerminalBuilder {
 
         let (_events_tx, events_rx) = unbounded();
 
-        // display-only terminals have no PTY. Construction only fails on allocation failure,
-        // which degrades to an inert terminal instead of making this constructor fallible.
-        let ghostty = match ghostty::GhosttyTerminal::new(
-            terminal_bounds.num_columns().max(1) as u16,
-            terminal_bounds.num_lines().max(1) as u16,
+        let ghostty = new_display_ghostty(
+            terminal_bounds,
             scrolling_history,
-        ) {
-            Ok(mut ghostty) => {
-                if let Err(error) = ghostty.set_default_cursor_shape(cursor_shape.into()) {
-                    log::error!("failed to set ghostty default cursor shape: {error}");
-                }
-                if matches!(alternate_scroll, AlternateScroll::Off)
-                    && let Err(error) = ghostty.disable_alternate_scroll()
-                {
-                    log::error!("failed to disable ghostty alternate scroll: {error}");
-                }
-                Some(Arc::new(parking_lot::Mutex::new(ghostty)))
-            }
-            Err(error) => {
-                log::error!("failed to create ghostty terminal for display-only terminal: {error}");
-                None
-            }
-        };
+            cursor_shape,
+            alternate_scroll,
+        );
 
         let terminal = Terminal {
             task: None,
@@ -1882,7 +1899,7 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) {
         self.process_ghostty_effects(effects, cx);
-        self.schedule_idle_compression(cx);
+        self.schedule_idle_compression();
 
         cx.emit(Event::Wakeup);
         if let TerminalType::Pty { info, .. } = &self.terminal_type {
@@ -1894,13 +1911,24 @@ impl Terminal {
     ///
     /// Large outputs, such as a linter reporting tens of thousands of lines, otherwise keep
     /// their full uncompressed scrollback in memory for as long as the terminal lives.
-    fn schedule_idle_compression(&mut self, cx: &mut Context<Self>) {
+    fn schedule_idle_compression(&mut self) {
+        self.idle_compression_task = self.compress_scrollback_after(ghostty::IDLE_COMPRESSION_DELAY);
+    }
+
+    /// Compresses the scrollback right away, for output that is known to be final.
+    pub fn shrink_to_used(&mut self) {
+        self.idle_compression_task = self.compress_scrollback_after(Duration::ZERO);
+    }
+
+    fn compress_scrollback_after(&self, delay: Duration) -> Task<()> {
         let Some(ghostty) = self.ghostty.clone() else {
-            return;
+            return Task::ready(());
         };
-        let executor = cx.background_executor().clone();
-        self.idle_compression_task = cx.background_spawn(async move {
-            executor.timer(ghostty::IDLE_COMPRESSION_DELAY).await;
+        let executor = self.background_executor.clone();
+        self.background_executor.spawn(async move {
+            if !delay.is_zero() {
+                executor.timer(delay).await;
+            }
             // steps release the lock in between, so output and rendering never wait long.
             loop {
                 match ghostty.lock().compress_idle_step() {
@@ -1912,7 +1940,7 @@ impl Terminal {
                     }
                 }
             }
-        });
+        })
     }
 
     fn process_ghostty_effects(
@@ -2434,7 +2462,7 @@ impl Terminal {
     }
 
     /// Terminal byte streams already contain their control sequences and must not be normalized.
-    fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    pub fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // no PTY thread drives this path, so bytes are written synchronously.
         if let Some(ghostty) = self.ghostty.clone() {
             let mut ghostty_guard = ghostty.lock();
@@ -2455,11 +2483,59 @@ impl Terminal {
                 .collect();
             drop(ghostty_guard);
             self.process_ghostty_effects(effects, cx);
-            self.schedule_idle_compression(cx);
+            self.schedule_idle_compression();
         }
 
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
+    }
+
+    /// Replaces all display-only output while retaining the terminal entity and its dimensions.
+    pub fn replace_display_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> Result<()> {
+        if !matches!(self.terminal_type, TerminalType::DisplayOnly) || self.subprocess.is_some() {
+            bail!("cannot replace output of a process-backed terminal");
+        }
+        let bounds = self.last_content.terminal_bounds;
+        let Some(ghostty) = new_display_ghostty(
+            bounds,
+            self.scrolling_history,
+            self.template.cursor_shape,
+            self.template.alternate_scroll,
+        ) else {
+            bail!("failed to create a terminal for the replaced output");
+        };
+        self.ghostty = Some(ghostty);
+        self.idle_compression_task = Task::ready(());
+        self.set_progress(None, cx);
+        // The new emulator already has the latest requested size; older resizes can truncate it.
+        self.events.clear();
+        self.last_content = Content {
+            terminal_bounds: bounds,
+            ..Default::default()
+        };
+        self.last_mouse = None;
+        self.mouse_down_position = None;
+        self.matches.clear();
+        self.selection_head = None;
+        self.selection_anchor = None;
+        self.breadcrumb_text.clear();
+        self.scroll_px = px(0.);
+        self.next_link_id = 0;
+        self.selection_phase = SelectionPhase::Ended;
+        self.hyperlink_regex_searches = RegexSearches::new(
+            &self.template.path_hyperlink_regexes,
+            self.template.path_hyperlink_timeout,
+        );
+        self.vi_mode_enabled = false;
+        self.last_hyperlink_search_position = None;
+        self.mouse_down_hyperlink = None;
+        self.cwd_history.clear();
+        self.pending_cwd_boundary = None;
+        self.write_raw_output(bytes, cx);
+        cx.emit(Event::BreadcrumbsChanged);
+        cx.emit(Event::NewNavigationTarget(None));
+        cx.emit(Event::OutputReplaced);
+        Ok(())
     }
 
     pub fn total_lines(&self) -> usize {
@@ -4669,6 +4745,10 @@ mod tests {
             terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
         assert_eq!(exit_status.await, Some(ExitStatus::default()));
         assert_content_eventually(&terminal, "hello-from-subprocess", cx).await;
+        terminal.update(cx, |terminal, cx| {
+            assert!(terminal.replace_display_output(b"replacement", cx).is_err());
+            assert!(terminal.get_content().contains("hello-from-subprocess"));
+        });
     }
 
     fn init_terminal_test(cx: &mut TestAppContext, output: &[u8]) -> Entity<Terminal> {
@@ -6847,6 +6927,132 @@ mod tests {
             terminal.update(cx, |terminal, cx| terminal.write_raw_output(chunk, cx));
         }
         terminal_content(&terminal, cx)
+    }
+
+    #[gpui::test]
+    async fn test_replace_display_output_rebuilds_screen_and_accepts_appends(
+        cx: &mut TestAppContext,
+    ) {
+        let bounds = TerminalBounds::new(
+            px(20.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(300.), px(160.))),
+        );
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only_with_bounds(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+                bounds,
+            )
+            .subscribe(cx)
+        });
+        let entity_id = terminal.entity_id();
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(b"old history\r\n\x1b[?1049h\x1b[Hold alternate", cx);
+            terminal
+                .ghostty
+                .as_ref()
+                .expect("display-only terminal")
+                .lock()
+                .set_selection(Some(SelectionRange {
+                    start: Point::new(0, 0),
+                    end: Point::new(0, 2),
+                    is_block: false,
+                }))
+                .expect("select");
+            terminal.refresh_last_content_from_ghostty(cx);
+            assert_eq!(terminal.last_content.selection_text.as_deref(), Some("old"));
+            terminal.events.push_back(InternalEvent::Copy(None));
+            terminal
+                .events
+                .push_back(InternalEvent::ScrollToPoint(Point::new(0, 0)));
+            terminal
+                .matches
+                .push(Range::new(Point::new(0, 0), Point::new(0, 3)));
+            terminal
+                .replace_display_output(b"new", cx)
+                .expect("replace");
+            terminal.write_raw_output(b" content", cx);
+        });
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(terminal.get_content().trim(), "new content");
+            assert_eq!(terminal.last_content.terminal_bounds, bounds);
+            assert_eq!(terminal.viewport_lines(), bounds.num_lines());
+            assert!(terminal.matches.is_empty());
+            assert!(terminal.last_content.selection_text.is_none());
+            assert!(terminal.events.is_empty());
+            assert!(
+                !terminal
+                    .ghostty
+                    .as_ref()
+                    .expect("display-only terminal")
+                    .lock()
+                    .modes()
+                    .expect("modes")
+                    .contains(Modes::ALT_SCREEN)
+            );
+        });
+        assert_eq!(terminal.entity_id(), entity_id);
+    }
+
+    #[gpui::test]
+    async fn test_replace_display_output_discards_superseded_resizes(cx: &mut TestAppContext) {
+        let (terminal, cx) = init_terminal_test_with_window(cx, b"");
+        terminal.update_in(cx, |terminal, window, cx| {
+            let wide = TerminalBounds::new(
+                px(20.),
+                px(10.),
+                bounds(point(px(0.), px(0.)), size(px(400.), px(160.))),
+            );
+            let narrow = TerminalBounds::new(
+                px(20.),
+                px(10.),
+                bounds(point(px(0.), px(0.)), size(px(50.), px(160.))),
+            );
+            terminal.set_size(wide);
+            terminal.sync(window, cx);
+            terminal.set_size(narrow);
+            terminal.scroll_up_by(1);
+            terminal.set_size(wide);
+            terminal
+                .replace_display_output(b"\x1b[?1049habcdefghijklmnop", cx)
+                .expect("snapshot at latest dimensions");
+            assert_eq!(terminal.get_content().trim(), "abcdefghijklmnop");
+            terminal.sync(window, cx);
+            assert_eq!(terminal.get_content().trim(), "abcdefghijklmnop");
+            assert_eq!(terminal.last_content.terminal_bounds, wide);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_replace_display_output_resets_parser_and_queued_title(cx: &mut TestAppContext) {
+        let terminal = display_only_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(b"\x1b]0;stale\x07\x1b[", cx);
+            terminal
+                .replace_display_output(b"fresh", cx)
+                .expect("replace");
+            terminal.write_raw_output(b"!", cx);
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(terminal.get_content().trim(), "fresh!");
+            assert!(terminal.breadcrumb_text.is_empty());
+        });
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(b"\xc3", cx);
+            terminal.replace_display_output(b"", cx).expect("clear");
+            terminal.write_raw_output(b"\x1b]0;current\x07ok", cx);
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(terminal.get_content().trim(), "ok");
+            assert_eq!(terminal.breadcrumb_text, "current");
+        });
     }
 
     #[gpui::test]
