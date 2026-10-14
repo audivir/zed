@@ -453,10 +453,36 @@ impl SvgPreviewView {
         cx.notify();
     }
 
-    /// Replaces `view` with a text editor of its SVG source.
-    ///
-    /// Activates an existing editor of the source instead, if there is one. The preview of a file
-    /// cannot share a pane with an editor of the same file, as panes keep one item per file.
+    /// Opens the SVG at `project_path` in a text editor in the active pane.
+    pub fn open_as_text_for_project_path(
+        project_path: ProjectPath,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let open_buffer = workspace
+            .project()
+            .update(cx, |project, cx| project.open_buffer(project_path, cx));
+
+        cx.spawn_in(window, async move |workspace, cx| {
+            let Some(buffer) = open_buffer
+                .await
+                .notify_workspace_async_err(workspace.clone(), cx)
+            else {
+                return;
+            };
+
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let pane = workspace.active_pane().clone();
+                    Self::open_buffer_as_text(workspace, buffer, pane, window, cx);
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Opens the source of the SVG shown in `view` in a text editor, replacing `view`.
     fn open_as_text(
         workspace: &mut Workspace,
         view: Entity<SvgPreviewView>,
@@ -466,7 +492,23 @@ impl SvgPreviewView {
         let Some(buffer) = view.read(cx).buffer.clone() else {
             return;
         };
+        let pane = workspace
+            .pane_for(&view)
+            .unwrap_or_else(|| workspace.active_pane().clone());
+        Self::open_buffer_as_text(workspace, buffer, pane, window, cx);
+    }
 
+    /// Opens `buffer` in a text editor in `pane`.
+    ///
+    /// Activates an existing editor of the buffer instead, if there is one. A file preview of the
+    /// buffer in `pane` is replaced, as panes keep one item per file.
+    fn open_buffer_as_text(
+        workspace: &mut Workspace,
+        buffer: Entity<Buffer>,
+        pane: Entity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         for pane in workspace.panes().to_vec() {
             let existing_editor = pane.read(cx).items_of_type::<Editor>().find(|editor| {
                 editor.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(&buffer)
@@ -481,14 +523,19 @@ impl SvgPreviewView {
             }
         }
 
-        let pane = workspace
-            .pane_for(&view)
-            .unwrap_or_else(|| workspace.active_pane().clone());
         let project = workspace.project().clone();
-        let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx));
+        let editor = cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project), window, cx));
         pane.update(cx, |pane, cx| {
-            let index = pane.index_for_item(&view);
-            pane.remove_item(view.entity_id(), false, false, window, cx);
+            let file_preview = pane.items_of_type::<SvgPreviewView>().find(|view| {
+                let view = view.read(cx);
+                view.svg_file.is_some() && view.buffer.as_ref() == Some(&buffer)
+            });
+            let index = file_preview
+                .as_ref()
+                .and_then(|view| pane.index_for_item(view));
+            if let Some(file_preview) = file_preview {
+                pane.remove_item(file_preview.entity_id(), false, false, window, cx);
+            }
             pane.add_item(Box::new(editor), true, true, index, window, cx);
         });
     }

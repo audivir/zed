@@ -452,6 +452,8 @@ actions!(
         OpenContextMenu,
         /// Opens an SVG preview for the selected file.
         OpenSvgPreview,
+        /// Opens the selected SVG file as text.
+        OpenSvgAsText,
     ]
 );
 
@@ -1187,6 +1189,7 @@ impl ProjectPanel {
                         })
                         .when(is_svg, |menu| {
                             menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                                .action("Open SVG as Text", Box::new(OpenSvgAsText))
                         })
                         .when(is_dir, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
@@ -1210,6 +1213,7 @@ impl ProjectPanel {
                             })
                             .when(is_svg, |menu| {
                                 menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                                    .action("Open SVG as Text", Box::new(OpenSvgAsText))
                             })
                             .when(is_dir, |menu| {
                                 menu.separator()
@@ -2034,6 +2038,20 @@ impl ProjectPanel {
         self.workspace
             .update(cx, |workspace, cx| {
                 SvgPreviewView::open_for_project_path(project_path, workspace, window, cx)
+            })
+            .ok();
+    }
+
+    fn open_svg_as_text(&mut self, _: &OpenSvgAsText, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((project_path, file_name)) = self.selected_file(cx) else {
+            return;
+        };
+        if !SvgPreviewView::is_svg_path(Path::new(file_name)) {
+            return;
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                SvgPreviewView::open_as_text_for_project_path(project_path, workspace, window, cx)
             })
             .ok();
     }
@@ -7638,6 +7656,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_split_horizontal))
                 .on_action(cx.listener(Self::open_markdown_preview))
                 .on_action(cx.listener(Self::open_svg_preview))
+                .on_action(cx.listener(Self::open_svg_as_text))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))

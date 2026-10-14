@@ -2495,6 +2495,61 @@ async fn test_copy_and_cut_write_to_system_clipboard(cx: &mut gpui::TestAppConte
 }
 
 #[gpui::test]
+async fn test_open_svg_as_text_replaces_the_svg_preview(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.update(svg_preview::init);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "icon.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(
+                path!("/root/icon.svg").into(),
+                workspace::OpenOptions::default(),
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    workspace.update(cx, |workspace, cx| {
+        assert!(workspace.active_item_as::<SvgPreviewView>(cx).is_some());
+    });
+
+    select_path(&panel, "root/icon.svg", cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.open_svg_as_text(&OpenSvgAsText, window, cx);
+    });
+    cx.run_until_parked();
+
+    workspace.update(cx, |workspace, cx| {
+        assert!(workspace.active_item_as::<Editor>(cx).is_some());
+        let pane = workspace.active_pane().read(cx);
+        assert_eq!(
+            pane.items_of_type::<SvgPreviewView>().count(),
+            0,
+            "the editor takes the place of the preview, as a pane holds one item per file"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_open_svg_preview_for_single_file_worktree(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
