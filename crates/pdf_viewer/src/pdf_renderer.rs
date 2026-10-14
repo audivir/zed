@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
 use futures::lock::Mutex;
 use gpui::{Bounds, Point, RenderImage, Size};
+use http_client::HttpClient;
+use http_client::github::AssetKind;
+use http_client::github_download::download_server_binary;
 use image::{Frame, RgbaImage};
 use once_cell::sync::OnceCell;
 use pdfium_render::prelude::{
@@ -448,11 +451,95 @@ static PENDING_EVICTIONS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec
 #[cfg(test)]
 pub(crate) static PDFIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Binds to the system PDFium library.
+/// `pdfium-binaries` release installed when no PDFium library is found.
+const PDFIUM_RELEASE: &str = "8100";
+
+/// Returns the `pdfium-binaries` archive name and its SHA-256 for this platform.
+fn pdfium_asset() -> Option<(&'static str, &'static str)> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some((
+            "pdfium-mac-arm64",
+            "7ea647c7a7a9c1169be3f947000bc071ece2fade2cd6bd7e401e3675c6560cce",
+        )),
+        ("macos", "x86_64") => Some((
+            "pdfium-mac-x64",
+            "d513a0530a0f0c1ca9929ded06660e27edb9a108a7d18d9df55a5fb060b091c8",
+        )),
+        ("linux", "aarch64") => Some((
+            "pdfium-linux-arm64",
+            "58c87a95a40a24c914a9c755fae798843f46f06adf9e5e9f2c893302d4bdb040",
+        )),
+        ("linux", "x86_64") => Some((
+            "pdfium-linux-x64",
+            "1c1894a12d4d96ee01400c3874444126254180c5c7d2ab628576b67f8120320a",
+        )),
+        _ => None,
+    }
+}
+
+/// Directory of the PDFium release installed by [`ensure_pdfium_installed`].
+fn installed_pdfium_dir() -> std::path::PathBuf {
+    paths::data_dir()
+        .join("pdfium")
+        .join(format!("chromium-{PDFIUM_RELEASE}"))
+}
+
+/// Serializes installs, so PDFs opened at the same time download PDFium once.
+static PDFIUM_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Downloads the pinned PDFium release into the data directory, unless a PDFium library can
+/// already be loaded.
+///
+/// # Errors
+///
+/// Returns `Err` if no prebuilt release exists for this platform, or the download, checksum, or
+/// extraction fails.
+pub async fn ensure_pdfium_installed(http_client: Arc<dyn HttpClient>) -> Result<()> {
+    if PDFIUM.get().is_some() {
+        return Ok(());
+    }
+    let _install_guard = PDFIUM_INSTALL_LOCK.lock().await;
+    if get_pdfium().is_ok() {
+        return Ok(());
+    }
+
+    let (asset, sha256) = pdfium_asset().ok_or_else(|| {
+        anyhow!(
+            "no prebuilt PDFium is available for {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let destination = installed_pdfium_dir();
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let url = format!(
+        "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/{PDFIUM_RELEASE}/{asset}.tgz"
+    );
+    log::info!("PDFium not found, installing {url} into {destination:?}");
+    download_server_binary(
+        http_client.as_ref(),
+        &url,
+        Some(sha256),
+        &destination,
+        AssetKind::TarGz,
+    )
+    .await?;
+
+    get_pdfium().map(|_| ())
+}
+
+/// Binds to PDFium next to the working directory, in the data directory, or on the system.
 fn get_bindings() -> Result<Box<dyn PdfiumLibraryBindings>> {
     let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
         .or_else(|_| {
             Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./pdfium/"))
+        })
+        .or_else(|_| {
+            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+                &installed_pdfium_dir().join("lib"),
+            ))
         })
         .or_else(|_| {
             Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(

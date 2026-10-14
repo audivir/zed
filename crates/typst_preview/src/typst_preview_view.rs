@@ -994,7 +994,11 @@ impl TypstPreviewView {
         view.world = Some(new_world_arc.clone());
         view.document = Some(document.clone());
 
+        let http_client = cx.http_client();
         cx.spawn(async move |view, cx| {
+            pdf_viewer::pdf_renderer::ensure_pdfium_installed(http_client)
+                .await
+                .log_err();
             let pdf = Arc::new(Pdf::from_bytes(bytes, Some((pages, max_width)), None).await);
             view.update(cx, |view, cx| {
                 let previous_pdf = view.pdf_view.read(cx).pdf(cx);

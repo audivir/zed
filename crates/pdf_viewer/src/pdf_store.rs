@@ -148,10 +148,17 @@ impl ProjectItem for PdfItem {
         cx: &mut App,
     ) -> Option<Task<Result<Entity<Self>>>> {
         if is_pdf_file(project, path, cx) {
+            let http_client = cx.http_client();
             Some(cx.spawn({
                 let path = path.clone();
                 let project = project.clone();
-                async move |cx| cx.update(|cx| open_pdf(project, path, cx)).await
+                async move |cx| {
+                    // a failed install surfaces as the bind error of the opened document.
+                    crate::pdf_renderer::ensure_pdfium_installed(http_client)
+                        .await
+                        .log_err();
+                    cx.update(|cx| open_pdf(project, path, cx)).await
+                }
             }))
         } else {
             None
