@@ -18,6 +18,7 @@ actions!(
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<SvgPreviewView>(cx);
+    workspace::register_serializable_item::<SvgPreviewView>(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use editor::Editor;
 use file_icons::FileIcons;
 use gpui::{
@@ -18,11 +19,15 @@ use multi_buffer::MultiBuffer;
 use project::{Project, ProjectEntryId, ProjectPath};
 use ui::{Tooltip, prelude::*};
 use workspace::invalid_item_view::InvalidItemView;
-use workspace::item::{Item, ItemHandle, ProjectItem};
+use workspace::item::{Item, ItemHandle, ProjectItem, SerializableItem};
 use workspace::notifications::NotifyResultExt;
-use workspace::{Pane, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace};
+use workspace::{
+    ItemId, Pane, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace, WorkspaceId,
+    delete_unloaded_items,
+};
 
 use crate::{OpenAsText, OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide};
+use persistence::SvgPreviewDb;
 
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 20.0;
@@ -959,6 +964,89 @@ impl ProjectItem for SvgPreviewView {
     }
 }
 
+impl SerializableItem for SvgPreviewView {
+    fn serialized_item_kind() -> &'static str {
+        "SvgPreviewView"
+    }
+
+    fn deserialize(
+        project: Entity<Project>,
+        _workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        let db = SvgPreviewDb::global(cx);
+        window.spawn(cx, async move |cx| {
+            let svg_path = db
+                .get_svg_path(item_id, workspace_id)?
+                .context("No SVG path found")?;
+
+            let (worktree, relative_path) = project
+                .update(cx, |project, cx| {
+                    project.find_or_create_worktree(svg_path, false, cx)
+                })
+                .await
+                .context("Path not found")?;
+            let worktree_id = worktree.update(cx, |worktree, _cx| worktree.id());
+            let project_path = ProjectPath {
+                worktree_id,
+                path: relative_path,
+            };
+
+            let buffer = project
+                .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                .await?;
+
+            cx.update(|window, cx| {
+                let svg_file = cx.new(|_| SvgFile {
+                    buffer: buffer.clone(),
+                });
+                cx.new(|cx| Self::with_buffer(Some(buffer), Some(svg_file), window, cx))
+            })
+        })
+    }
+
+    fn cleanup(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        let db = SvgPreviewDb::global(cx);
+        delete_unloaded_items(alive_items, workspace_id, "svg_previews", &db, cx)
+    }
+
+    fn serialize(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        // Previews of an editor follow that editor, so only previews of files are restored.
+        self.svg_file.as_ref()?;
+        let workspace_id = workspace.database_id()?;
+        let svg_path = self
+            .buffer
+            .as_ref()?
+            .read(cx)
+            .file()?
+            .as_local()?
+            .abs_path(cx);
+
+        let db = SvgPreviewDb::global(cx);
+        Some(cx.background_spawn(
+            async move { db.save_svg_path(item_id, workspace_id, svg_path).await },
+        ))
+    }
+
+    fn should_serialize(&self, _event: &Self::Event) -> bool {
+        false
+    }
+}
+
 /// Zoom controls and the text editor toggle for the active SVG preview.
 pub struct SvgPreviewToolbarControls {
     view: Option<WeakEntity<SvgPreviewView>>,
@@ -1063,6 +1151,59 @@ impl ToolbarItemView for SvgPreviewToolbarControls {
         }
 
         ToolbarItemLocation::Hidden
+    }
+}
+
+mod persistence {
+    use std::path::PathBuf;
+
+    use db::{
+        query,
+        sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
+        sqlez_macros::sql,
+    };
+    use workspace::{ItemId, WorkspaceDb, WorkspaceId};
+
+    pub struct SvgPreviewDb(ThreadSafeConnection);
+
+    impl Domain for SvgPreviewDb {
+        const NAME: &str = stringify!(SvgPreviewDb);
+
+        const MIGRATIONS: &[&str] = &[sql!(
+                CREATE TABLE svg_previews (
+                    workspace_id INTEGER,
+                    item_id INTEGER UNIQUE,
+
+                    svg_path BLOB,
+
+                    PRIMARY KEY(workspace_id, item_id),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                ) STRICT;
+        )];
+    }
+
+    db::static_connection!(SvgPreviewDb, [WorkspaceDb]);
+
+    impl SvgPreviewDb {
+        query! {
+            pub async fn save_svg_path(
+                item_id: ItemId,
+                workspace_id: WorkspaceId,
+                svg_path: PathBuf
+            ) -> Result<()> {
+                INSERT OR REPLACE INTO svg_previews(item_id, workspace_id, svg_path)
+                VALUES (?, ?, ?)
+            }
+        }
+
+        query! {
+            pub fn get_svg_path(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<PathBuf>> {
+                SELECT svg_path
+                FROM svg_previews
+                WHERE item_id = ? AND workspace_id = ?
+            }
+        }
     }
 }
 
@@ -1211,6 +1352,58 @@ mod tests {
         let (rasterized_width, expected_width) = raster_width_after_drawing(cx);
         assert!(expected_width > 300, "zoomed far beyond the intrinsic 40px");
         assert_eq!(rasterized_width, Some(expected_width));
+    }
+
+    #[gpui::test]
+    async fn saved_svg_tabs_are_restored_as_file_previews(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            serde_json::json!({ "image.svg": SQUARE_SVG }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let workspace_id = cx
+            .update(|_, cx| workspace::WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .expect("workspace id");
+        let item_id: ItemId = 1;
+        cx.update(|_, cx| SvgPreviewDb::global(cx))
+            .save_svg_path(item_id, workspace_id, path!("/root/image.svg").into())
+            .await
+            .expect("save");
+
+        let restored = cx
+            .update(|window, cx| {
+                SvgPreviewView::deserialize(
+                    project.clone(),
+                    workspace.downgrade(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("restore");
+        cx.run_until_parked();
+        restored.read_with(cx, |restored, cx| {
+            assert!(
+                restored.svg_file.is_some(),
+                "restored as the file, not a preview"
+            );
+            assert_eq!(restored.tab_content_text(0, cx), "image.svg");
+            assert_eq!(restored.intrinsic_size(), Some(Size::new(40.0, 20.0)));
+        });
     }
 
     fn editor_count(workspace: &Workspace, cx: &App) -> usize {
