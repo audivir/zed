@@ -13,6 +13,7 @@ use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use ui::SharedString;
+use util::ResultExt as _;
 
 /// Lazily loaded font, avoiding reading all font data at startup.
 #[derive(Clone)]
@@ -121,6 +122,39 @@ struct DiskFile {
     bytes: typst::foundations::Bytes,
 }
 
+/// Directories below a project root whose fonts are loaded, including their subdirectories.
+const PROJECT_FONT_DIRS: &[&str] = &["fonts", "assets/fonts"];
+
+/// Loads the fonts of a project: font files directly in `root` and everything in
+/// [`PROJECT_FONT_DIRS`].
+///
+/// The root itself is not scanned recursively, since it falls back to the directory of the
+/// previewed file, which can be the home directory with cloud drives and whole libraries below it.
+fn load_project_fonts(db: &mut fontdb::Database, root: &Path) {
+    match std::fs::read_dir(root) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_font = path.extension().is_some_and(|extension| {
+                    ["ttf", "otf", "ttc", "otc"]
+                        .iter()
+                        .any(|font_extension| extension.eq_ignore_ascii_case(font_extension))
+                });
+                if is_font && path.is_file() {
+                    db.load_font_file(&path).log_err();
+                }
+            }
+        }
+        Err(error) => log::debug!("failed to list project fonts in {root:?}: {error}"),
+    }
+    for font_dir in PROJECT_FONT_DIRS {
+        let font_dir = root.join(font_dir);
+        if font_dir.is_dir() {
+            db.load_fonts_dir(font_dir);
+        }
+    }
+}
+
 impl TypstSystemWorld {
     pub fn new(root: PathBuf) -> Self {
         let start = Instant::now();
@@ -131,7 +165,7 @@ impl TypstSystemWorld {
         let mut fonts = static_font_slots.clone();
 
         let mut project_db = fontdb::Database::new();
-        project_db.load_fonts_dir(&root);
+        load_project_fonts(&mut project_db, &root);
         collect_fontdb_faces(&project_db, &mut book, &mut fonts);
 
         let main_id = FileId::new(RootedPath::new(
@@ -502,6 +536,27 @@ mod tests {
             dir.0.join("local.ttf").display(),
             world.fonts.len(),
         );
+    }
+
+    #[test]
+    fn project_fonts_come_from_font_directories_but_not_every_subdirectory() {
+        let (_, static_font_slots) = static_fonts();
+        let baseline = static_font_slots.len();
+        let font_bytes = typst_assets::fonts()
+            .next()
+            .expect("typst_assets ships at least one bundled font");
+
+        let dir = ScratchDir::new("typst_world_font_dir_test");
+        std::fs::create_dir_all(dir.0.join("fonts/display")).unwrap();
+        std::fs::write(dir.0.join("fonts/display/heading.ttf"), font_bytes).unwrap();
+        assert!(TypstSystemWorld::new(dir.0.clone()).fonts.len() > baseline);
+
+        // a root that falls back to a large directory, such as the home directory, must not
+        // load fonts from unrelated subdirectories.
+        let dir = ScratchDir::new("typst_world_unrelated_font_test");
+        std::fs::create_dir_all(dir.0.join("Books/novel/fonts")).unwrap();
+        std::fs::write(dir.0.join("Books/novel/fonts/body.otf"), font_bytes).unwrap();
+        assert_eq!(TypstSystemWorld::new(dir.0.clone()).fonts.len(), baseline);
     }
 
     #[test]
