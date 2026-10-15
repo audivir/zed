@@ -104,6 +104,9 @@ serde_json.workspace = true
 tempfile.workspace = true
 theme = { workspace = true, features = ["test-support"] }
 theme_settings.workspace = true
+typst = "0.15"
+typst-layout = "0.15"
+typst_preview.workspace = true
 unindent.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 zlog.workspace = true

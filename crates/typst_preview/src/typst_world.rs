@@ -3,7 +3,7 @@ use editor::MultiBufferSnapshot;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime};
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Datetime, Duration};
@@ -14,6 +14,102 @@ use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use ui::SharedString;
 use util::ResultExt as _;
+use util::rel_path::RelPath;
+use worktree::{RemoteFileLoader, Snapshot};
+
+/// Where the project files of a Typst document are read from.
+///
+/// Packages are always read from the local package cache.
+#[derive(Clone)]
+pub enum ProjectFiles {
+    Local,
+    Remote(RemoteProjectFiles),
+}
+
+/// Reads a file of a remote worktree by its worktree-relative path.
+pub type RemoteFileReader = Arc<dyn Fn(&RelPath) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+
+/// Files of a remote project, downloaded when a compile needs them.
+#[derive(Clone)]
+pub struct RemoteProjectFiles {
+    pub read: RemoteFileReader,
+    /// absolute path of the worktree root on the remote host.
+    pub worktree_root: PathBuf,
+    /// worktree entries, whose modification times decide when a file is downloaded again. Files
+    /// missing from it, such as those in unexpanded ignored directories, are not found.
+    pub snapshot: Snapshot,
+}
+
+impl RemoteProjectFiles {
+    pub fn new(loader: RemoteFileLoader, worktree_root: PathBuf, snapshot: Snapshot) -> Self {
+        Self {
+            // compiles run on a background thread, which can wait for the download.
+            read: Arc::new(move |rel_path| futures::executor::block_on(loader.load(rel_path))),
+            worktree_root,
+            snapshot,
+        }
+    }
+
+    fn rel_path(&self, path: &Path) -> Option<Arc<RelPath>> {
+        let relative = path.strip_prefix(&self.worktree_root).ok()?;
+        Some(
+            RelPath::new(relative, self.snapshot.path_style())
+                .ok()?
+                .into_arc(),
+        )
+    }
+
+    fn read_rel(&self, rel_path: &RelPath) -> FileResult<Vec<u8>> {
+        (self.read)(rel_path).map_err(|error| FileError::Other(Some(format!("{error:#}").into())))
+    }
+}
+
+impl ProjectFiles {
+    /// Returns the modification time and size of the file at `path`, if it exists.
+    fn metadata(&self, path: &Path) -> Option<(Option<SystemTime>, u64)> {
+        match self {
+            ProjectFiles::Local => {
+                let metadata = std::fs::metadata(path).ok()?;
+                Some((metadata.modified().ok(), metadata.len()))
+            }
+            ProjectFiles::Remote(remote) => {
+                let entry = remote.snapshot.entry_for_path(&remote.rel_path(path)?)?;
+                entry.is_file().then(|| {
+                    (
+                        entry.mtime.map(|mtime| mtime.timestamp_for_user()),
+                        entry.size,
+                    )
+                })
+            }
+        }
+    }
+
+    fn read(&self, path: &Path) -> FileResult<Vec<u8>> {
+        match self {
+            ProjectFiles::Local => {
+                std::fs::read(path).map_err(|_| FileError::NotFound(path.to_path_buf()))
+            }
+            ProjectFiles::Remote(remote) => {
+                let rel_path = remote
+                    .rel_path(path)
+                    .ok_or_else(|| FileError::NotFound(path.to_path_buf()))?;
+                remote.read_rel(&rel_path)
+            }
+        }
+    }
+
+    pub fn exists(&self, path: &Path) -> bool {
+        self.metadata(path).is_some()
+    }
+
+    pub fn read_to_string(&self, path: &Path) -> FileResult<String> {
+        String::from_utf8(self.read(path)?).map_err(|_| FileError::InvalidUtf8)
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, ProjectFiles::Remote(_))
+    }
+}
 
 /// Lazily loaded font, avoiding reading all font data at startup.
 #[derive(Clone)]
@@ -108,6 +204,8 @@ pub struct TypstSystemWorld {
     main_id: FileId,
     main_source: Source,
     pub root: PathBuf,
+    /// replaced before every compile, so a remote snapshot reflects the latest changes.
+    pub files: ProjectFiles,
     pub file_overrides: HashMap<PathBuf, MultiBufferSnapshot>,
     pub sources: RwLock<HashMap<FileId, Source>>,
     disk_files: RwLock<HashMap<PathBuf, DiskFile>>,
@@ -125,6 +223,14 @@ struct DiskFile {
 /// Directories below a project root whose fonts are loaded, including their subdirectories.
 const PROJECT_FONT_DIRS: &[&str] = &["fonts", "assets/fonts"];
 
+fn is_font_file(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["ttf", "otf", "ttc", "otc"]
+            .iter()
+            .any(|font_extension| extension.eq_ignore_ascii_case(font_extension))
+    })
+}
+
 /// Loads the fonts of a project: font files directly in `root` and everything in
 /// [`PROJECT_FONT_DIRS`].
 ///
@@ -135,12 +241,7 @@ fn load_project_fonts(db: &mut fontdb::Database, root: &Path) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_font = path.extension().is_some_and(|extension| {
-                    ["ttf", "otf", "ttc", "otc"]
-                        .iter()
-                        .any(|font_extension| extension.eq_ignore_ascii_case(font_extension))
-                });
-                if is_font && path.is_file() {
+                if is_font_file(&path) && path.is_file() {
                     db.load_font_file(&path).log_err();
                 }
             }
@@ -155,8 +256,52 @@ fn load_project_fonts(db: &mut fontdb::Database, root: &Path) {
     }
 }
 
+/// Downloads the fonts of a remote project from the same places [`load_project_fonts`] looks.
+fn load_remote_project_fonts(
+    remote: &RemoteProjectFiles,
+    root: &Path,
+    book: &mut FontBook,
+    fonts: &mut Vec<FontSlot>,
+) {
+    let Some(root) = remote.rel_path(root) else {
+        return;
+    };
+    let mut font_paths = remote
+        .snapshot
+        .child_entries(&root)
+        .filter(|entry| entry.is_file() && is_font_file(entry.path.as_std_path()))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    for font_dir in PROJECT_FONT_DIRS {
+        let Ok(font_dir) = RelPath::from_unix_str(font_dir) else {
+            continue;
+        };
+        let font_dir = root.join(font_dir);
+        font_paths.extend(
+            remote
+                .snapshot
+                .traverse_from_path(true, false, true, &font_dir)
+                .take_while(|entry| entry.path.starts_with(&font_dir))
+                .filter(|entry| is_font_file(entry.path.as_std_path()))
+                .map(|entry| entry.path.clone()),
+        );
+    }
+
+    for font_path in font_paths {
+        match remote.read_rel(&font_path) {
+            Ok(data) => {
+                for font in Font::iter(typst::foundations::Bytes::new(data)) {
+                    book.push(font.info().clone());
+                    fonts.push(FontSlot::Memory(font));
+                }
+            }
+            Err(error) => log::debug!("failed to download project font {font_path:?}: {error:?}"),
+        }
+    }
+}
+
 impl TypstSystemWorld {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, files: ProjectFiles) -> Self {
         let start = Instant::now();
 
         // bundled and system fonts are cached process-wide; only project fonts depend on `root`.
@@ -164,9 +309,16 @@ impl TypstSystemWorld {
         let mut book = static_book.clone();
         let mut fonts = static_font_slots.clone();
 
-        let mut project_db = fontdb::Database::new();
-        load_project_fonts(&mut project_db, &root);
-        collect_fontdb_faces(&project_db, &mut book, &mut fonts);
+        match &files {
+            ProjectFiles::Local => {
+                let mut project_db = fontdb::Database::new();
+                load_project_fonts(&mut project_db, &root);
+                collect_fontdb_faces(&project_db, &mut book, &mut fonts);
+            }
+            ProjectFiles::Remote(remote) => {
+                load_remote_project_fonts(remote, &root, &mut book, &mut fonts);
+            }
+        }
 
         let main_id = FileId::new(RootedPath::new(
             VirtualRoot::Project,
@@ -180,6 +332,7 @@ impl TypstSystemWorld {
             main_id,
             main_source: Source::new(main_id, String::new()),
             root,
+            files,
             file_overrides: Default::default(),
             sources: RwLock::new(Default::default()),
             disk_files: RwLock::new(Default::default()),
@@ -194,11 +347,19 @@ impl TypstSystemWorld {
     /// Returns the bytes of `path`, re-reading only when its modification time or size changed.
     ///
     /// The flag reports whether the file was re-read.
-    fn read_disk_file(&self, path: &Path) -> FileResult<(typst::foundations::Bytes, bool)> {
-        let not_found = || FileError::NotFound(path.to_path_buf());
-        let metadata = std::fs::metadata(path).map_err(|_| not_found())?;
-        let modified = metadata.modified().ok();
-        let len = metadata.len();
+    fn read_disk_file(
+        &self,
+        id: FileId,
+        path: &Path,
+    ) -> FileResult<(typst::foundations::Bytes, bool)> {
+        let local_files = ProjectFiles::Local;
+        let files = match id.root() {
+            VirtualRoot::Package(_) => &local_files,
+            VirtualRoot::Project => &self.files,
+        };
+        let (modified, len) = files
+            .metadata(path)
+            .ok_or_else(|| FileError::NotFound(path.to_path_buf()))?;
         if let Some(file) = self.disk_files.read().get(path)
             && file.modified.is_some()
             && file.modified == modified
@@ -207,7 +368,7 @@ impl TypstSystemWorld {
             return Ok((file.bytes.clone(), false));
         }
 
-        let bytes = typst::foundations::Bytes::new(std::fs::read(path).map_err(|_| not_found())?);
+        let bytes = typst::foundations::Bytes::new(files.read(path)?);
         self.disk_files.write().insert(
             path.to_path_buf(),
             DiskFile {
@@ -303,7 +464,7 @@ impl World for TypstSystemWorld {
             self.disk_files.write().remove(&path);
             override_text.text()
         } else {
-            let (bytes, changed) = self.read_disk_file(&path)?;
+            let (bytes, changed) = self.read_disk_file(id, &path)?;
             if !changed && let Some(source) = self.sources.read().get(&id) {
                 return Ok(source.clone());
             }
@@ -329,7 +490,7 @@ impl World for TypstSystemWorld {
 
     fn file(&self, id: FileId) -> FileResult<typst::foundations::Bytes> {
         let path = self.resolve_path(id)?;
-        let (bytes, _changed) = self.read_disk_file(&path)?;
+        let (bytes, _changed) = self.read_disk_file(id, &path)?;
         Ok(bytes)
     }
 
@@ -466,7 +627,7 @@ mod tests {
         let dir = ScratchDir::new("typst_world_disk_cache_test");
         let path = dir.0.join("chapter.typ");
         std::fs::write(&path, "first").unwrap();
-        let world = TypstSystemWorld::new(dir.0.clone());
+        let world = TypstSystemWorld::new(dir.0.clone(), ProjectFiles::Local);
         let id = FileId::new(RootedPath::new(
             VirtualRoot::Project,
             VirtualPath::new("/chapter.typ").unwrap(),
@@ -486,7 +647,7 @@ mod tests {
     #[test]
     fn missing_preview_packages_are_recorded_for_download() {
         let dir = ScratchDir::new("typst_world_missing_package_test");
-        let mut world = TypstSystemWorld::new(dir.0.clone());
+        let mut world = TypstSystemWorld::new(dir.0.clone(), ProjectFiles::Local);
         world.update_main(
             concat!(
                 "#import \"@preview/zed-surely-missing-package:0.1.2\": *\n",
@@ -527,7 +688,7 @@ mod tests {
             .expect("typst_assets ships at least one bundled font");
         std::fs::write(dir.0.join("local.ttf"), font_bytes).unwrap();
 
-        let world = TypstSystemWorld::new(dir.0.clone());
+        let world = TypstSystemWorld::new(dir.0.clone(), ProjectFiles::Local);
 
         assert!(
             world.fonts.len() > baseline,
@@ -549,14 +710,24 @@ mod tests {
         let dir = ScratchDir::new("typst_world_font_dir_test");
         std::fs::create_dir_all(dir.0.join("fonts/display")).unwrap();
         std::fs::write(dir.0.join("fonts/display/heading.ttf"), font_bytes).unwrap();
-        assert!(TypstSystemWorld::new(dir.0.clone()).fonts.len() > baseline);
+        assert!(
+            TypstSystemWorld::new(dir.0.clone(), ProjectFiles::Local)
+                .fonts
+                .len()
+                > baseline
+        );
 
         // a root that falls back to a large directory, such as the home directory, must not
         // load fonts from unrelated subdirectories.
         let dir = ScratchDir::new("typst_world_unrelated_font_test");
         std::fs::create_dir_all(dir.0.join("Books/novel/fonts")).unwrap();
         std::fs::write(dir.0.join("Books/novel/fonts/body.otf"), font_bytes).unwrap();
-        assert_eq!(TypstSystemWorld::new(dir.0.clone()).fonts.len(), baseline);
+        assert_eq!(
+            TypstSystemWorld::new(dir.0.clone(), ProjectFiles::Local)
+                .fonts
+                .len(),
+            baseline
+        );
     }
 
     #[test]
@@ -564,8 +735,8 @@ mod tests {
         let dir_a = ScratchDir::new("typst_world_shared_fonts_test_a");
         let dir_b = ScratchDir::new("typst_world_shared_fonts_test_b");
 
-        let world_a = TypstSystemWorld::new(dir_a.0.clone());
-        let world_b = TypstSystemWorld::new(dir_b.0.clone());
+        let world_a = TypstSystemWorld::new(dir_a.0.clone(), ProjectFiles::Local);
+        let world_b = TypstSystemWorld::new(dir_b.0.clone(), ProjectFiles::Local);
 
         let (_, static_font_slots) = static_fonts();
         // without project fonts, both worlds reuse the cached static font set.

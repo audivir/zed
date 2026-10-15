@@ -13,6 +13,7 @@ path = "src/typst_preview.rs"
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 chrono.workspace = true
 editor.workspace = true
 gpui.workspace = true
@@ -29,6 +30,7 @@ theme_settings.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
+worktree.workspace = true
 pdf_viewer.workspace = true
 toml.workspace = true
 zed_actions.workspace = true

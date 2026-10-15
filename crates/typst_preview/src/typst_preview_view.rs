@@ -1,4 +1,4 @@
-use crate::typst_world::TypstSystemWorld;
+use crate::typst_world::{ProjectFiles, RemoteProjectFiles, TypstSystemWorld};
 use crate::{
     ExportPdf, OpenFixedFollowingPreview, OpenFixedPreview, OpenFixedPreviewToTheSide,
     OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide,
@@ -39,6 +39,28 @@ use workspace::searchable::{SearchEvent, SearchableItemHandle};
 use workspace::{Pane, SplitDirection, ToolbarItemLocation, Workspace};
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(1000);
+
+/// Returns the absolute path of `file`, which is a path on the remote host for remote projects.
+fn file_abs_path(file: &Arc<dyn language::File>, cx: &App) -> Option<PathBuf> {
+    let file = project::File::from_dyn(Some(file))?;
+    Some(file.worktree.read(cx).absolutize(&file.path))
+}
+
+/// Returns where the compiler reads the project files of `file` from.
+fn project_files(file: &Arc<dyn language::File>, cx: &App) -> ProjectFiles {
+    let Some(file) = project::File::from_dyn(Some(file)) else {
+        return ProjectFiles::Local;
+    };
+    let worktree = file.worktree.read(cx);
+    match worktree.as_remote() {
+        Some(remote) => ProjectFiles::Remote(RemoteProjectFiles::new(
+            remote.file_loader(),
+            worktree.abs_path().to_path_buf(),
+            worktree.snapshot(),
+        )),
+        None => ProjectFiles::Local,
+    }
+}
 
 pub struct TypstPreviewView {
     workspace: WeakEntity<Workspace>,
@@ -247,8 +269,7 @@ fn publish_editor_diagnostics(
     let Some(active_path) = buffer
         .read(cx)
         .file()
-        .and_then(|file| file.as_local())
-        .map(|local| local.abs_path(cx))
+        .and_then(|file| file_abs_path(file, cx))
     else {
         return;
     };
@@ -835,7 +856,7 @@ impl TypstPreviewView {
                             let index = Self::selected_source_index(editor, cx);
                             let file_path = editor
                                 .file_at(MultiBufferOffset(0), cx)
-                                .and_then(|f| f.as_local().map(|f| f.abs_path(cx)));
+                                .and_then(|file| file_abs_path(&file, cx));
                             let focused = editor.focus_handle(cx).is_focused(window);
                             (index, file_path, focused)
                         });
@@ -887,7 +908,7 @@ impl TypstPreviewView {
                                 let index = Self::selected_source_index(editor, cx);
                                 let file_path = editor
                                     .file_at(MultiBufferOffset(0), cx)
-                                    .and_then(|f| f.as_local().map(|f| f.abs_path(cx)));
+                                    .and_then(|file| file_abs_path(&file, cx));
                                 let focused = editor.focus_handle(cx).is_focused(window);
                                 (index, file_path, focused)
                             });
@@ -936,9 +957,13 @@ impl TypstPreviewView {
 
     /// Resolves the project root and main file from `active_path`.
     ///
-    /// Walks up looking for a `typst.toml` entrypoint or a `main.typ`. Performs filesystem I/O,
-    /// so callers must run it on a background thread.
-    fn resolve_project(project_resolution: bool, active_path: &Path) -> (PathBuf, PathBuf) {
+    /// Walks up looking for a `typst.toml` entrypoint or a `main.typ`. Reads files, over the
+    /// network for remote projects, so callers must run it on a background thread.
+    fn resolve_project(
+        project_resolution: bool,
+        active_path: &Path,
+        files: &ProjectFiles,
+    ) -> (PathBuf, PathBuf) {
         let unresolved = (
             active_path
                 .parent()
@@ -953,8 +978,8 @@ impl TypstPreviewView {
         let mut found = None;
         while let Some(dir) = current {
             let toml_path = dir.join("typst.toml");
-            if toml_path.exists()
-                && let Ok(toml_content) = std::fs::read_to_string(&toml_path)
+            if files.exists(&toml_path)
+                && let Ok(toml_content) = files.read_to_string(&toml_path)
                 && let Ok(manifest) = toml_content.parse::<toml::Table>()
                 && let Some(entrypoint) = manifest
                     .get("package")
@@ -962,13 +987,13 @@ impl TypstPreviewView {
                     .and_then(|e| e.as_str())
             {
                 let main_file = dir.join(entrypoint);
-                if main_file.exists() {
+                if files.exists(&main_file) {
                     found = Some((dir.to_path_buf(), main_file));
                     break;
                 }
             }
             let potential_main = dir.join("main.typ");
-            if potential_main.exists() {
+            if files.exists(&potential_main) {
                 found = Some((dir.to_path_buf(), potential_main));
                 break;
             }
@@ -1044,11 +1069,9 @@ impl TypstPreviewView {
                                                     && let Some(file) = editor
                                                         .read(cx)
                                                         .file_at(MultiBufferOffset(0), cx)
-                                                    && let Some(local) = file.as_local()
+                                                    && let Some(abs_path) = file_abs_path(&file, cx)
                                                 {
-                                                    let item_path = util::normalize_path(
-                                                        &local.abs_path(cx).to_path_buf(),
-                                                    );
+                                                    let item_path = util::normalize_path(&abs_path);
                                                     if item_path == normalized_path {
                                                         return Some(editor.clone());
                                                     }
@@ -1170,17 +1193,17 @@ impl TypstPreviewView {
                     return None;
                 }
 
-                let (active_snapshot, selection_start, file_path) =
+                let (active_snapshot, selection_start, file) =
                     editor_clone.update(cx, |editor, cx| {
                         let active_snapshot = editor.buffer().read(cx).snapshot(cx);
                         let selection_start = Self::selected_source_index(editor, cx);
-                        let file_path = editor
-                            .file_at(MultiBufferOffset(0), cx)
-                            .and_then(|f| f.as_local().map(|f| f.abs_path(cx)));
-                        (active_snapshot, selection_start, file_path)
+                        let file = editor.file_at(MultiBufferOffset(0), cx).and_then(|file| {
+                            Some((file_abs_path(&file, cx)?, project_files(&file, cx)))
+                        });
+                        (active_snapshot, selection_start, file)
                     });
 
-                let Some(active_path) = file_path else {
+                let Some((active_path, files)) = file else {
                     view.compile_state =
                         TypstCompileState::Failed("Save this file to preview it".to_string());
                     cx.notify();
@@ -1202,10 +1225,10 @@ impl TypstPreviewView {
                                 if buffer.is_dirty(cx)
                                     && let Some(file) =
                                         editor_read.file_at(MultiBufferOffset(0), cx)
-                                    && let Some(local) = file.as_local()
+                                    && let Some(abs_path) = file_abs_path(&file, cx)
                                 {
                                     let snapshot = buffer.snapshot(cx);
-                                    map.insert(local.abs_path(cx).to_path_buf(), snapshot);
+                                    map.insert(abs_path, snapshot);
                                 }
                             }
                         }
@@ -1226,6 +1249,7 @@ impl TypstPreviewView {
                 Some((
                     selection_start,
                     active_path,
+                    files,
                     view.project_resolution,
                     final_overrides,
                     view.world.clone(),
@@ -1235,6 +1259,7 @@ impl TypstPreviewView {
             if let Some((
                 selection_start,
                 active_path,
+                files,
                 project_resolution,
                 final_overrides,
                 current_world,
@@ -1264,18 +1289,23 @@ impl TypstPreviewView {
                     .spawn(async move {
                         let start = Instant::now();
 
-                        // resolving the project performs filesystem I/O.
+                        // resolving the project reads files, from the remote for remote projects.
                         let (new_root, main_file_path) =
-                            Self::resolve_project(project_resolution, &active_path);
+                            Self::resolve_project(project_resolution, &active_path, &files);
 
-                        let world_arc = match current_world.filter(|w| w.lock().root == new_root) {
+                        let world_arc = match current_world.filter(|world| {
+                            let world = world.lock();
+                            world.root == new_root && world.files.is_remote() == files.is_remote()
+                        }) {
                             Some(world) => world,
-                            None => Arc::new(Mutex::new(TypstSystemWorld::new(new_root))),
+                            None => {
+                                Arc::new(Mutex::new(TypstSystemWorld::new(new_root, files.clone())))
+                            }
                         };
 
                         let main_contents = match final_overrides.get(&main_file_path) {
                             Some(snap) => snap.text(),
-                            None => match std::fs::read_to_string(&main_file_path) {
+                            None => match files.read_to_string(&main_file_path) {
                                 Ok(text) => text,
                                 Err(e) => {
                                     return CompileOutcome {
@@ -1292,6 +1322,7 @@ impl TypstPreviewView {
                         };
 
                         let mut world = world_arc.lock();
+                        world.files = files;
                         world.update_main(main_contents.into(), &main_file_path);
                         world.file_overrides = final_overrides;
 
@@ -1492,9 +1523,18 @@ impl TypstPreviewView {
     fn export_pdf(&mut self, _: &ExportPdf, _window: &mut Window, cx: &mut Context<Self>) {
         let document = self.document.clone();
         let export_path = self.export_path();
+        // the export path is on the remote host, where this cannot write yet.
+        let is_remote = self
+            .world
+            .as_ref()
+            .is_some_and(|world| world.lock().files.is_remote());
         let workspace = self.workspace.clone();
         cx.spawn(async move |_, cx| {
             let result = async {
+                anyhow::ensure!(
+                    !is_remote,
+                    "exporting from a remote project is not supported yet"
+                );
                 let document = document.context("the Typst document has not compiled yet")?;
                 let path = export_path.context("the Typst document has no main file")?;
                 let write_path = path.clone();
@@ -2039,7 +2079,7 @@ mod tests {
     #[test]
     fn export_path_sits_next_to_the_main_file() {
         let root = ScratchDir::new("export_path");
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
         world.update_main("= Hello".into(), &root.join("chapters/intro.typ"));
         assert_eq!(export_path(&world), Some(root.join("chapters/intro.pdf")));
     }
@@ -2104,7 +2144,8 @@ mod tests {
         let active_path = root.join("src/chapters/intro.typ");
         std::fs::write(&active_path, "").unwrap();
 
-        let (resolved_root, main_file) = TypstPreviewView::resolve_project(true, &active_path);
+        let (resolved_root, main_file) =
+            TypstPreviewView::resolve_project(true, &active_path, &ProjectFiles::Local);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, root.join("main.typ"));
@@ -2124,7 +2165,8 @@ mod tests {
         std::fs::write(root.join("main.typ"), "").unwrap();
         let active_path = root.join("src/entry.typ");
 
-        let (resolved_root, main_file) = TypstPreviewView::resolve_project(true, &active_path);
+        let (resolved_root, main_file) =
+            TypstPreviewView::resolve_project(true, &active_path, &ProjectFiles::Local);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, root.join("src/entry.typ"));
@@ -2137,7 +2179,8 @@ mod tests {
         let active_path = root.join("standalone.typ");
         std::fs::write(&active_path, "").unwrap();
 
-        let (resolved_root, main_file) = TypstPreviewView::resolve_project(true, &active_path);
+        let (resolved_root, main_file) =
+            TypstPreviewView::resolve_project(true, &active_path, &ProjectFiles::Local);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, active_path);
@@ -2151,7 +2194,8 @@ mod tests {
         std::fs::write(&active_path, "").unwrap();
 
         // without project resolution, an adjacent `main.typ` is ignored.
-        let (resolved_root, main_file) = TypstPreviewView::resolve_project(false, &active_path);
+        let (resolved_root, main_file) =
+            TypstPreviewView::resolve_project(false, &active_path, &ProjectFiles::Local);
 
         assert_eq!(resolved_root, root.0);
         assert_eq!(main_file, active_path);
@@ -2162,7 +2206,7 @@ mod tests {
         cx.executor().allow_parking();
         let root = ScratchDir::new("export_date");
         let main_path = root.join("main.typ");
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
         world.update_main("Hello".into(), &main_path);
         let document = typst::compile::<PagedDocument>(&world)
             .output
@@ -2183,7 +2227,7 @@ mod tests {
         let root = ScratchDir::new("disk_changes");
         let main_path = root.join("main.typ");
         std::fs::write(root.join("chapter.typ"), "Chapter").unwrap();
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
         world.update_main("#include \"chapter.typ\"".into(), &main_path);
         typst::compile::<PagedDocument>(&world)
             .output
@@ -2211,7 +2255,7 @@ mod tests {
     fn editing_one_page_only_changes_its_hash() {
         let root = ScratchDir::new("page_hashes");
         let main_path = root.join("main.typ");
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
 
         let mut compile = |source: &str| {
             world.update_main(source.to_string().into(), &main_path);
@@ -2236,7 +2280,7 @@ mod tests {
         let main_path = root.join("main.typ");
         let source = "Hello #undefined_var\n";
 
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
         world.update_main(source.into(), &main_path);
 
         let compiled = typst::compile::<PagedDocument>(&world);
@@ -2265,7 +2309,7 @@ mod tests {
         let other_path = root.join("other.typ");
         std::fs::write(&other_path, "Hello ä\n#undefined_var\n").unwrap();
 
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
         world.update_main("#include \"other.typ\"\n".into(), &main_path);
 
         let compiled = typst::compile::<PagedDocument>(&world);
@@ -2301,7 +2345,7 @@ mod tests {
         let sentence = "This is a long sentence that will definitely wrap across several lines on such a narrow page.";
         let source = format!("{preamble}{sentence}\n");
 
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
         world.update_main(source.clone().into(), &main_path);
 
         let compiled = typst::compile::<PagedDocument>(&world);
@@ -2361,7 +2405,7 @@ mod tests {
              It compiles incredibly fast and has a very clean syntax.";
         let source = format!("{preamble}{sentence}\n");
 
-        let mut world = TypstSystemWorld::new(root.0.clone());
+        let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
         world.update_main(source.clone().into(), &main_path);
 
         let compiled = typst::compile::<PagedDocument>(&world);
@@ -2441,7 +2485,7 @@ mod tests {
                  #set text(size: {font_size_pt}pt)\n\
                  Some plain paragraph text.\n"
             );
-            let mut world = TypstSystemWorld::new(root.0.clone());
+            let mut world = TypstSystemWorld::new(root.0.clone(), ProjectFiles::Local);
             world.update_main(source.clone().into(), &main_path);
             let compiled = typst::compile::<PagedDocument>(&world);
             let document = compiled.output.expect("fixture should compile");

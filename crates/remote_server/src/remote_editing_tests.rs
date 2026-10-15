@@ -584,6 +584,82 @@ async fn test_remote_load_binary_file(cx: &mut TestAppContext, server_cx: &mut T
 }
 
 #[gpui::test]
+async fn test_remote_typst_compile_reads_project_files(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use typst_preview::typst_world::{ProjectFiles, RemoteProjectFiles, TypstSystemWorld};
+
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project": {
+                "main.typ": "#import \"lib.typ\": greet\n#greet(\"remote\")\n#image(\"dot.svg\")\n",
+                "lib.typ": "#let greet(name) = [Hello #name]\n",
+                "dot.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>",
+            }
+        }),
+    )
+    .await;
+
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project"), true, cx)
+        })
+        .await
+        .expect("remote worktree should open");
+    cx.run_until_parked();
+
+    let (loader, snapshot) = worktree.read_with(cx, |worktree, _| {
+        let remote = worktree.as_remote().expect("worktree should be remote");
+        (remote.file_loader(), worktree.snapshot())
+    });
+    // The compiler blocks while it reads files, which would stall the test executor that serves
+    // the requests, so the files are downloaded through the same loader up front.
+    let mut downloaded = HashMap::default();
+    for path in ["main.typ", "lib.typ", "dot.svg"] {
+        let content = loader
+            .load(rel_path(path))
+            .await
+            .expect("remote file should download");
+        downloaded.insert(path.to_string(), content);
+    }
+    let files = ProjectFiles::Remote(RemoteProjectFiles {
+        read: Arc::new(move |path| {
+            downloaded
+                .get(path.as_unix_str())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{path:?} was not downloaded"))
+        }),
+        worktree_root: PathBuf::from(path!("/code/project")),
+        snapshot,
+    });
+
+    let root = PathBuf::from(path!("/code/project"));
+    let main_path = root.join("main.typ");
+    let mut world = TypstSystemWorld::new(root.clone(), files.clone());
+    let main_text = files
+        .read_to_string(&main_path)
+        .expect("main file should be readable");
+    world.update_main(main_text.into(), &main_path);
+    let compiled = typst::compile::<typst_layout::PagedDocument>(&world);
+    let page_count = compiled
+        .output
+        .map(|document| document.pages().len())
+        .map_err(|errors| format!("{errors:?}"));
+    let read_imports =
+        world.has_read(&root.join("lib.typ")) && world.has_read(&root.join("dot.svg"));
+
+    assert_eq!(page_count, Ok(1));
+    assert!(
+        read_imports,
+        "the import and the image should come from the remote"
+    );
+}
+
+#[gpui::test]
 async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(

@@ -15694,6 +15694,9 @@ dependencies = [
  "theme_settings",
  "thiserror 2.0.20",
  "toml_edit 0.22.27",
+ "typst",
+ "typst-layout",
+ "typst_preview",
  "unindent",
  "util",
  "uuid",
@@ -20298,6 +20301,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "worktree",
  "zed_actions",
 ]
 
