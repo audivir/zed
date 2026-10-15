@@ -86,6 +86,9 @@ impl project::ProjectItem for SvgFile {
 struct RasterizedSvg {
     image: Arc<RenderImage>,
     width: u32,
+    /// The parse this was rasterized from, so changed content is rasterized again even when its
+    /// width stays the same.
+    source: Arc<ParsedSvg>,
 }
 
 pub struct SvgPreviewView {
@@ -258,8 +261,13 @@ impl SvgPreviewView {
         let Some(Ok(parsed_svg)) = self.parsed_svg.clone() else {
             return;
         };
+        let shows_current_content = self
+            .rasterized_svg
+            .as_ref()
+            .is_some_and(|rasterized| Arc::ptr_eq(&rasterized.source, &parsed_svg));
         if self.pending_raster_width == Some(width)
             || (self.pending_raster_width.is_none()
+                && shows_current_content
                 && self
                     .rasterized_svg
                     .as_ref()
@@ -270,7 +278,8 @@ impl SvgPreviewView {
 
         // The first rasterization of new content shows up right away; zoom changes wait until
         // zooming pauses.
-        let debounce = self.rasterized_svg.is_some();
+        let debounce = shows_current_content;
+        let source = parsed_svg.clone();
         let renderer = cx.svg_renderer();
         self.pending_raster_width = Some(width);
         self._rasterize = cx.spawn_in(window, async move |this, cx| {
@@ -289,9 +298,14 @@ impl SvgPreviewView {
             this.update_in(cx, |view, window, cx| {
                 view.pending_raster_width = None;
                 match result {
-                    Ok(image) => {
-                        view.set_rasterized_svg(Some(RasterizedSvg { image, width }), window)
-                    }
+                    Ok(image) => view.set_rasterized_svg(
+                        Some(RasterizedSvg {
+                            image,
+                            width,
+                            source,
+                        }),
+                        window,
+                    ),
                     Err(error) => {
                         log::error!("failed to rasterize SVG: {error}");
                         view.parsed_svg = Some(Err(error.to_string().into()));
@@ -1258,7 +1272,7 @@ mod persistence {
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
-    use project::FakeFs;
+    use project::{FakeFs, Fs as _};
     use util::path;
     use workspace::MultiWorkspace;
 
@@ -1399,6 +1413,70 @@ mod tests {
         let (rasterized_width, expected_width) = raster_width_after_drawing(cx);
         assert!(expected_width > 300, "zoomed far beyond the intrinsic 40px");
         assert_eq!(rasterized_width, Some(expected_width));
+    }
+
+    #[gpui::test]
+    async fn content_rewritten_on_disk_at_the_same_size_is_rasterized_again(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            serde_json::json!({ "image.svg": SQUARE_SVG }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let view = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    path!("/root/image.svg").into(),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("open svg")
+            .downcast::<SvgPreviewView>()
+            .expect("svg files open in the preview");
+        cx.run_until_parked();
+
+        let rasterized_image_after_drawing = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            cx.executor().advance_clock(RASTERIZE_DEBOUNCE);
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                view.rasterized_svg
+                    .as_ref()
+                    .map(|rasterized| rasterized.image.clone())
+                    .expect("the svg is rasterized")
+            })
+        };
+        let original_image = rasterized_image_after_drawing(cx);
+
+        // Same size and zoom, so only the content tells the old rasterization apart.
+        fs.save(
+            path!("/root/image.svg").as_ref(),
+            &SQUARE_SVG.replace("red", "blue").into(),
+            language::LineEnding::Unix,
+        )
+        .await
+        .expect("rewrite svg");
+        cx.run_until_parked();
+        let rewritten_image = rasterized_image_after_drawing(cx);
+
+        assert!(!Arc::ptr_eq(&original_image, &rewritten_image));
+        assert_ne!(original_image.as_bytes(0), rewritten_image.as_bytes(0));
     }
 
     #[gpui::test]
