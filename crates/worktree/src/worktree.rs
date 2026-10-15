@@ -2324,7 +2324,9 @@ async fn download_binary_file(
     'attempts: for _ in 0..MAX_ATTEMPTS {
         request.offset = 0;
         let first_chunk = client.request(request.clone()).await?;
-        let file = first_chunk.file.context("missing file in binary file chunk")?;
+        let file = first_chunk
+            .file
+            .context("missing file in binary file chunk")?;
         let total_size = first_chunk.total_size;
         let mut content = Vec::with_capacity(usize::try_from(total_size)?);
         content.extend_from_slice(&first_chunk.data);
