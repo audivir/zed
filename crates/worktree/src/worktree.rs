@@ -2315,6 +2315,34 @@ impl LocalWorktree {
     }
 }
 
+/// Loads files of a remote worktree without a `Worktree` entity, so it can be used from any thread.
+#[derive(Clone)]
+pub struct RemoteFileLoader {
+    client: AnyProtoClient,
+    project_id: u64,
+    worktree_id: u64,
+}
+
+impl RemoteFileLoader {
+    pub async fn load(&self, path: &RelPath) -> Result<Vec<u8>> {
+        let (_, _, content) = self.load_with_file(path).await?;
+        Ok(content)
+    }
+
+    async fn load_with_file(&self, path: &RelPath) -> Result<(proto::File, u64, Vec<u8>)> {
+        download_binary_file(
+            &self.client,
+            proto::LoadBinaryFileChunk {
+                project_id: self.project_id,
+                worktree_id: self.worktree_id,
+                path: path.as_unix_str().to_owned(),
+                offset: 0,
+            },
+        )
+        .await
+    }
+}
+
 async fn download_binary_file(
     client: &AnyProtoClient,
     mut request: proto::LoadBinaryFileChunk,
@@ -2359,20 +2387,23 @@ impl RemoteWorktree {
         self.project_id
     }
 
+    pub fn file_loader(&self) -> RemoteFileLoader {
+        RemoteFileLoader {
+            client: self.client.clone(),
+            project_id: self.project_id,
+            worktree_id: self.id().to_proto(),
+        }
+    }
+
     fn load_binary_file(
         &self,
         path: &RelPath,
         cx: &Context<Worktree>,
     ) -> Task<Result<LoadedBinaryFile>> {
-        let client = self.client.clone();
-        let request = proto::LoadBinaryFileChunk {
-            project_id: self.project_id,
-            worktree_id: self.id().to_proto(),
-            path: path.as_unix_str().to_owned(),
-            offset: 0,
-        };
+        let loader = self.file_loader();
+        let path = Arc::<RelPath>::from(path);
         cx.spawn(async move |worktree, cx| {
-            let (file, total_size, content) = download_binary_file(&client, request).await?;
+            let (file, total_size, content) = loader.load_with_file(&path).await?;
             let worktree = worktree.upgrade().context("worktree was dropped")?;
             let mut file = cx.update(|cx| File::from_proto(file, worktree, cx))?;
             // `File::from_proto` leaves the size unknown. Fill it in so that the disk state matches
