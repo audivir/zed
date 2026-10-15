@@ -166,16 +166,19 @@ impl Pdf {
         priority: gpui::Priority,
         on_rendered: impl FnOnce(&mut App) + Send + 'static,
     ) -> Option<Task<()>> {
-        // reuse a cached render in this style and at least this scale that covers the point.
+        // a page missing from the metadata still goes to the renderer, which records the failure.
+        let page_size = self.metadata.pages.get(page_idx).map(|page| page.size);
+        let satisfies = move |rendered: &PageData| {
+            page_size.is_some_and(|page_size| {
+                rendered.satisfies(page_size, requested_scale, style, visible_center_y)
+            })
+        };
+
         let prev_page = {
             let cache = self.page_cache.read();
 
             if let Some(rendered) = cache.get(&page_idx) {
-                // tolerance for float precision.
-                if rendered.scale >= requested_scale * 0.99
-                    && rendered.style == style
-                    && rendered.covers_page_y(visible_center_y)
-                {
+                if satisfies(rendered) {
                     return None; // We already have a good enough render, abort the task
                 }
                 // a render in another style has the wrong shape or colors.
@@ -188,7 +191,7 @@ impl Pdf {
         {
             let failed = self.failed_pages.lock();
             if let Some(&(failed_scale, failed_style)) = failed.get(&page_idx)
-                && failed_scale >= requested_scale * 0.99
+                && PageData::scale_is_reusable(failed_scale, requested_scale)
                 && failed_style == style
             {
                 return None; // Already know this render fails at this resolution; don't retry every frame
@@ -198,10 +201,10 @@ impl Pdf {
         {
             let mut rendering = self.rendering_pages.lock();
             if let Some(&(rendering_scale, rendering_style)) = rendering.get(&page_idx)
-                && rendering_scale >= requested_scale * 0.99
+                && PageData::scale_is_reusable(rendering_scale, requested_scale)
                 && rendering_style == style
             {
-                return None; // Already queuing a render of equal or better resolution
+                return None; // Already queuing a render of a suitable resolution
             }
             rendering.insert(page_idx, (requested_scale, style));
         }
@@ -234,10 +237,10 @@ impl Pdf {
 
                             let mut cache = pdf.page_cache.write();
 
-                            // overwrite only a worse or stale-style render that landed first.
-                            let should_insert = cache
-                                .get(&page_idx)
-                                .is_none_or(|c| c.scale <= requested_scale || c.style != style);
+                            // keep a render that landed first if it serves this request as well,
+                            // such as a sharper one from a later zoom step.
+                            let should_insert =
+                                cache.get(&page_idx).is_none_or(|cached| !satisfies(cached));
                             if should_insert {
                                 cache.insert(page_idx, new_page);
                                 log::debug!("Written to cache");
@@ -711,6 +714,89 @@ mod tests {
         assert!(
             bottom_offset > top_offset,
             "expected the re-render to move the strip toward the bottom of the page"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn zooming_out_until_a_page_fits_replaces_its_strip_with_the_whole_page(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/tall_page.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let page_height_pt = pdf.metadata.pages[0].size.height;
+        // close enough that only the coverage of the strip, not its sharpness, forces the render.
+        let fitting_scale = 8192.0 / page_height_pt * 0.95;
+        let strip_scale = 8192.0 / page_height_pt * 1.1;
+
+        for scale in [strip_scale, fitting_scale] {
+            cx.update(|cx| {
+                pdf.clone().request_page(
+                    cx,
+                    0,
+                    scale,
+                    page_height_pt / 2.0,
+                    PageRotation::None.into(),
+                    gpui::Priority::High,
+                    |_| {},
+                )
+            })
+            .expect("the cached render should not satisfy this request")
+            .await;
+        }
+
+        let cache = pdf.page_cache.read();
+        let rendered = cache.get(&0).expect("page should be cached");
+        assert_eq!(rendered.scale, fitting_scale);
+        assert_eq!(rendered.page_offset_pt, 0.0);
+        assert!(rendered.covered_height_pt() >= page_height_pt - 1.0);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn zooming_far_out_re_renders_instead_of_shrinking_a_sharp_render(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test_fixtures/solid_red.pdf");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+        let pdf = Arc::new(Pdf::from_bytes(bytes, None, None).await);
+        let request = |scale: f32, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                pdf.clone().request_page(
+                    cx,
+                    0,
+                    scale,
+                    0.0,
+                    PageRotation::None.into(),
+                    gpui::Priority::High,
+                    |_| {},
+                )
+            })
+        };
+
+        request(4.0, cx).expect("uncached page should render").await;
+        request(1.0, cx)
+            .expect("a render four times too sharp should not be reused")
+            .await;
+        assert_eq!(
+            pdf.page_cache.read().get(&0).map(|page| page.scale),
+            Some(1.0)
+        );
+
+        assert!(
+            request(0.9, cx).is_none(),
+            "a slightly sharper render should still be reused"
         );
     }
 

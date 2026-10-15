@@ -26,6 +26,23 @@ const MAX_RENDER_WIDTH: f32 = 8192.0;
 /// Taller pages render a strip of this height around `visible_center_y` instead of downscaling.
 const MAX_RENDER_HEIGHT: f32 = 8192.0;
 
+/// Highest ratio of a cached render's scale to the requested scale at which the render is shown.
+///
+/// Images are sampled without mipmaps, so shrinking a much sharper render on the GPU aliases.
+const MAX_OVERSAMPLING: f32 = 1.25;
+
+/// Returns the scale a page of `display_size` points is rasterized at for `scale`, which is
+/// lower when `MAX_RENDER_WIDTH` caps the width.
+fn effective_render_scale(display_size: Size<f32>, scale: f32) -> f32 {
+    (display_size.width * scale).round().min(MAX_RENDER_WIDTH) / display_size.width
+}
+
+/// Whether a page of `display_size` points renders as a strip at `scale`, being too tall to
+/// render whole.
+fn renders_as_strip(display_size: Size<f32>, scale: f32) -> bool {
+    display_size.height * effective_render_scale(display_size, scale) > MAX_RENDER_HEIGHT
+}
+
 /// Text layer and link annotations of a page.
 type TextAndLinks = (Arc<Vec<PdfTextSpan>>, Arc<Vec<PdfLink>>);
 
@@ -411,6 +428,31 @@ impl PageData {
     /// Whether `image` covers the page-space Y coordinate `y_pt`.
     pub fn covers_page_y(&self, y_pt: f32) -> bool {
         y_pt >= self.page_offset_pt && y_pt <= self.page_offset_pt + self.covered_height_pt()
+    }
+
+    /// Whether this render can be shown in place of a render of a page of `page_size` points at
+    /// `scale` in `style`, centered on `visible_center_y` if it is a strip.
+    pub fn satisfies(
+        &self,
+        page_size: Size<f32>,
+        scale: f32,
+        style: RenderStyle,
+        visible_center_y: f32,
+    ) -> bool {
+        let display_size = style.rotation.display_size(page_size);
+        // a strip left over from zooming in must not stand in for a page that now fits whole.
+        let covers_request = if renders_as_strip(display_size, scale) {
+            self.covers_page_y(visible_center_y)
+        } else {
+            self.page_offset_pt == 0.0 && self.covered_height_pt() >= display_size.height - 1.0
+        };
+        self.style == style && Self::scale_is_reusable(self.scale, scale) && covers_request
+    }
+
+    /// Whether a render requested at `rendered_scale` can be shown for a request at `scale`.
+    pub fn scale_is_reusable(rendered_scale: f32, scale: f32) -> bool {
+        // tolerance for float precision.
+        rendered_scale >= scale * 0.99 && rendered_scale <= scale * MAX_OVERSAMPLING
     }
 }
 
@@ -960,15 +1002,19 @@ impl PdfRenderer {
             (page.width().value, page.height().value)
         };
 
+        let display_size = Size {
+            width: source_width_pt,
+            height: source_height_pt,
+        };
         // cap the width so extreme zoom cannot request a multi-gigabyte bitmap. Height is
         // capped separately below.
-        let target_width = ((source_width_pt * scale).round()).min(MAX_RENDER_WIDTH) as i32;
-        let effective_scale = target_width as f32 / source_width_pt;
+        let effective_scale = effective_render_scale(display_size, scale);
+        let target_width = (source_width_pt * effective_scale).round() as i32;
         let full_height_px = source_height_pt * effective_scale;
 
         // render only a strip around `visible_center_y` for pages too tall to render whole, a
         // one-dimensional version of the tiling in the Chromium PDF viewer.
-        let (target_height, page_offset_pt) = if full_height_px > MAX_RENDER_HEIGHT {
+        let (target_height, page_offset_pt) = if renders_as_strip(display_size, scale) {
             let strip_height_pt = MAX_RENDER_HEIGHT / effective_scale;
             let max_offset_pt = (source_height_pt - strip_height_pt).max(0.0);
             let offset_pt = (visible_center_y - strip_height_pt / 2.0).clamp(0.0, max_offset_pt);
