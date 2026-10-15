@@ -26,28 +26,71 @@ pub enum ProjectFiles {
     Remote(RemoteProjectFiles),
 }
 
-/// Reads a file of a remote worktree by its worktree-relative path.
-pub type RemoteFileReader = Arc<dyn Fn(&RelPath) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+/// Files of a remote worktree, addressed by their worktree-relative paths.
+pub trait RemoteFileSource: Send + Sync {
+    fn read_file(&self, path: &RelPath) -> anyhow::Result<Vec<u8>>;
+
+    /// Returns the modification time and size of a file without downloading it.
+    fn file_metadata(&self, path: &RelPath) -> anyhow::Result<(Option<SystemTime>, u64)>;
+}
+
+// compiles run on a background thread, which can wait for the network.
+impl RemoteFileSource for RemoteFileLoader {
+    fn read_file(&self, path: &RelPath) -> anyhow::Result<Vec<u8>> {
+        futures::executor::block_on(self.load(path))
+    }
+
+    fn file_metadata(&self, path: &RelPath) -> anyhow::Result<(Option<SystemTime>, u64)> {
+        let (mtime, size) = futures::executor::block_on(self.metadata(path))?;
+        Ok((mtime.map(|mtime| mtime.timestamp_for_user()), size))
+    }
+}
 
 /// Files of a remote project, downloaded when a compile needs them.
 #[derive(Clone)]
 pub struct RemoteProjectFiles {
-    pub read: RemoteFileReader,
+    pub source: Arc<dyn RemoteFileSource>,
     /// absolute path of the worktree root on the remote host.
     pub worktree_root: PathBuf,
-    /// worktree entries, whose modification times decide when a file is downloaded again. Files
-    /// missing from it, such as those in unexpanded ignored directories, are not found.
+    /// worktree entries, whose modification times decide when a file is downloaded again.
     pub snapshot: Snapshot,
 }
 
 impl RemoteProjectFiles {
     pub fn new(loader: RemoteFileLoader, worktree_root: PathBuf, snapshot: Snapshot) -> Self {
         Self {
-            // compiles run on a background thread, which can wait for the download.
-            read: Arc::new(move |rel_path| futures::executor::block_on(loader.load(rel_path))),
+            source: Arc::new(loader),
             worktree_root,
             snapshot,
         }
+    }
+
+    /// Returns the modification time and size of `rel_path`, if it is a file.
+    ///
+    /// Files in directories the worktree has not scanned, like ignored build directories with
+    /// generated images, are looked up on the remote. Anything else missing from the snapshot
+    /// does not exist, which avoids a request for every file the project resolution probes.
+    fn metadata(&self, rel_path: &RelPath) -> Option<(Option<SystemTime>, u64)> {
+        if let Some(entry) = self.snapshot.entry_for_path(rel_path) {
+            return entry.is_file().then(|| {
+                (
+                    entry.mtime.map(|mtime| mtime.timestamp_for_user()),
+                    entry.size,
+                )
+            });
+        }
+        let in_unscanned_dir = rel_path
+            .ancestors()
+            .skip(1)
+            .find_map(|ancestor| self.snapshot.entry_for_path(ancestor))
+            .is_some_and(|ancestor| ancestor.kind.is_unloaded());
+        if !in_unscanned_dir {
+            return None;
+        }
+        self.source
+            .file_metadata(rel_path)
+            .map_err(|error| log::debug!("no remote file {rel_path:?}: {error:#}"))
+            .ok()
     }
 
     fn rel_path(&self, path: &Path) -> Option<Arc<RelPath>> {
@@ -60,7 +103,9 @@ impl RemoteProjectFiles {
     }
 
     fn read_rel(&self, rel_path: &RelPath) -> FileResult<Vec<u8>> {
-        (self.read)(rel_path).map_err(|error| FileError::Other(Some(format!("{error:#}").into())))
+        self.source
+            .read_file(rel_path)
+            .map_err(|error| FileError::Other(Some(format!("{error:#}").into())))
     }
 }
 
@@ -72,15 +117,7 @@ impl ProjectFiles {
                 let metadata = std::fs::metadata(path).ok()?;
                 Some((metadata.modified().ok(), metadata.len()))
             }
-            ProjectFiles::Remote(remote) => {
-                let entry = remote.snapshot.entry_for_path(&remote.rel_path(path)?)?;
-                entry.is_file().then(|| {
-                    (
-                        entry.mtime.map(|mtime| mtime.timestamp_for_user()),
-                        entry.size,
-                    )
-                })
-            }
+            ProjectFiles::Remote(remote) => remote.metadata(&remote.rel_path(path)?),
         }
     }
 

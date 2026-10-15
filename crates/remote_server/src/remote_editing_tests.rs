@@ -79,7 +79,7 @@ use util::{
     path,
     path_list::PathList,
     paths::{PathMatcher, PathStyle},
-    rel_path::rel_path,
+    rel_path::{RelPath, rel_path},
 };
 
 #[gpui::test]
@@ -588,16 +588,46 @@ async fn test_remote_typst_compile_reads_project_files(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,
 ) {
-    use typst_preview::typst_world::{ProjectFiles, RemoteProjectFiles, TypstSystemWorld};
+    use std::time::SystemTime;
+    use typst_preview::typst_world::{
+        ProjectFiles, RemoteFileSource, RemoteProjectFiles, TypstSystemWorld,
+    };
 
+    /// Files downloaded up front, since the compiler blocks while it reads files, which would
+    /// stall the test executor that serves the requests.
+    struct PrefetchedFiles {
+        contents: HashMap<String, Vec<u8>>,
+        metadata: HashMap<String, (Option<SystemTime>, u64)>,
+    }
+
+    impl RemoteFileSource for PrefetchedFiles {
+        fn read_file(&self, path: &RelPath) -> anyhow::Result<Vec<u8>> {
+            self.contents
+                .get(path.as_unix_str())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{path:?} was not prefetched"))
+        }
+
+        fn file_metadata(&self, path: &RelPath) -> anyhow::Result<(Option<SystemTime>, u64)> {
+            self.metadata
+                .get(path.as_unix_str())
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("{path:?} was not prefetched"))
+        }
+    }
+
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
         path!("/code"),
         json!({
             "project": {
-                "main.typ": "#import \"lib.typ\": greet\n#greet(\"remote\")\n#image(\"dot.svg\")\n",
+                ".git": {},
+                ".gitignore": "build/\n",
+                "main.typ": "#import \"lib.typ\": greet\n#greet(\"remote\")\n#image(\"dot.svg\")\n#image(\"build/figure.svg\")\n",
                 "lib.typ": "#let greet(name) = [Hello #name]\n",
-                "dot.svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>",
+                "dot.svg": svg,
+                "build": { "figure.svg": svg },
             }
         }),
     )
@@ -616,23 +646,40 @@ async fn test_remote_typst_compile_reads_project_files(
         let remote = worktree.as_remote().expect("worktree should be remote");
         (remote.file_loader(), worktree.snapshot())
     });
-    // The compiler blocks while it reads files, which would stall the test executor that serves
-    // the requests, so the files are downloaded through the same loader up front.
-    let mut downloaded = HashMap::default();
-    for path in ["main.typ", "lib.typ", "dot.svg"] {
+    assert!(
+        snapshot
+            .entry_for_path(rel_path("build"))
+            .is_some_and(|entry| entry.kind.is_unloaded()),
+        "the ignored directory should not be scanned"
+    );
+    assert!(
+        snapshot
+            .entry_for_path(rel_path("build/figure.svg"))
+            .is_none()
+    );
+
+    let mut prefetched = PrefetchedFiles {
+        contents: HashMap::default(),
+        metadata: HashMap::default(),
+    };
+    for path in ["main.typ", "lib.typ", "dot.svg", "build/figure.svg"] {
         let content = loader
             .load(rel_path(path))
             .await
             .expect("remote file should download");
-        downloaded.insert(path.to_string(), content);
+        prefetched.contents.insert(path.to_string(), content);
     }
+    let (mtime, size) = loader
+        .metadata(rel_path("build/figure.svg"))
+        .await
+        .expect("metadata of an unscanned file should load");
+    assert_eq!(size, svg.len() as u64);
+    prefetched.metadata.insert(
+        "build/figure.svg".to_string(),
+        (mtime.map(|mtime| mtime.timestamp_for_user()), size),
+    );
     let files = ProjectFiles::Remote(RemoteProjectFiles {
-        read: Arc::new(move |path| {
-            downloaded
-                .get(path.as_unix_str())
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("{path:?} was not downloaded"))
-        }),
+        source: Arc::new(prefetched),
         worktree_root: PathBuf::from(path!("/code/project")),
         snapshot,
     });
@@ -656,6 +703,10 @@ async fn test_remote_typst_compile_reads_project_files(
     assert!(
         read_imports,
         "the import and the image should come from the remote"
+    );
+    assert!(
+        world.has_read(&root.join("build/figure.svg")),
+        "the image in the unscanned directory should come from the remote"
     );
 }
 
