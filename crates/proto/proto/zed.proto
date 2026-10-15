@@ -525,6 +525,10 @@ message Envelope {
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+
+    // Numbered far above upstream's messages so that upstream additions don't collide.
+    LoadBinaryFileChunk load_binary_file_chunk = 1000;
+    LoadBinaryFileChunkResponse load_binary_file_chunk_response = 1001;
   }
 
   reserved 87 to 88;

@@ -61,7 +61,7 @@ use std::{
     ffi::OsStr,
     fmt,
     future::Future,
-    io::Read,
+    io::{Read, Seek as _, SeekFrom},
     mem::{self},
     ops::{Bound, Deref, DerefMut, Range},
     path::{Path, PathBuf},
@@ -936,9 +936,7 @@ impl Worktree {
     ) -> Task<Result<LoadedBinaryFile>> {
         match self {
             Worktree::Local(this) => this.load_binary_file(path, cx),
-            Worktree::Remote(_) => {
-                Task::ready(Err(anyhow!("remote worktrees can't yet load binary files")))
-            }
+            Worktree::Remote(this) => this.load_binary_file(path, cx),
         }
     }
 
@@ -1167,6 +1165,57 @@ impl Worktree {
             },
             worktree_scan_id: scan_id as u64,
         })
+    }
+
+    pub async fn handle_load_binary_file_chunk(
+        this: Entity<Self>,
+        request: proto::LoadBinaryFileChunk,
+        cx: AsyncApp,
+    ) -> Result<proto::LoadBinaryFileChunkResponse> {
+        const CHUNK_SIZE: u64 = 1024 * 1024;
+
+        let path: Arc<RelPath> = RelPath::from_unix_str(&request.path)
+            .with_context(|| format!("received invalid relative path {:?}", request.path))?
+            .into();
+        let (fs, abs_path, worktree_id, entry_id) = this.read_with(&cx, |this, _| {
+            let this = this.as_local().context("worktree is not local")?;
+            anyhow::ensure!(
+                request.project_id == proto::REMOTE_SERVER_PROJECT_ID
+                    || !this.is_path_private(&path),
+                "file is private"
+            );
+            let entry_id = this.entry_for_path(&path).map(|entry| entry.id);
+            anyhow::Ok((this.fs.clone(), this.absolutize(&path), this.id(), entry_id))
+        })?;
+
+        cx.background_spawn(async move {
+            let metadata = fs
+                .metadata(&abs_path)
+                .await?
+                .with_context(|| format!("{abs_path:?} does not exist"))?;
+            anyhow::ensure!(!metadata.is_dir, "{abs_path:?} is a directory");
+
+            let mut reader = fs.open_sync(&abs_path).await?;
+            reader.seek(SeekFrom::Start(request.offset))?;
+            let mut data = Vec::new();
+            reader
+                .take(CHUNK_SIZE.min(metadata.len.saturating_sub(request.offset)))
+                .read_to_end(&mut data)?;
+
+            Ok(proto::LoadBinaryFileChunkResponse {
+                file: Some(proto::File {
+                    worktree_id: worktree_id.to_proto(),
+                    entry_id: entry_id.map(|id| id.to_proto()),
+                    path: path.as_unix_str().to_owned(),
+                    mtime: Some(metadata.mtime.into()),
+                    is_deleted: false,
+                    is_historic: false,
+                }),
+                total_size: metadata.len,
+                data,
+            })
+        })
+        .await
     }
 
     pub async fn handle_trash_entry(
@@ -2266,9 +2315,74 @@ impl LocalWorktree {
     }
 }
 
+async fn download_binary_file(
+    client: &AnyProtoClient,
+    mut request: proto::LoadBinaryFileChunk,
+) -> Result<(proto::File, u64, Vec<u8>)> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    'attempts: for _ in 0..MAX_ATTEMPTS {
+        request.offset = 0;
+        let first_chunk = client.request(request.clone()).await?;
+        let file = first_chunk.file.context("missing file in binary file chunk")?;
+        let total_size = first_chunk.total_size;
+        let mut content = Vec::with_capacity(usize::try_from(total_size)?);
+        content.extend_from_slice(&first_chunk.data);
+
+        while (content.len() as u64) < total_size {
+            request.offset = content.len() as u64;
+            let chunk = client.request(request.clone()).await?;
+            // The file was modified on the remote while it was being read, so the chunks
+            // already received belong to a different version of it.
+            if chunk.file.as_ref().map(|chunk_file| &chunk_file.mtime) != Some(&file.mtime)
+                || chunk.total_size != total_size
+            {
+                continue 'attempts;
+            }
+            anyhow::ensure!(
+                !chunk.data.is_empty(),
+                "remote file was truncated while loading"
+            );
+            content.extend_from_slice(&chunk.data);
+        }
+
+        return Ok((file, total_size, content));
+    }
+
+    anyhow::bail!("remote file kept changing while loading")
+}
+
 impl RemoteWorktree {
     pub fn project_id(&self) -> u64 {
         self.project_id
+    }
+
+    fn load_binary_file(
+        &self,
+        path: &RelPath,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedBinaryFile>> {
+        let client = self.client.clone();
+        let request = proto::LoadBinaryFileChunk {
+            project_id: self.project_id,
+            worktree_id: self.id().to_proto(),
+            path: path.as_unix_str().to_owned(),
+            offset: 0,
+        };
+        cx.spawn(async move |worktree, cx| {
+            let (file, total_size, content) = download_binary_file(&client, request).await?;
+            let worktree = worktree.upgrade().context("worktree was dropped")?;
+            let mut file = cx.update(|cx| File::from_proto(file, worktree, cx))?;
+            // `File::from_proto` leaves the size unknown. Fill it in so that the disk state matches
+            // the worktree entry, and the next update of the entry isn't mistaken for a change.
+            if let DiskState::Present { size, .. } = &mut file.disk_state {
+                *size = total_size;
+            }
+            Ok(LoadedBinaryFile {
+                file: Arc::new(file),
+                content,
+            })
+        })
     }
 
     pub fn client(&self) -> AnyProtoClient {

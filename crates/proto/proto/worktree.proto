@@ -156,6 +156,21 @@ message ExpandAllForProjectEntryResponse {
   uint64 worktree_scan_id = 1;
 }
 
+// Reads a file in slices, so that transferring a large file doesn't hold up
+// other messages, such as heartbeats, on the connection.
+message LoadBinaryFileChunk {
+  uint64 project_id = 1;
+  uint64 worktree_id = 2;
+  string path = 3;
+  uint64 offset = 4;
+}
+
+message LoadBinaryFileChunkResponse {
+  File file = 1;
+  uint64 total_size = 2;
+  bytes data = 3;
+}
+
 // TODO(yara|dino): split into per-operation response messages (e.g.
 // `CreateProjectEntryResponse`, `CopyProjectEntryResponse`,
 // `DeleteProjectEntryResponse`, `RenameProjectEntryResponse`) for consistency

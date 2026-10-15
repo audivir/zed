@@ -539,6 +539,51 @@ async fn test_remote_project_image_source(cx: &mut TestAppContext, server_cx: &m
 }
 
 #[gpui::test]
+async fn test_remote_load_binary_file(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/code"), json!({ "project": {} }))
+        .await;
+    // Larger than a single chunk, so the file arrives in several requests.
+    let content = (0..2_500_000u32)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs.insert_file(path!("/code/project/document.pdf"), content.clone())
+        .await;
+
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project"), true, cx)
+        })
+        .await
+        .expect("remote worktree should open");
+    cx.run_until_parked();
+
+    let loaded = worktree
+        .update(cx, |worktree, cx| {
+            worktree.load_binary_file(rel_path("document.pdf"), cx)
+        })
+        .await
+        .expect("remote binary file should load");
+    assert_eq!(loaded.content, content);
+
+    worktree.read_with(cx, |worktree, _| {
+        let entry = worktree
+            .entry_for_path(rel_path("document.pdf"))
+            .expect("entry should exist");
+        assert!(!loaded.file.is_local);
+        assert_eq!(loaded.file.entry_id, Some(entry.id));
+        assert_eq!(
+            loaded.file.disk_state,
+            language::DiskState::Present {
+                mtime: entry.mtime.expect("entry should have an mtime"),
+                size: entry.size,
+            }
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
