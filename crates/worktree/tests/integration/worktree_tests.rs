@@ -7751,3 +7751,44 @@ fn set_file_scan_depth(cx: &mut TestAppContext, depth: Option<u32>) {
         });
     });
 }
+
+#[gpui::test]
+async fn test_load_binary_file_chunk_past_the_end_returns_only_metadata(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    init_test(cx);
+
+    // A real file system, since seeking past the end of a real file fails.
+    let temp_root = TempTree::new(json!({ "figure.svg": "<svg/>" }));
+    let tree = Worktree::local(
+        temp_root.path(),
+        true,
+        RealFs::new(None, cx.executor()),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    let request = |offset| proto::LoadBinaryFileChunk {
+        project_id: proto::REMOTE_SERVER_PROJECT_ID,
+        worktree_id: 0,
+        path: "figure.svg".to_string(),
+        offset,
+    };
+    let metadata_only =
+        Worktree::handle_load_binary_file_chunk(tree.clone(), request(u64::MAX), cx.to_async())
+            .await
+            .unwrap();
+    assert!(metadata_only.data.is_empty());
+    assert_eq!(metadata_only.total_size, 6);
+    assert!(metadata_only.file.unwrap().mtime.is_some());
+
+    let content = Worktree::handle_load_binary_file_chunk(tree, request(0), cx.to_async())
+        .await
+        .unwrap();
+    assert_eq!(content.data, b"<svg/>");
+}

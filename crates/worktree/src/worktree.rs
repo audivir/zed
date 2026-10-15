@@ -1195,12 +1195,15 @@ impl Worktree {
                 .with_context(|| format!("{abs_path:?} does not exist"))?;
             anyhow::ensure!(!metadata.is_dir, "{abs_path:?} is a directory");
 
-            let mut reader = fs.open_sync(&abs_path).await?;
-            reader.seek(SeekFrom::Start(request.offset))?;
             let mut data = Vec::new();
-            reader
-                .take(CHUNK_SIZE.min(metadata.len.saturating_sub(request.offset)))
-                .read_to_end(&mut data)?;
+            // An offset at or past the end asks for the metadata alone.
+            if request.offset < metadata.len {
+                let mut reader = fs.open_sync(&abs_path).await?;
+                reader.seek(SeekFrom::Start(request.offset))?;
+                reader
+                    .take(CHUNK_SIZE.min(metadata.len - request.offset))
+                    .read_to_end(&mut data)?;
+            }
 
             Ok(proto::LoadBinaryFileChunkResponse {
                 file: Some(proto::File {
@@ -2327,6 +2330,21 @@ impl RemoteFileLoader {
     pub async fn load(&self, path: &RelPath) -> Result<Vec<u8>> {
         let (_, _, content) = self.load_with_file(path).await?;
         Ok(content)
+    }
+
+    /// Returns the modification time and size of `path` without downloading it.
+    pub async fn metadata(&self, path: &RelPath) -> Result<(Option<MTime>, u64)> {
+        let response = self
+            .client
+            .request(proto::LoadBinaryFileChunk {
+                project_id: self.project_id,
+                worktree_id: self.worktree_id,
+                path: path.as_unix_str().to_owned(),
+                offset: u64::MAX,
+            })
+            .await?;
+        let file = response.file.context("missing file in binary file chunk")?;
+        Ok((file.mtime.map(MTime::from), response.total_size))
     }
 
     async fn load_with_file(&self, path: &RelPath) -> Result<(proto::File, u64, Vec<u8>)> {
