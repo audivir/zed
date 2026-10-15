@@ -13,10 +13,34 @@ use project::{
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
 };
 use rpc::{ErrorCode, ErrorExt as _};
+use settings::{RegisterSetting, Settings};
 use std::path::PathBuf;
 use std::sync::Arc;
 use util::{ResultExt, rel_path::RelPath};
 use worktree::{LoadedBinaryFile, PathChange, Worktree};
+
+/// The settings for the PDF viewer.
+#[derive(Clone, Debug, Default, RegisterSetting)]
+pub struct PdfViewerSettings {
+    /// Whether PDFs opened from a remote project are downloaded again when they change on the
+    /// remote.
+    ///
+    /// Default: false
+    pub reload_remote_files: bool,
+}
+
+impl Settings for PdfViewerSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            reload_remote_files: content
+                .pdf_viewer
+                .as_ref()
+                .unwrap()
+                .reload_remote_files
+                .unwrap(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum PdfItemEvent {
@@ -66,7 +90,10 @@ impl PdfItem {
         let new_state = new_file.disk_state();
         if old_state != new_state {
             file_changed = true;
-            if matches!(new_state, DiskState::Present { .. }) {
+            // a remote reload transfers the whole file again, so it is opt-in.
+            if matches!(new_state, DiskState::Present { .. })
+                && (new_file.is_local || PdfViewerSettings::get_global(cx).reload_remote_files)
+            {
                 cx.emit(PdfItemEvent::ReloadNeeded)
             }
         }
@@ -78,16 +105,19 @@ impl PdfItem {
         }
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) -> Option<oneshot::Receiver<()>> {
+    fn reload(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<()> {
         log::debug!("Creating reload task");
-        let local_file = self.file.as_local()?;
         let (tx, rx) = futures::channel::oneshot::channel();
 
-        let content = local_file.load_bytes(cx);
+        let path = self.file.path.clone();
+        let content = self
+            .file
+            .worktree
+            .update(cx, |worktree, cx| worktree.load_binary_file(&path, cx));
         // keep the password so an encrypted document does not reprompt after an on-disk reload.
         let password = self.pdf.password.clone();
         self.reload_task = Some(cx.spawn(async move |this, cx| {
-            if let Some(bytes) = content
+            if let Some(LoadedBinaryFile { content: bytes, .. }) = content
                 .await
                 .context("Failed to load pdf content")
                 .log_err()
@@ -104,7 +134,7 @@ impl PdfItem {
             _ = tx.send(());
             log::debug!("Reload task completed");
         }));
-        Some(rx)
+        rx
     }
 
     /// Retries opening the document with a user-supplied password.
@@ -422,9 +452,7 @@ impl PdfStoreImpl for Entity<LocalPdfStore> {
         );
         cx.spawn(async move |_, cx| {
             for pdf in pdfs {
-                if let Some(rec) = pdf.update(cx, |pdf, cx| pdf.reload(cx)) {
-                    rec.await?
-                }
+                pdf.update(cx, |pdf, cx| pdf.reload(cx)).await?;
             }
             Ok(())
         })
@@ -437,10 +465,9 @@ impl PdfStoreImpl for Entity<LocalPdfStore> {
 
 impl LocalPdfStore {
     fn subscribe_to_worktree(&mut self, worktree: &Entity<Worktree>, cx: &mut Context<Self>) {
+        // remote worktrees are followed too, so that remote PDFs can be reloaded.
         cx.subscribe(worktree, |this, worktree, event, cx| {
-            if worktree.read(cx).is_local()
-                && let worktree::Event::UpdatedEntries(changes) = event
-            {
+            if let worktree::Event::UpdatedEntries(changes) = event {
                 this.local_worktree_entries_changed(&worktree, changes, cx);
             }
         })
@@ -516,7 +543,7 @@ impl LocalPdfStore {
                         },
                         None => old_file.disk_state,
                     },
-                    is_local: true,
+                    is_local: old_file.is_local,
                     entry_id: Some(entry.id),
                     path: entry.path.clone(),
                     worktree: worktree.clone(),
@@ -525,7 +552,7 @@ impl LocalPdfStore {
             } else {
                 worktree::File {
                     disk_state: DiskState::Deleted,
-                    is_local: true,
+                    is_local: old_file.is_local,
                     entry_id: old_file.entry_id,
                     path: old_file.path.clone(),
                     worktree: worktree.clone(),
@@ -658,7 +685,6 @@ impl PdfProject {
         event: &PdfItemEvent,
         cx: &mut Context<Self>,
     ) -> Option<()> {
-        // TODO: handle PDF events from remote.
         if let PdfItemEvent::ReloadNeeded = event {
             self.reload_pdfs([pdf].into_iter().collect(), cx)
                 .detach_and_log_err(cx);

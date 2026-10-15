@@ -245,6 +245,9 @@ pub struct SettingsContent {
     /// The settings for the markdown preview.
     pub markdown_preview: Option<MarkdownPreviewSettingsContent>,
 
+    /// The settings for the PDF viewer.
+    pub pdf_viewer: Option<PdfViewerSettingsContent>,
+
     pub repl: Option<ReplSettingsContent>,
 
     /// Whether or not to enable Helix mode.
@@ -408,7 +411,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
-        global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
+        global_lsp_settings, image_viewer, markdown_preview, pdf_viewer, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
@@ -1369,6 +1372,17 @@ pub struct ImageViewerSettingsContent {
     ///
     /// Default: "binary"
     pub unit: Option<ImageFileSizeUnit>,
+}
+
+/// The settings for the PDF viewer.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct PdfViewerSettingsContent {
+    /// Whether PDFs opened from a remote project are downloaded again when
+    /// they change on the remote. Each reload transfers the whole file.
+    ///
+    /// Default: false
+    pub reload_remote_files: Option<bool>,
 }
 
 #[with_fallible_options]

@@ -113,6 +113,12 @@
     // The unit for image file sizes: "binary" (KiB, MiB) or decimal (KB, MB)
     "unit": "binary",
   },
+  // PDF viewer settings
+  "pdf_viewer": {
+    // Whether PDFs opened from a remote project are downloaded again when they
+    // change on the remote. Each reload transfers the whole file.
+    "reload_remote_files": false,
+  },
   // Markdown preview settings
   "markdown_preview": {
     // The default font size for the markdown preview. Falls back to the UI font size if unset.

@@ -10714,7 +10714,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
         ]
     }
 
-    fn global_only_miscellaneous_sub_section() -> [SettingsPageItem; 4] {
+    fn global_only_miscellaneous_sub_section() -> [SettingsPageItem; 5] {
         [
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Image Viewer",
@@ -10730,6 +10730,28 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
                     },
                     write: |settings_content, value, _| {
                         settings_content.image_viewer.get_or_insert_default().unit = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Reload Remote PDFs",
+                description: "Whether PDFs from a remote project are downloaded again when they change. Each reload transfers the whole file.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("pdf_viewer.reload_remote_files"),
+                    pick: |settings_content| {
+                        settings_content
+                            .pdf_viewer
+                            .as_ref()
+                            .and_then(|pdf_viewer| pdf_viewer.reload_remote_files.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .pdf_viewer
+                            .get_or_insert_default()
+                            .reload_remote_files = value;
                     },
                 }),
                 metadata: None,

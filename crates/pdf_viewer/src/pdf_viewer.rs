@@ -4711,6 +4711,53 @@ mod tests {
         });
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[gpui::test]
+    async fn pdf_is_reloaded_when_the_file_changes_on_disk(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let fixture = |name: &str| {
+            let path = format!("{}/test_fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+            std::fs::read(&path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"))
+        };
+        let original = fixture("solid_red.pdf");
+        let modified = fixture("two_pages_with_text.pdf");
+
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(util::path!("/root"), serde_json::json!({}))
+            .await;
+        fs.insert_file(util::path!("/root/document.pdf"), original.clone())
+            .await;
+        let project = Project::test(fs.clone(), [util::path!("/root").as_ref()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let project_path = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path("document.pdf").into(),
+        };
+        let pdf_item = cx
+            .update(|cx| open_pdf(project.clone(), project_path, cx))
+            .await
+            .unwrap();
+        pdf_item.read_with(cx, |item, _| {
+            assert_eq!(item.pdf.bytes.as_slice(), original.as_slice());
+        });
+
+        fs.insert_file(util::path!("/root/document.pdf"), modified.clone())
+            .await;
+        cx.run_until_parked();
+
+        pdf_item.read_with(cx, |item, _| {
+            assert_eq!(item.pdf.bytes.as_slice(), modified.as_slice());
+            assert_eq!(item.pdf.metadata.page_count, 2);
+        });
+    }
+
     // only test bodies take `PDFIUM_TEST_LOCK`, so holding it across an await cannot deadlock.
     #[allow(clippy::await_holding_lock)]
     #[gpui::test]
