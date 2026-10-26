@@ -429,11 +429,14 @@ impl GhosttyTerminal {
         })?;
 
         // handles OSC 52 writes. libghostty-vt always ignores clipboard reads by design.
-        // Multi-MIME writes are flattened to the text of their first representation.
+        // Multi-MIME writes are flattened to the text of their first representation with text.
+        // libghostty-vt exposes data that is not UTF-8, like images, as empty text, and a write
+        // without representations asks to clear the clipboard; neither replaces what the user
+        // copied.
         terminal.on_clipboard_write({
             let effects = effects.clone();
             move |_terminal, write| {
-                if let Some(content) = write.contents().next() {
+                if let Some(content) = write.contents().find(|content| !content.data.is_empty()) {
                     effects
                         .lock()
                         .push(GhosttyEffect::ClipboardStore(content.data.to_owned()));
@@ -3652,6 +3655,25 @@ mod tests {
                 |effect| matches!(effect, GhosttyEffect::ClipboardStore(text) if text == "hello clipboard")
             ),
             "expected a ClipboardStore effect with the decoded payload, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_osc52_clipboard_writes_without_text() {
+        let mut terminal = GhosttyTerminal::new(8, 2, 100).unwrap();
+
+        // an empty payload asks to clear the clipboard.
+        terminal.write(b"\x1b]52;c;\x1b\\");
+        // PNG data, which is not valid UTF-8.
+        let payload = base64_encode(b"\x89PNG\r\n\x1a\n");
+        terminal.write(format!("\x1b]52;c;{payload}\x1b\\").as_bytes());
+
+        let effects = terminal.take_effects();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, GhosttyEffect::ClipboardStore(_))),
+            "expected no clipboard store, got {effects:?}"
         );
     }
 
