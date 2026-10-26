@@ -19,6 +19,7 @@ use pdf_viewer::pdf::Pdf;
 use pdf_viewer::pdf_renderer::{PageMetadata, PdfTarget};
 use pdf_viewer::{PdfView, ScrollAnchor, ScrollMode};
 use project::lsp_store::DocumentDiagnosticsUpdate;
+use settings::Settings as _;
 use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -27,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use text::Point as BufferPoint;
+use theme_settings::ThemeSettings;
 use typst::World;
 use typst::layout::{Abs, Frame, FrameItem, Point as TypstPoint};
 use typst::syntax::package::PackageSpec;
@@ -116,6 +118,7 @@ const TYPST_PREVIEW_DIAGNOSTICS_SERVER_ID: LanguageServerId = LanguageServerId(u
 struct TypstDiagnostic {
     severity: DiagnosticSeverity,
     message: String,
+    hints: Vec<String>,
     file_path: Option<PathBuf>,
     range: Option<Range<usize>>,
     /// `range` as UTF-16 points, for files without an open buffer to convert offsets.
@@ -159,12 +162,47 @@ fn resolve_typst_diagnostics(
             TypstDiagnostic {
                 severity,
                 message: diagnostic.message.to_string(),
+                hints: diagnostic
+                    .hints
+                    .iter()
+                    .map(|hint| hint.v.to_string())
+                    .collect(),
                 file_path,
                 range,
                 point_range,
             }
         })
         .collect()
+}
+
+/// Formats the errors among `diagnostics` like the Typst CLI, one `path:line:column: error:
+/// message` line per error followed by its hints.
+fn format_compile_errors(diagnostics: &[TypstDiagnostic], root: &Path) -> String {
+    let mut lines = Vec::new();
+    for diagnostic in diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::ERROR)
+    {
+        let location = diagnostic.file_path.as_ref().map(|path| {
+            let path = path.strip_prefix(root).unwrap_or(path);
+            match &diagnostic.point_range {
+                Some(range) => format!(
+                    "{}:{}:{}: ",
+                    path.display(),
+                    range.start.row + 1,
+                    range.start.column + 1
+                ),
+                None => format!("{}: ", path.display()),
+            }
+        });
+        lines.push(format!(
+            "{}error: {}",
+            location.unwrap_or_default(),
+            diagnostic.message
+        ));
+        lines.extend(diagnostic.hints.iter().map(|hint| format!("hint: {hint}")));
+    }
+    lines.join("\n")
 }
 
 fn byte_to_point_utf16(source: &Source, byte: usize) -> Option<PointUtf16> {
@@ -1341,14 +1379,13 @@ impl TypstPreviewView {
                         let document = match compiled.output {
                             Ok(document) => document,
                             Err(errors) => {
-                                diagnostics.extend(resolve_typst_diagnostics(&world, &errors));
+                                let errors = resolve_typst_diagnostics(&world, &errors);
+                                let message = format_compile_errors(&errors, &world.root);
+                                diagnostics.extend(errors);
                                 return CompileOutcome {
                                     diagnostics,
                                     missing_packages: world.take_missing_packages(),
-                                    result: Err(anyhow::anyhow!(
-                                        "Compilation failed:\n{:?}",
-                                        errors
-                                    )),
+                                    result: Err(anyhow::anyhow!(message)),
                                 };
                             }
                         };
@@ -1778,6 +1815,11 @@ impl Render for TypstPreviewView {
         use TypstCompileState::*;
         let page_count = self.pdf_view.read(cx).pdf(cx).metadata.page_count;
         let bg_color = cx.theme().colors().editor_background;
+        let failure = match &self.compile_state {
+            Failed(message) => Some(message.clone()),
+            _ => None,
+        };
+        let failure_is_none = failure.is_none();
 
         div()
             .id("TypstPreview")
@@ -1786,71 +1828,109 @@ impl Render for TypstPreviewView {
             .on_action(cx.listener(Self::export_pdf))
             .size_full()
             .bg(bg_color)
-            .child(
-                if !matches!(self.compile_state, Failed(_)) && page_count != 0 {
-                    let warning_count = self.compile_warnings.len();
-                    div()
-                        .relative()
-                        .size_full()
-                        .child(self.pdf_view.clone())
-                        .when(warning_count > 0, |this| {
-                            let message =
-                                self.compile_warnings.first().cloned().unwrap_or_default();
-                            let label = if warning_count > 1 {
-                                format!("{} ({} more warning(s))", message, warning_count - 1)
-                            } else {
-                                message
-                            };
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .right_0()
-                                    .p_1()
-                                    .bg(cx.theme().status().warning_background)
-                                    .text_color(cx.theme().status().warning)
-                                    .child(label),
-                            )
-                        })
-                        .into_any_element()
-                } else {
-                    let (status_message, text_color) = match self.compile_state.clone() {
-                        Failed(err) => (err, cx.theme().status().error),
-                        Compiling | Rendering => (
-                            "Compiling Typst...".to_string(),
-                            cx.theme().colors().text_muted,
-                        ),
-                        DownloadingPackages(packages) => (
-                            format!(
-                                "Downloading {}...",
-                                packages
-                                    .iter()
-                                    .map(ToString::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
-                            cx.theme().colors().text_muted,
-                        ),
-                        Uninitialized => (
-                            "Waiting for input...".to_string(),
-                            cx.theme().colors().text_muted,
-                        ),
-                        Finished => ("No view found".to_string(), cx.theme().status().error),
-                    };
+            .child(if page_count != 0 {
+                let warning_count = self.compile_warnings.len();
+                div()
+                    .relative()
+                    .size_full()
+                    .child(self.pdf_view.clone())
+                    // the last successful render stays visible while the source has errors.
+                    .when_some(failure, |this, message| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .bottom_2()
+                                .left_2()
+                                .right_2()
+                                .child(render_compile_failure(message, cx)),
+                        )
+                    })
+                    .when(failure_is_none && warning_count > 0, |this| {
+                        let message = self.compile_warnings.first().cloned().unwrap_or_default();
+                        let label = if warning_count > 1 {
+                            format!("{} ({} more warning(s))", message, warning_count - 1)
+                        } else {
+                            message
+                        };
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .p_1()
+                                .bg(cx.theme().status().warning_background)
+                                .text_color(cx.theme().status().warning)
+                                .child(label),
+                        )
+                    })
+                    .into_any_element()
+            } else if let Some(message) = failure {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .child(render_compile_failure(message, cx))
+                    .into_any_element()
+            } else {
+                let status_message = match self.compile_state.clone() {
+                    Compiling | Rendering => "Compiling Typst...".to_string(),
+                    DownloadingPackages(packages) => format!(
+                        "Downloading {}...",
+                        packages
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    Uninitialized => "Waiting for input...".to_string(),
+                    Finished | Failed(_) => "No view found".to_string(),
+                };
 
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .p_4()
-                        .text_color(text_color)
-                        .child(status_message)
-                        .into_any_element()
-                },
-            )
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .text_color(cx.theme().colors().text_muted)
+                    .child(status_message)
+                    .into_any_element()
+            })
     }
+}
+
+/// Renders a failed compile as a card whose message wraps and scrolls instead of running off
+/// the preview.
+fn render_compile_failure(message: String, cx: &App) -> impl IntoElement {
+    let buffer_font = ThemeSettings::get_global(cx).buffer_font.family.clone();
+    v_flex()
+        .w_full()
+        .gap_1()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().status().error_border)
+        .bg(cx.theme().colors().elevated_surface_background)
+        .shadow_md()
+        .child(
+            h_flex()
+                .gap_1()
+                .child(Icon::new(IconName::XCircle).color(Color::Error))
+                .child(Label::new("Typst compilation failed").color(Color::Error)),
+        )
+        .child(
+            div()
+                .id("typst-compile-failure")
+                .max_h(rems(12.))
+                .overflow_y_scroll()
+                .font_family(buffer_font)
+                .text_sm()
+                .text_color(cx.theme().colors().text)
+                .child(message),
+        )
 }
 
 /// Returns where the exported PDF goes, next to the main file, as the Typst CLI does.
@@ -1933,6 +2013,47 @@ async fn download_package(
 mod tests {
     use super::*;
 
+    #[test]
+    fn compile_errors_are_formatted_one_per_line_with_their_location_and_hints() {
+        let root = Path::new(util::path!("/root"));
+        let diagnostics = [
+            TypstDiagnostic {
+                severity: DiagnosticSeverity::ERROR,
+                message: "unclosed delimiter".to_string(),
+                hints: vec!["try adding a closing parenthesis".to_string()],
+                file_path: Some(root.join("chapters").join("intro.typ")),
+                range: Some(18..19),
+                point_range: Some(PointUtf16::new(13, 4)..PointUtf16::new(13, 5)),
+            },
+            TypstDiagnostic {
+                severity: DiagnosticSeverity::WARNING,
+                message: "unused variable".to_string(),
+                hints: Vec::new(),
+                file_path: None,
+                range: None,
+                point_range: None,
+            },
+            TypstDiagnostic {
+                severity: DiagnosticSeverity::ERROR,
+                message: "failed to load font".to_string(),
+                hints: Vec::new(),
+                file_path: None,
+                range: None,
+                point_range: None,
+            },
+        ];
+        let intro = Path::new("chapters").join("intro.typ");
+        assert_eq!(
+            format_compile_errors(&diagnostics, root),
+            format!(
+                "{}:14:5: error: unclosed delimiter\n\
+                 hint: try adding a closing parenthesis\n\
+                 error: failed to load font",
+                intro.display()
+            )
+        );
+    }
+
     /// Scratch directory tree that removes itself on drop.
     struct ScratchDir(PathBuf);
 
@@ -1988,6 +2109,7 @@ mod tests {
         let diagnostics = vec![TypstDiagnostic {
             severity: DiagnosticSeverity::ERROR,
             message: "unknown variable: undefined".to_string(),
+            hints: Vec::new(),
             file_path: Some(chapter.clone()),
             range: Some(1..10),
             point_range: Some(PointUtf16::new(0, 1)..PointUtf16::new(0, 10)),
@@ -2074,6 +2196,92 @@ mod tests {
             0,
             "closing the preview should clear its diagnostics"
         );
+    }
+
+    #[gpui::test]
+    async fn compile_errors_keep_the_last_render_and_read_like_the_cli(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/root"),
+            serde_json::json!({ "main.typ": "Hello" }),
+        )
+        .await;
+        let project = project::Project::test(fs, [util::path!("/root").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from(util::path!("/root/main.typ")),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        let preview = workspace.update_in(cx, |workspace, window, cx| {
+            TypstPreviewView::create_typst_view(workspace, editor.clone(), false, window, cx)
+        });
+        let state = |cx: &mut gpui::VisualTestContext| {
+            preview.read_with(cx, |preview, cx| {
+                (
+                    preview.compile_state.clone(),
+                    preview.pdf_view.read(cx).pdf(cx).metadata.page_count,
+                )
+            })
+        };
+        let wait_until =
+            |cx: &mut gpui::VisualTestContext, done: &dyn Fn(&TypstCompileState, usize) -> bool| {
+                for _ in 0..500 {
+                    cx.run_until_parked();
+                    let (compile_state, page_count) = state(cx);
+                    if done(&compile_state, page_count) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!("preview stuck at {:?}", state(cx).0);
+            };
+        wait_until(cx, &|compile_state, page_count| {
+            matches!(compile_state, TypstCompileState::Finished) && page_count == 1
+        });
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello\n#let(", window, cx)
+        });
+        cx.executor().advance_clock(REPARSE_DEBOUNCE);
+        wait_until(cx, &|compile_state, _| {
+            matches!(compile_state, TypstCompileState::Failed(_))
+        });
+        let (compile_state, page_count) = state(cx);
+        assert_eq!(page_count, 1, "the last render should stay");
+        let TypstCompileState::Failed(message) = compile_state else {
+            unreachable!()
+        };
+        assert!(
+            message.starts_with("main.typ:2:"),
+            "the error should name its location: {message}"
+        );
+        assert!(!message.contains("DiagSpan"), "{message}");
+        cx.run_until_parked();
     }
 
     #[test]
