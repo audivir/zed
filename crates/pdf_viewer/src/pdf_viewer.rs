@@ -14,7 +14,7 @@ use gpui::{
     AnyElement, App, Bounds, Context, DismissEvent, DispatchPhase, Element, ElementId, Entity,
     EntityId, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId,
     InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollHandle, ScrollEvent, Size, Style, Styled,
+    PinchEvent, Pixels, Point, Render, ScrollEvent, ScrollHandle, Size, Style, Styled,
     Subscription, Task, WeakEntity, Window, actions, div, img, px, size, uniform_list,
 };
 use language::File as _;

@@ -9,9 +9,8 @@ use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, ParsedSvg,
-    PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, Size, Style,
-    Styled, Subscription, SvgSize, Task, WeakEntity, Window, checkerboard, div, img, point, px,
-    size,
+    PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, Size, Style, Styled,
+    Subscription, SvgSize, Task, WeakEntity, Window, checkerboard, div, img, point, px, size,
 };
 use image_viewer::{FitToView, ResetZoom, ZoomIn, ZoomOut, ZoomToActualSize};
 use language::{Buffer, BufferEvent};

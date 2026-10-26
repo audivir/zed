@@ -1109,7 +1109,8 @@ impl TypstPreviewView {
                                                         .file_at(MultiBufferOffset(0), cx)
                                                     && let Some(abs_path) = file_abs_path(&file, cx)
                                                 {
-                                                    let item_path = util::paths::normalize_path(&abs_path);
+                                                    let item_path =
+                                                        util::paths::normalize_path(&abs_path);
                                                     if item_path == normalized_path {
                                                         return Some(editor.clone());
                                                     }
