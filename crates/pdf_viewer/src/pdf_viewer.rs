@@ -232,39 +232,239 @@ fn selected_char_range_for_page(
     (range_start < range_end).then_some(range_start..range_end)
 }
 
-/// Groups consecutive characters in `range` into one rectangle per line.
+/// A visual line of text spans.
+#[derive(Debug)]
+struct TextLine {
+    /// Span indices on the line, including whitespace and generated line breaks.
+    spans: std::ops::Range<usize>,
+    /// Extent of the line's visible characters, ignoring whitespace where possible.
+    bounds: Bounds<f32>,
+}
+
+/// PDFium replaces a hyphen that breaks a word at a line end with this character.
+const PDFIUM_HYPHEN: &str = "\u{2}";
+
+fn vertically_overlaps(a: Bounds<f32>, b: Bounds<f32>) -> bool {
+    let overlap =
+        (a.origin.y + a.size.height).min(b.origin.y + b.size.height) - a.origin.y.max(b.origin.y);
+    let shorter_height = a.size.height.min(b.size.height);
+    shorter_height > 0.0 && overlap >= shorter_height * 0.5
+}
+
+fn union_bounds(a: Bounds<f32>, b: Bounds<f32>) -> Bounds<f32> {
+    let left = a.origin.x.min(b.origin.x);
+    let top = a.origin.y.min(b.origin.y);
+    let right = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+    let bottom = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+    Bounds {
+        origin: Point { x: left, y: top },
+        size: Size {
+            width: right - left,
+            height: bottom - top,
+        },
+    }
+}
+
+/// Groups the spans in `range` into visual lines.
 ///
 /// Two spans share a line when their vertical bounds overlap by at least half of the shorter
-/// height.
+/// height. Spans without an area, like the line breaks PDFium generates, join the current line.
+fn text_lines(text_spans: &[PdfTextSpan], range: std::ops::Range<usize>) -> Vec<TextLine> {
+    struct LineBuilder {
+        start: usize,
+        end: usize,
+        all: Option<Bounds<f32>>,
+        // trailing spaces of justified lines reach past the column edge, so they only count
+        // when a line has nothing else.
+        visible: Option<Bounds<f32>>,
+    }
+
+    let mut builders: Vec<LineBuilder> = Vec::new();
+    for index in range {
+        let Some(span) = text_spans.get(index) else {
+            break;
+        };
+        let bounds = span.bounds;
+        let has_area = bounds.size.width > 0.0 && bounds.size.height > 0.0;
+        let starts_new_line = match builders.last() {
+            None => true,
+            Some(line) => {
+                has_area
+                    && line
+                        .all
+                        .is_some_and(|all| !vertically_overlaps(all, bounds))
+            }
+        };
+        if starts_new_line {
+            builders.push(LineBuilder {
+                start: index,
+                end: index,
+                all: None,
+                visible: None,
+            });
+        }
+        let Some(line) = builders.last_mut() else {
+            continue;
+        };
+        line.end = index + 1;
+        if has_area {
+            line.all = Some(line.all.map_or(bounds, |all| union_bounds(all, bounds)));
+            if !span.text.trim().is_empty() {
+                line.visible = Some(line.visible.map_or(bounds, |all| union_bounds(all, bounds)));
+            }
+        }
+    }
+
+    builders
+        .into_iter()
+        .filter_map(|line| {
+            Some(TextLine {
+                spans: line.start..line.end,
+                bounds: line.visible.or(line.all)?,
+            })
+        })
+        .collect()
+}
+
+/// Returns one rectangle per selected line, with the gaps between adjacent lines closed so
+/// a selected paragraph reads as one block.
 fn selection_highlight_rects(
     text_spans: &[PdfTextSpan],
     range: std::ops::Range<usize>,
 ) -> Vec<Bounds<f32>> {
-    let mut rects: Vec<Bounds<f32>> = Vec::new();
-    for span in &text_spans[range] {
-        let bounds = span.bounds;
-        if let Some(last) = rects.last_mut() {
-            let overlap = (last.origin.y + last.size.height)
-                .min(bounds.origin.y + bounds.size.height)
-                - last.origin.y.max(bounds.origin.y);
-            let shorter_height = last.size.height.min(bounds.size.height);
-            if shorter_height > 0.0 && overlap >= shorter_height * 0.5 {
-                let left = last.origin.x.min(bounds.origin.x);
-                let right =
-                    (last.origin.x + last.size.width).max(bounds.origin.x + bounds.size.width);
-                let top = last.origin.y.min(bounds.origin.y);
-                let bottom =
-                    (last.origin.y + last.size.height).max(bounds.origin.y + bounds.size.height);
-                last.origin.x = left;
-                last.origin.y = top;
-                last.size.width = right - left;
-                last.size.height = bottom - top;
-                continue;
-            }
+    let mut rects: Vec<Bounds<f32>> = text_lines(text_spans, range)
+        .into_iter()
+        .map(|line| line.bounds)
+        .collect();
+    for index in 1..rects.len() {
+        let above = rects[index - 1];
+        let below = rects[index];
+        let above_bottom = above.origin.y + above.size.height;
+        let gap = below.origin.y - above_bottom;
+        let horizontally_overlaps = above.origin.x < below.origin.x + below.size.width
+            && below.origin.x < above.origin.x + above.size.width;
+        if gap > 0.0 && gap < above.size.height.min(below.size.height) && horizontally_overlaps {
+            let middle = above_bottom + gap / 2.0;
+            rects[index - 1].size.height = middle - above.origin.y;
+            rects[index].origin.y = middle;
+            rects[index].size.height = below.origin.y + below.size.height - middle;
         }
-        rects.push(bounds);
     }
     rects
+}
+
+/// Returns whether the break between `lines[index]` and the next line ends a paragraph,
+/// rather than wrapping running text.
+///
+/// A paragraph ends when the next line's first word would have fit at the end of the line,
+/// when the lines are further apart than usual, or when the next line starts a list item.
+fn ends_paragraph(
+    text_spans: &[PdfTextSpan],
+    lines: &[TextLine],
+    index: usize,
+    usual_gap: f32,
+) -> bool {
+    let (Some(line), Some(next)) = (lines.get(index), lines.get(index + 1)) else {
+        return true;
+    };
+    let line_right = line.bounds.origin.x + line.bounds.size.width;
+    let line_height = line.bounds.size.height.max(next.bounds.size.height);
+
+    let gap = next.bounds.origin.y - (line.bounds.origin.y + line.bounds.size.height);
+    if gap > usual_gap + line_height * 0.5 {
+        return true;
+    }
+
+    let mut next_words = text_spans[next.spans.clone()]
+        .iter()
+        .filter(|span| span.bounds.size.width > 0.0);
+    let Some(first) = next_words.next() else {
+        return false;
+    };
+    if matches!(first.text.as_str(), "•" | "‣" | "◦" | "▪" | "–" | "—") {
+        return true;
+    }
+    let first_word_right = std::iter::once(first)
+        .chain(next_words.take_while(|span| !span.text.trim().is_empty()))
+        .map(|span| span.bounds.origin.x + span.bounds.size.width)
+        .fold(f32::MIN, f32::max);
+    let first_word_width = first_word_right - first.bounds.origin.x;
+
+    // the column edge comes from the surrounding lines of the same column, since this line
+    // may be the short last line of its paragraph.
+    let column_right = lines[index.saturating_sub(1)..=index + 1]
+        .iter()
+        .filter(|other| {
+            other.bounds.origin.x < line_right
+                && line.bounds.origin.x < other.bounds.origin.x + other.bounds.size.width
+        })
+        .map(|other| other.bounds.origin.x + other.bounds.size.width)
+        .fold(line_right, f32::max);
+    let space_width = line_height * 0.25;
+    first_word_width + space_width < column_right - line_right
+}
+
+/// Returns the median vertical gap between consecutive lines, the spacing within a paragraph.
+fn usual_line_gap(lines: &[TextLine]) -> f32 {
+    let mut gaps: Vec<f32> = lines
+        .windows(2)
+        .map(|pair| {
+            pair[1].bounds.origin.y - (pair[0].bounds.origin.y + pair[0].bounds.size.height)
+        })
+        .filter(|gap| *gap >= 0.0)
+        .collect();
+    gaps.sort_unstable_by(f32::total_cmp);
+    gaps.get(gaps.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// Returns the selected text of one page as running text.
+///
+/// Wrapped lines are joined with a space, and words hyphenated at a line end are joined
+/// without the hyphen. Paragraphs end in a line break.
+fn page_selection_text(text_spans: &[PdfTextSpan], range: std::ops::Range<usize>) -> String {
+    let lines = text_lines(text_spans, 0..text_spans.len());
+    let usual_gap = usual_line_gap(&lines);
+    let mut result = String::new();
+    let mut previous_line: Option<(usize, bool)> = None;
+    for (line_index, line) in lines.iter().enumerate() {
+        let start = line.spans.start.max(range.start);
+        let end = line.spans.end.min(range.end);
+        if start >= end {
+            continue;
+        }
+        if let Some((previous_index, hyphenated)) = previous_line {
+            let trimmed_length = result.trim_end().len();
+            result.truncate(trimmed_length);
+            if !hyphenated {
+                if ends_paragraph(text_spans, &lines, previous_index, usual_gap) {
+                    result.push('\n');
+                } else {
+                    result.push(' ');
+                }
+            }
+        }
+
+        let mut hyphenated = false;
+        for span in &text_spans[start..end] {
+            match span.text.as_str() {
+                "\r" | "\n" => {}
+                PDFIUM_HYPHEN => hyphenated = true,
+                text => {
+                    if hyphenated {
+                        // the hyphen was not at the line end after all.
+                        result.push('-');
+                        hyphenated = false;
+                    }
+                    result.push_str(text);
+                }
+            }
+        }
+        previous_line = Some((line_index, hyphenated));
+    }
+    if previous_line.is_some_and(|(_, hyphenated)| hyphenated) {
+        result.push('-');
+    }
+    result
 }
 
 /// Returns the selected text across the available pages in `page_text_spans`.
@@ -280,9 +480,7 @@ fn selection_to_text(
         if !result.is_empty() {
             result.push('\n');
         }
-        for span in &spans[range] {
-            result.push_str(&span.text);
-        }
+        result.push_str(&page_selection_text(spans, range));
     }
     result
 }
@@ -4220,7 +4418,7 @@ mod tests {
 
     #[test]
     fn selection_to_text_joins_pages_with_newlines_in_document_order() {
-        let page0 = Arc::new(two_line_fixture()); // "HelloWorld" as one span list
+        let page0 = Arc::new(two_line_fixture()); // "Hello" wrapping onto "World"
         let page1 = Arc::new(vec![span("!", 0.0, 0.0, 10.0, 10.0)]);
 
         let selection = TextSelection {
@@ -4235,7 +4433,85 @@ mod tests {
         };
 
         let text = selection_to_text(&selection, &[(0, page0), (1, page1)]);
-        assert_eq!(text, "HelloWorld\n!");
+        assert_eq!(text, "Hello World\n!");
+    }
+
+    fn justified_paragraphs_spans() -> Arc<Vec<PdfTextSpan>> {
+        let _guard = crate::pdf_renderer::PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_fixtures/justified_paragraphs.pdf"
+        ))
+        .expect("fixture should exist");
+        let id = gpui::hash(&bytes);
+        crate::pdf_renderer::evict_document(id);
+        let renderer = crate::pdf_renderer::PdfRenderer::new(id, Arc::new(bytes), None);
+        let metadata = Arc::new(
+            futures::executor::block_on(renderer.get_metadata(None)).expect("fixture should open"),
+        );
+        let spans = futures::executor::block_on(renderer.extract_text_only(0, metadata))
+            .expect("fixture should have a text layer");
+        crate::pdf_renderer::evict_document(id);
+        spans
+    }
+
+    #[test]
+    fn copied_text_joins_wrapped_lines_and_keeps_paragraphs() {
+        let spans = justified_paragraphs_spans();
+        let text = page_selection_text(&spans, 0..spans.len());
+        assert_eq!(
+            text,
+            "Methods\n\
+             Data standardization. SMILES strings10 were parsed with RDKit and converted to \
+             canonical SMILES. Explicit hydrogens, salts, isotopes and stereochemical information \
+             were removed, the largest fragment was kept, and molecules containing other elements \
+             were discarded. Tautomers were standardized with the RDKit tautomer canonicalizer.\n\
+             A second paragraph follows here."
+        );
+    }
+
+    #[test]
+    fn selected_paragraph_is_highlighted_as_one_block() {
+        let spans = justified_paragraphs_spans();
+        let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+        let first = text.find("Data").expect("fixture has the paragraph");
+        let last = text
+            .find("canonicalizer")
+            .expect("fixture has the paragraph");
+        // span indices equal byte offsets up to here, since all text before is ASCII.
+        let rects = selection_highlight_rects(&spans, first..last + "canonicalizer".len());
+        assert!(rects.len() > 3, "the paragraph should wrap: {rects:?}");
+
+        for pair in rects.windows(2) {
+            let bottom = pair[0].origin.y + pair[0].size.height;
+            assert!(
+                (pair[1].origin.y - bottom).abs() < 0.01,
+                "lines should touch: {pair:?}"
+            );
+        }
+        // justified lines end at the same edge even though most end with a space. typst lets
+        // the hyphens of hyphenated lines hang into the margin, so those are left out.
+        let right = |bounds: &Bounds<f32>| bounds.origin.x + bounds.size.width;
+        let hyphen_rights: Vec<f32> = spans
+            .iter()
+            .filter(|span| span.text == PDFIUM_HYPHEN)
+            .map(|span| right(&span.bounds))
+            .collect();
+        let unhyphenated_rights: Vec<f32> = rects[..rects.len() - 1]
+            .iter()
+            .map(right)
+            .filter(|rect_right| !hyphen_rights.contains(rect_right))
+            .collect();
+        assert!(unhyphenated_rights.len() > 2);
+        let widest = unhyphenated_rights.iter().copied().fold(f32::MIN, f32::max);
+        for rect_right in unhyphenated_rights {
+            assert!(
+                widest - rect_right < 0.5,
+                "ragged line ending at {rect_right}"
+            );
+        }
     }
 
     #[test]
