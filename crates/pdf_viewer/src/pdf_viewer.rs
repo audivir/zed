@@ -12,10 +12,10 @@ use collections::{HashMap, HashSet};
 use editor::{Editor, EditorSettings};
 use gpui::{
     AnyElement, App, Bounds, Context, DismissEvent, DispatchPhase, Element, ElementId, Entity,
-    EntityId, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId,
-    InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollEvent, ScrollHandle, Size, Style, Styled,
-    Subscription, Task, WeakEntity, Window, actions, div, img, px, size, uniform_list,
+    EntityId, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, Hitbox, HitboxBehavior,
+    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton,
+    ParentElement, PinchEvent, Pixels, Point, Render, ScrollEvent, ScrollHandle, Size, Style,
+    Styled, Subscription, Task, WeakEntity, Window, actions, div, img, px, size, uniform_list,
 };
 use language::File as _;
 use persistence::PdfViewerDb;
@@ -1981,11 +1981,17 @@ impl PdfView {
 
 struct PdfContentElement {
     pdf_view: Entity<PdfView>,
+    /// Lets overlays in front of the document, like the Typst error card, keep scroll and pinch
+    /// gestures to themselves.
+    hitbox: Option<Hitbox>,
 }
 
 impl PdfContentElement {
     fn new(pdf_view: Entity<PdfView>) -> Self {
-        Self { pdf_view }
+        Self {
+            pdf_view,
+            hitbox: None,
+        }
     }
 }
 
@@ -2038,6 +2044,7 @@ impl Element for PdfContentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        self.hitbox = Some(window.insert_hitbox(bounds, HitboxBehavior::Normal));
         self.pdf_view
             .update(cx, |view, cx| view.refit_to_bounds(bounds, cx));
         let (
@@ -2763,7 +2770,7 @@ impl Element for PdfContentElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
+        _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
@@ -2773,11 +2780,16 @@ impl Element for PdfContentElement {
             return;
         };
 
+        let Some(hitbox) = self.hitbox.clone() else {
+            return;
+        };
+
         // captured so that zooming takes precedence over the scroll container below.
         window.on_mouse_event({
             let pdf_view = self.pdf_view.downgrade();
+            let hitbox = hitbox.clone();
             move |event: &ScrollEvent, phase, window, cx| {
-                if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
+                if phase != DispatchPhase::Capture || !hitbox.should_handle_scroll(window) {
                     return;
                 }
                 let delta = f32::from(event.delta.pixel_delta(window.line_height()).y);
@@ -2811,8 +2823,8 @@ impl Element for PdfContentElement {
         });
         window.on_mouse_event({
             let pdf_view = self.pdf_view.downgrade();
-            move |event: &PinchEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble || !bounds.contains(&event.position) {
+            move |event: &PinchEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
                     return;
                 }
                 pdf_view

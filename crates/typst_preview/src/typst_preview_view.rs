@@ -7,8 +7,8 @@ use anyhow::{Context as _, Result};
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
-    AnyEntity, App, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Font,
-    IntoElement, Point, Render, Size, Subscription, Task, WeakEntity, Window, div,
+    AnyEntity, App, Bounds, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, Font, IntoElement, Point, Render, Size, Subscription, Task, WeakEntity, Window, div,
 };
 use language::{
     Diagnostic, DiagnosticEntry, DiagnosticMessage, DiagnosticSet, DiagnosticSeverity,
@@ -34,7 +34,7 @@ use typst::layout::{Abs, Frame, FrameItem, Point as TypstPoint};
 use typst::syntax::package::PackageSpec;
 use typst::syntax::{LinkedNode, RootedPath, Side, Source, Span, SyntaxKind, VirtualRoot};
 use typst_layout::PagedDocument;
-use ui::prelude::*;
+use ui::{Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::item::{Item, ItemBufferKind, ItemHandle};
 use workspace::searchable::{SearchEvent, SearchableItemHandle};
@@ -75,6 +75,8 @@ pub struct TypstPreviewView {
     compile_state: TypstCompileState,
     /// Warnings from the last successful compile, which do not fail compilation.
     compile_warnings: Vec<String>,
+    /// Compile failure the user closed, hidden until a different failure or a successful compile.
+    dismissed_failure: Option<String>,
     pending_update_task: Option<Task<Result<()>>>,
     mode: TypstPreviewMode,
     project_resolution: bool,
@@ -750,6 +752,7 @@ impl TypstPreviewView {
                 document: None,
                 compile_state: TypstCompileState::Uninitialized,
                 compile_warnings: Vec::new(),
+                dismissed_failure: None,
                 pending_update_task: None,
                 mode,
                 project_resolution,
@@ -1489,6 +1492,7 @@ impl TypstPreviewView {
                             );
                             view.compile_warnings = warnings;
                             view.compile_state = TypstCompileState::Finished;
+                            view.dismissed_failure = None;
                         }
                         Err(e) => {
                             view.compile_state = TypstCompileState::Failed(e.to_string());
@@ -1836,16 +1840,29 @@ impl Render for TypstPreviewView {
                     .size_full()
                     .child(self.pdf_view.clone())
                     // the last successful render stays visible while the source has errors.
-                    .when_some(failure, |this, message| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .bottom_2()
-                                .left_2()
-                                .right_2()
-                                .child(render_compile_failure(message, cx)),
-                        )
-                    })
+                    .when_some(
+                        failure.filter(|message| self.dismissed_failure.as_ref() != Some(message)),
+                        |this, message| {
+                            let dismiss = cx.listener({
+                                let message = message.clone();
+                                move |this, _: &ClickEvent, _window, cx| {
+                                    this.dismissed_failure = Some(message.clone());
+                                    cx.notify();
+                                }
+                            });
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .bottom_2()
+                                    .left_2()
+                                    .right_2()
+                                    // scrolling the card must not scroll the document behind it.
+                                    .occlude()
+                                    .debug_selector(|| "typst-compile-failure-card".to_string())
+                                    .child(render_compile_failure(message, Some(dismiss), cx)),
+                            )
+                        },
+                    )
                     .when(failure_is_none && warning_count > 0, |this| {
                         let message = self.compile_warnings.first().cloned().unwrap_or_default();
                         let label = if warning_count > 1 {
@@ -1873,7 +1890,11 @@ impl Render for TypstPreviewView {
                     .items_center()
                     .justify_center()
                     .p_4()
-                    .child(render_compile_failure(message, cx))
+                    .child(render_compile_failure(
+                        message,
+                        None::<fn(&ClickEvent, &mut Window, &mut App)>,
+                        cx,
+                    ))
                     .into_any_element()
             } else {
                 let status_message = match self.compile_state.clone() {
@@ -1905,7 +1926,11 @@ impl Render for TypstPreviewView {
 
 /// Renders a failed compile as a card whose message wraps and scrolls instead of running off
 /// the preview.
-fn render_compile_failure(message: String, cx: &App) -> impl IntoElement {
+fn render_compile_failure(
+    message: String,
+    on_dismiss: Option<impl Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+    cx: &App,
+) -> impl IntoElement {
     let buffer_font = ThemeSettings::get_global(cx).buffer_font.family.clone();
     v_flex()
         .w_full()
@@ -1920,7 +1945,19 @@ fn render_compile_failure(message: String, cx: &App) -> impl IntoElement {
             h_flex()
                 .gap_1()
                 .child(Icon::new(IconName::XCircle).color(Color::Error))
-                .child(Label::new("Typst compilation failed").color(Color::Error)),
+                .child(Label::new("Typst compilation failed").color(Color::Error))
+                .when_some(on_dismiss, |this, on_dismiss| {
+                    this.child(div().flex_1()).child(
+                        div()
+                            .debug_selector(|| "dismiss-typst-compile-failure".to_string())
+                            .child(
+                                IconButton::new("dismiss-typst-compile-failure", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Hide Until the Error Changes"))
+                                    .on_click(on_dismiss),
+                            ),
+                    )
+                }),
         )
         .child(
             div()
@@ -2213,7 +2250,7 @@ mod tests {
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree(
             util::path!("/root"),
-            serde_json::json!({ "main.typ": "Hello" }),
+            serde_json::json!({ "main.typ": "Hello\n#pagebreak()\nWorld\n#pagebreak()\nAgain" }),
         )
         .await;
         let project = project::Project::test(fs, [util::path!("/root").as_ref()], cx).await;
@@ -2239,7 +2276,10 @@ mod tests {
             .downcast::<Editor>()
             .unwrap();
         let preview = workspace.update_in(cx, |workspace, window, cx| {
-            TypstPreviewView::create_typst_view(workspace, editor.clone(), false, window, cx)
+            let preview =
+                TypstPreviewView::create_typst_view(workspace, editor.clone(), false, window, cx);
+            workspace.add_item_to_active_pane(Box::new(preview.clone()), None, true, window, cx);
+            preview
         });
         let state = |cx: &mut gpui::VisualTestContext| {
             preview.read_with(cx, |preview, cx| {
@@ -2262,7 +2302,7 @@ mod tests {
                 panic!("preview stuck at {:?}", state(cx).0);
             };
         wait_until(cx, &|compile_state, page_count| {
-            matches!(compile_state, TypstCompileState::Finished) && page_count == 1
+            matches!(compile_state, TypstCompileState::Finished) && page_count == 3
         });
 
         editor.update_in(cx, |editor, window, cx| {
@@ -2273,7 +2313,7 @@ mod tests {
             matches!(compile_state, TypstCompileState::Failed(_))
         });
         let (compile_state, page_count) = state(cx);
-        assert_eq!(page_count, 1, "the last render should stay");
+        assert_eq!(page_count, 3, "the last render should stay");
         let TypstCompileState::Failed(message) = compile_state else {
             unreachable!()
         };
@@ -2282,7 +2322,46 @@ mod tests {
             "the error should name its location: {message}"
         );
         assert!(!message.contains("DiagSpan"), "{message}");
+
+        let card = cx
+            .debug_bounds("typst-compile-failure-card")
+            .expect("the error card should show over the last render");
+        let scroll_position = |cx: &mut gpui::VisualTestContext| {
+            preview.read_with(cx, |preview, cx| {
+                preview.pdf_view.read(cx).scroll_position_in_page(cx)
+            })
+        };
+        let scroll_at = |cx: &mut gpui::VisualTestContext, position| {
+            cx.simulate_event(gpui::ScrollEvent {
+                position,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-200.))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        };
+        let before = scroll_position(cx);
+        scroll_at(cx, card.center());
+        assert_eq!(
+            scroll_position(cx),
+            before,
+            "scrolling the card should leave the document alone"
+        );
+        scroll_at(cx, gpui::point(card.center().x, card.origin.y - px(100.)));
+        assert_ne!(
+            scroll_position(cx),
+            before,
+            "scrolling the document itself still works"
+        );
+
+        let close = cx
+            .debug_bounds("dismiss-typst-compile-failure")
+            .expect("the card should have a close button");
+        cx.simulate_click(close.center(), gpui::Modifiers::none());
         cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("typst-compile-failure-card").is_none(),
+            "closing should hide the card"
+        );
     }
 
     #[test]
