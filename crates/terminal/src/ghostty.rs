@@ -3993,7 +3993,7 @@ mod tests {
     #[test]
     fn kitty_keyboard_protocol_encodes_keys_once_enabled() {
         let mut terminal = GhosttyTerminal::new(80, 24, 100).unwrap();
-        let encode = |terminal: &mut GhosttyTerminal, keystroke: &str| {
+        let encode = |terminal: &mut GhosttyTerminal, keystroke: &'static str| {
             let mut keystroke = gpui::Keystroke::parse(keystroke).unwrap();
             if keystroke.modifiers.number_of_modifiers() == 0 && keystroke.key.len() == 1 {
                 keystroke.key_char = Some(keystroke.key.clone());
@@ -4031,7 +4031,7 @@ mod tests {
         // plain text keeps flowing through the text input path.
         assert_eq!(encode(&mut terminal, "a"), None);
 
-        let release = |terminal: &mut GhosttyTerminal, keystroke: &str| {
+        let release = |terminal: &mut GhosttyTerminal, keystroke: &'static str| {
             let keystroke = gpui::Keystroke::parse(keystroke).unwrap();
             terminal
                 .encode_kitty_key(&keystroke, false, key::Action::Release)

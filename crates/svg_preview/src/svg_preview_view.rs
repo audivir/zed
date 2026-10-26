@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, ParsedSvg,
-    PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Size, Style,
+    PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, Size, Style,
     Styled, Subscription, SvgSize, Task, WeakEntity, Window, checkerboard, div, img, point, px,
     size,
 };
@@ -656,7 +656,7 @@ impl SvgPreviewView {
 
     fn handle_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -914,7 +914,7 @@ impl Render for SvgPreviewView {
                         } else {
                             gpui::CursorStyle::OpenHand
                         })
-                        .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+                        .on_scroll(cx.listener(Self::handle_scroll_wheel))
                         .on_pinch(cx.listener(Self::handle_pinch))
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
                         .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))

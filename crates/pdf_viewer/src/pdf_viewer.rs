@@ -14,7 +14,7 @@ use gpui::{
     AnyElement, App, Bounds, Context, DismissEvent, DispatchPhase, Element, ElementId, Entity,
     EntityId, EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, InspectorElementId,
     InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, Size, Style, Styled,
+    PinchEvent, Pixels, Point, Render, ScrollHandle, ScrollEvent, Size, Style, Styled,
     Subscription, Task, WeakEntity, Window, actions, div, img, px, size, uniform_list,
 };
 use language::File as _;
@@ -1730,7 +1730,7 @@ impl PdfView {
     /// Tracks scrolling in single-page mode and flips the page once the scrolling goes far
     /// enough past the edge of the current one.
     ///
-    /// `delta_y` is positive when scrolling up, like `ScrollWheelEvent` deltas. Returns whether
+    /// `delta_y` is positive when scrolling up, like `ScrollEvent` deltas. Returns whether
     /// the page flipped.
     fn scroll_single_page(
         &mut self,
@@ -2356,13 +2356,16 @@ impl Element for PdfContentElement {
                 .ml(px(page_margin_left))
                 .w(width)
                 .h(height)
+                // pages hold only absolutely positioned children, so without this the flex
+                // layout shrinks them to fit the viewport instead of scrolling.
+                .flex_shrink_0()
                 .bg(cx.theme().colors().panel_background)
                 .shadow_sm()
                 .relative()
                 .debug_selector(|| format!("pdf-page-{page_idx}"))
                 .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                     // plain clicks are left to text selection, like go-to-definition in editors.
-                    if !e.modifiers.secondary() {
+                    if !e.modifiers.secondary(cx) {
                         return;
                     }
                     if let Some(handler) = &page_click_handler {
@@ -2773,7 +2776,7 @@ impl Element for PdfContentElement {
         // captured so that zooming takes precedence over the scroll container below.
         window.on_mouse_event({
             let pdf_view = self.pdf_view.downgrade();
-            move |event: &ScrollWheelEvent, phase, window, cx| {
+            move |event: &ScrollEvent, phase, window, cx| {
                 if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
                     return;
                 }
@@ -5766,7 +5769,7 @@ mod tests {
         let zoom_level =
             |cx: &mut gpui::VisualTestContext| view.read_with(cx, |view, _| view.zoom_level);
         let scroll = |cx: &mut gpui::VisualTestContext, modifiers: gpui::Modifiers| {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(50.))),
                 modifiers,
@@ -5820,7 +5823,7 @@ mod tests {
             .unwrap_or_else(|| panic!("page 0 should be laid out"))
             .center();
         let scroll = |cx: &mut gpui::VisualTestContext, delta_y: f32, phase: gpui::TouchPhase| {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position,
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta_y))),
                 touch_phase: phase,

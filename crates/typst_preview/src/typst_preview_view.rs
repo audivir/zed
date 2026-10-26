@@ -1096,7 +1096,7 @@ impl TypstPreviewView {
                                 typst_ide::jump_from_click(&*world, &*document_clone, &position)
                                 && let Some(path_buf) = world.resolve_path(file_id).ok()
                             {
-                                let normalized_path = util::normalize_path(&path_buf);
+                                let normalized_path = util::paths::normalize_path(&path_buf);
                                 if let Some(workspace) = workspace_weak.upgrade() {
                                     // move the cursor without focusing, so clicking in the preview
                                     // does not steal focus, like the Markdown preview.
@@ -1109,7 +1109,7 @@ impl TypstPreviewView {
                                                         .file_at(MultiBufferOffset(0), cx)
                                                     && let Some(abs_path) = file_abs_path(&file, cx)
                                                 {
-                                                    let item_path = util::normalize_path(&abs_path);
+                                                    let item_path = util::paths::normalize_path(&abs_path);
                                                     if item_path == normalized_path {
                                                         return Some(editor.clone());
                                                     }
