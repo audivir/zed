@@ -599,6 +599,8 @@ async fn test_remote_typst_compile_reads_project_files(
     struct PrefetchedFiles {
         contents: HashMap<String, Vec<u8>>,
         metadata: HashMap<String, (Option<SystemTime>, u64)>,
+        /// keyed by `@namespace/name:version/path`.
+        package_files: HashMap<String, Vec<u8>>,
     }
 
     impl RemoteFileSource for PrefetchedFiles {
@@ -615,6 +617,26 @@ async fn test_remote_typst_compile_reads_project_files(
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("{path:?} was not prefetched"))
         }
+
+        fn read_package_file(
+            &self,
+            package: &typst::syntax::package::PackageSpec,
+            path: &RelPath,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.package_files
+                .get(&format!("{package}/{}", path.as_unix_str()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{package} {path:?} was not prefetched"))
+        }
+
+        fn package_file_metadata(
+            &self,
+            package: &typst::syntax::package::PackageSpec,
+            path: &RelPath,
+        ) -> anyhow::Result<(Option<SystemTime>, u64)> {
+            let content = self.read_package_file(package, path)?;
+            Ok((None, content.len() as u64))
+        }
     }
 
     let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
@@ -625,12 +647,25 @@ async fn test_remote_typst_compile_reads_project_files(
             "project": {
                 ".git": {},
                 ".gitignore": "build/\n",
-                "main.typ": "#import \"lib.typ\": greet\n#greet(\"remote\")\n#image(\"dot.svg\")\n#image(\"build/figure.svg\")\n",
+                "main.typ": "#import \"lib.typ\": greet\n#import \"@local/zed-remote-greeting:0.1.0\": shout\n#greet(\"remote\")\n#shout()\n#image(\"dot.svg\")\n#image(\"build/figure.svg\")\n",
                 "lib.typ": "#let greet(name) = [Hello #name]\n",
                 "dot.svg": svg,
                 "build": { "figure.svg": svg },
             }
         }),
+    )
+    .await;
+    // a private package that only the remote host has installed.
+    let package_dir = paths::typst_package_dirs()
+        .into_iter()
+        .next()
+        .expect("there should be a Typst package directory")
+        .join("local/zed-remote-greeting/0.1.0");
+    let package_manifest = "[package]\nname = \"zed-remote-greeting\"\nversion = \"0.1.0\"\nentrypoint = \"src/lib.typ\"\n";
+    let package_lib = "#let shout() = [Hello from a private package]\n";
+    fs.insert_tree(
+        &package_dir,
+        json!({ "typst.toml": package_manifest, "src": { "lib.typ": package_lib } }),
     )
     .await;
 
@@ -662,7 +697,42 @@ async fn test_remote_typst_compile_reads_project_files(
     let mut prefetched = PrefetchedFiles {
         contents: HashMap::default(),
         metadata: HashMap::default(),
+        package_files: HashMap::default(),
     };
+    let package = worktree::TypstPackage {
+        namespace: "local",
+        name: "zed-remote-greeting",
+        version: "0.1.0",
+    };
+    for (path, expected) in [
+        ("typst.toml", package_manifest),
+        ("src/lib.typ", package_lib),
+    ] {
+        let content = loader
+            .load_typst_package_file(&package, rel_path(path))
+            .await
+            .expect("package file should download from the remote");
+        assert_eq!(content, expected.as_bytes());
+        prefetched
+            .package_files
+            .insert(format!("@local/zed-remote-greeting:0.1.0/{path}"), content);
+    }
+    let (_, manifest_size) = loader
+        .typst_package_file_metadata(&package, rel_path("typst.toml"))
+        .await
+        .expect("package file metadata should load");
+    assert_eq!(manifest_size, package_manifest.len() as u64);
+    let escaping = worktree::TypstPackage {
+        namespace: "..",
+        ..package
+    };
+    assert!(
+        loader
+            .load_typst_package_file(&escaping, rel_path("typst.toml"))
+            .await
+            .is_err(),
+        "package components must not leave the package directories"
+    );
     for path in ["main.typ", "lib.typ", "dot.svg", "build/figure.svg"] {
         let content = loader
             .load(rel_path(path))
@@ -679,11 +749,11 @@ async fn test_remote_typst_compile_reads_project_files(
         "build/figure.svg".to_string(),
         (mtime.map(|mtime| mtime.timestamp_for_user()), size),
     );
-    let files = ProjectFiles::Remote(RemoteProjectFiles {
-        source: Arc::new(prefetched),
-        worktree_root: PathBuf::from(path!("/code/project")),
+    let files = ProjectFiles::Remote(RemoteProjectFiles::with_source(
+        Arc::new(prefetched),
+        PathBuf::from(path!("/code/project")),
         snapshot,
-    });
+    ));
 
     let root = PathBuf::from(path!("/code/project"));
     let main_path = root.join("main.typ");
@@ -701,6 +771,10 @@ async fn test_remote_typst_compile_reads_project_files(
         world.has_read(&root.join("lib.typ")) && world.has_read(&root.join("dot.svg"));
 
     assert_eq!(page_count, Ok(1));
+    assert!(
+        world.has_read(Path::new("@local/zed-remote-greeting:0.1.0/src/lib.typ")),
+        "the private package should come from the remote"
+    );
     assert!(
         read_imports,
         "the import and the image should come from the remote"

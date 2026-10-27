@@ -20427,6 +20427,7 @@ dependencies = [
  "log",
  "lsp",
  "parking_lot",
+ "paths",
  "pdf_viewer",
  "project",
  "serde_json",

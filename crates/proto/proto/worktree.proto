@@ -166,6 +166,18 @@ message LoadBinaryFileChunk {
   uint64 offset = 4;
 }
 
+// Reads a chunk of a file inside a Typst package installed on the host, answered like
+// LoadBinaryFileChunk. The worktree only routes the request; `path` is relative to the package.
+message LoadTypstPackageFileChunk {
+  uint64 project_id = 1;
+  uint64 worktree_id = 2;
+  string namespace = 3;
+  string name = 4;
+  string version = 5;
+  string path = 6;
+  uint64 offset = 7;
+}
+
 message LoadBinaryFileChunkResponse {
   File file = 1;
   uint64 total_size = 2;

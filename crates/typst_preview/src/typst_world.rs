@@ -15,11 +15,12 @@ use typst::{Library, LibraryExt, World};
 use ui::SharedString;
 use util::ResultExt as _;
 use util::rel_path::RelPath;
-use worktree::{RemoteFileLoader, Snapshot};
+use worktree::{RemoteFileLoader, Snapshot, TypstPackage};
 
 /// Where the project files of a Typst document are read from.
 ///
-/// Packages are always read from the local package cache.
+/// Packages of remote projects are read from the remote host when it has them installed, and
+/// otherwise from the local package directories.
 #[derive(Clone)]
 pub enum ProjectFiles {
     Local,
@@ -32,6 +33,17 @@ pub trait RemoteFileSource: Send + Sync {
 
     /// Returns the modification time and size of a file without downloading it.
     fn file_metadata(&self, path: &RelPath) -> anyhow::Result<(Option<SystemTime>, u64)>;
+
+    /// Reads `path` from `package` installed on the remote host.
+    fn read_package_file(&self, package: &PackageSpec, path: &RelPath) -> anyhow::Result<Vec<u8>>;
+
+    /// Returns the modification time and size of `path` in `package`, failing if the remote host
+    /// does not have the package installed.
+    fn package_file_metadata(
+        &self,
+        package: &PackageSpec,
+        path: &RelPath,
+    ) -> anyhow::Result<(Option<SystemTime>, u64)>;
 }
 
 // compiles run on a background thread, which can wait for the network.
@@ -44,6 +56,32 @@ impl RemoteFileSource for RemoteFileLoader {
         let (mtime, size) = futures::executor::block_on(self.metadata(path))?;
         Ok((mtime.map(|mtime| mtime.timestamp_for_user()), size))
     }
+
+    fn read_package_file(&self, package: &PackageSpec, path: &RelPath) -> anyhow::Result<Vec<u8>> {
+        let version = package.version.to_string();
+        let package = TypstPackage {
+            namespace: &package.namespace,
+            name: &package.name,
+            version: &version,
+        };
+        futures::executor::block_on(self.load_typst_package_file(&package, path))
+    }
+
+    fn package_file_metadata(
+        &self,
+        package: &PackageSpec,
+        path: &RelPath,
+    ) -> anyhow::Result<(Option<SystemTime>, u64)> {
+        let version = package.version.to_string();
+        let package = TypstPackage {
+            namespace: &package.namespace,
+            name: &package.name,
+            version: &version,
+        };
+        let (mtime, size) =
+            futures::executor::block_on(self.typst_package_file_metadata(&package, path))?;
+        Ok((mtime.map(|mtime| mtime.timestamp_for_user()), size))
+    }
 }
 
 /// Files of a remote project, downloaded when a compile needs them.
@@ -54,15 +92,44 @@ pub struct RemoteProjectFiles {
     pub worktree_root: PathBuf,
     /// worktree entries, whose modification times decide when a file is downloaded again.
     pub snapshot: Snapshot,
+    /// whether the remote host has a package installed, asked once per compile since the files
+    /// are replaced before every compile.
+    remote_packages: Arc<parking_lot::Mutex<HashMap<PackageSpec, bool>>>,
 }
 
 impl RemoteProjectFiles {
     pub fn new(loader: RemoteFileLoader, worktree_root: PathBuf, snapshot: Snapshot) -> Self {
+        Self::with_source(Arc::new(loader), worktree_root, snapshot)
+    }
+
+    pub fn with_source(
+        source: Arc<dyn RemoteFileSource>,
+        worktree_root: PathBuf,
+        snapshot: Snapshot,
+    ) -> Self {
         Self {
-            source: Arc::new(loader),
+            source,
             worktree_root,
             snapshot,
+            remote_packages: Default::default(),
         }
+    }
+
+    /// Returns whether the remote host has `package` installed, like private `@local` packages
+    /// that only exist next to the project.
+    fn has_package(&self, package: &PackageSpec) -> bool {
+        *self
+            .remote_packages
+            .lock()
+            .entry(package.clone())
+            .or_insert_with(|| {
+                RelPath::from_unix_str("typst.toml")
+                    .and_then(|manifest| self.source.package_file_metadata(package, manifest))
+                    .map_err(|error| {
+                        log::debug!("package {package} is not on the remote: {error:#}")
+                    })
+                    .is_ok()
+            })
     }
 
     /// Returns the modification time and size of `rel_path`, if it is a file.
@@ -389,14 +456,29 @@ impl TypstSystemWorld {
         id: FileId,
         path: &Path,
     ) -> FileResult<(typst::foundations::Bytes, bool)> {
+        let remote_package = match (id.root(), &self.files) {
+            (VirtualRoot::Package(package), ProjectFiles::Remote(remote))
+                if remote.has_package(package) =>
+            {
+                let package_path = RelPath::from_unix_str(id.vpath().get_without_slash())
+                    .map_err(|_| FileError::NotFound(path.to_path_buf()))?;
+                Some((remote, package, package_path))
+            }
+            _ => None,
+        };
         let local_files = ProjectFiles::Local;
         let files = match id.root() {
             VirtualRoot::Package(_) => &local_files,
             VirtualRoot::Project => &self.files,
         };
-        let (modified, len) = files
-            .metadata(path)
-            .ok_or_else(|| FileError::NotFound(path.to_path_buf()))?;
+        let metadata = match &remote_package {
+            Some((remote, package, package_path)) => remote
+                .source
+                .package_file_metadata(package, package_path)
+                .ok(),
+            None => files.metadata(path),
+        };
+        let (modified, len) = metadata.ok_or_else(|| FileError::NotFound(path.to_path_buf()))?;
         if let Some(file) = self.disk_files.read().get(path)
             && file.modified.is_some()
             && file.modified == modified
@@ -405,7 +487,14 @@ impl TypstSystemWorld {
             return Ok((file.bytes.clone(), false));
         }
 
-        let bytes = typst::foundations::Bytes::new(files.read(path)?);
+        let bytes = match &remote_package {
+            Some((remote, package, package_path)) => remote
+                .source
+                .read_package_file(package, package_path)
+                .map_err(|error| FileError::Other(Some(format!("{error:#}").into())))?,
+            None => files.read(path)?,
+        };
+        let bytes = typst::foundations::Bytes::new(bytes);
         self.disk_files.write().insert(
             path.to_path_buf(),
             DiskFile {
@@ -460,12 +549,19 @@ impl TypstSystemWorld {
 
     pub fn resolve_path(&self, id: FileId) -> FileResult<PathBuf> {
         let root = match id.root() {
-            VirtualRoot::Package(package) => package_dir(package).ok_or_else(|| {
-                if package.namespace == "preview" {
-                    self.missing_packages.lock().insert(package.clone());
+            VirtualRoot::Package(package) => match &self.files {
+                // stands in for the package directory on the remote host, named like the Typst
+                // CLI names package files in diagnostics.
+                ProjectFiles::Remote(remote) if remote.has_package(package) => {
+                    PathBuf::from(package.to_string())
                 }
-                FileError::Package(typst::diag::PackageError::NotFound(package.clone()))
-            })?,
+                _ => package_dir(package).ok_or_else(|| {
+                    if package.namespace == "preview" {
+                        self.missing_packages.lock().insert(package.clone());
+                    }
+                    FileError::Package(typst::diag::PackageError::NotFound(package.clone()))
+                })?,
+            },
             VirtualRoot::Project => self.root.clone(),
         };
         id.vpath()
@@ -567,7 +663,7 @@ impl typst_ide::IdeWorld for TypstSystemWorld {
 
 fn package_dir(spec: &PackageSpec) -> Option<PathBuf> {
     let subdir = package_subdir(spec);
-    package_roots()
+    paths::typst_package_dirs()
         .into_iter()
         .map(|root| root.join(&subdir))
         .find(|path| path.exists())
@@ -576,12 +672,7 @@ fn package_dir(spec: &PackageSpec) -> Option<PathBuf> {
 /// Returns where a downloaded package is stored, following the Typst CLI, so both share their
 /// package cache.
 pub fn package_download_dir(spec: &PackageSpec) -> Option<PathBuf> {
-    Some(
-        package_roots()
-            .into_iter()
-            .next()?
-            .join(package_subdir(spec)),
-    )
+    Some(paths::typst_package_cache_dir()?.join(package_subdir(spec)))
 }
 
 /// Returns the URL of the archive of an `@preview` package on the Typst package registry.
@@ -594,48 +685,6 @@ pub fn package_download_url(spec: &PackageSpec) -> String {
 
 fn package_subdir(spec: &PackageSpec) -> String {
     format!("{}/{}/{}", spec.namespace, spec.name, spec.version)
-}
-
-/// Returns the package directories searched in order, with the download cache first.
-fn package_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(cache_dir) = std::env::var("TYPST_PACKAGE_CACHE_DIR") {
-        roots.push(PathBuf::from(cache_dir));
-    }
-
-    let Some(home) = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-    else {
-        return roots;
-    };
-
-    let paths = if cfg!(target_os = "macos") {
-        vec![
-            format!("{home}/Library/Caches/typst/packages"),
-            format!("{home}/Library/Application Support/typst/packages"),
-        ]
-    } else if cfg!(target_os = "windows") {
-        vec![
-            std::env::var("LOCALAPPDATA")
-                .ok()
-                .unwrap_or_else(|| format!("{home}/AppData/Local"))
-                + "/typst/packages",
-            std::env::var("APPDATA")
-                .ok()
-                .unwrap_or_else(|| format!("{home}/AppData/Roaming"))
-                + "/typst/packages",
-        ]
-    } else {
-        vec![
-            std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{home}/.cache"))
-                + "/typst/packages",
-            std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"))
-                + "/typst/packages",
-        ]
-    };
-    roots.extend(paths.into_iter().map(PathBuf::from));
-    roots
 }
 
 #[cfg(test)]

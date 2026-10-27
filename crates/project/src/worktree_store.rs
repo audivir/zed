@@ -243,6 +243,7 @@ impl WorktreeStore {
         client.add_entity_request_handler(Self::handle_expand_project_entry);
         client.add_entity_request_handler(Self::handle_expand_all_for_project_entry);
         client.add_entity_request_handler(Self::handle_load_binary_file_chunk);
+        client.add_entity_request_handler(Self::handle_load_typst_package_file_chunk);
     }
 
     pub fn init_remote(client: &AnyProtoClient) {
@@ -1324,6 +1325,19 @@ impl WorktreeStore {
                 .context("worktree not found")
         })?;
         Worktree::handle_load_binary_file_chunk(worktree, envelope.payload, cx).await
+    }
+
+    pub async fn handle_load_typst_package_file_chunk(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::LoadTypstPackageFileChunk>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::LoadBinaryFileChunkResponse> {
+        let worktree = this.update(&mut cx, |this, cx| {
+            let worktree_id = WorktreeId::from_proto(envelope.payload.worktree_id);
+            this.worktree_for_id(worktree_id, cx)
+                .context("worktree not found")
+        })?;
+        Worktree::handle_load_typst_package_file_chunk(worktree, envelope.payload, cx).await
     }
 
     pub async fn handle_copy_project_entry(

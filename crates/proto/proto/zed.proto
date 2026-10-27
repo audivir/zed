@@ -522,6 +522,7 @@ message Envelope {
     // Numbered far above upstream's messages so that upstream additions don't collide.
     LoadBinaryFileChunk load_binary_file_chunk = 1000;
     LoadBinaryFileChunkResponse load_binary_file_chunk_response = 1001;
+    LoadTypstPackageFileChunk load_typst_package_file_chunk = 1002;
   }
 
   reserved 87 to 88;

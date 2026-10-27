@@ -635,3 +635,25 @@ pub fn global_gitignore_path() -> Option<PathBuf> {
         .get_or_init(::ignore::gitignore::gitconfig_excludes_path)
         .clone()
 }
+
+/// Returns the directories that Typst packages are looked up in, in the order of the Typst CLI.
+///
+/// Packages installed by hand, like private `@local` packages, live in the data directory and
+/// take precedence over downloaded packages in the cache directory. `TYPST_PACKAGE_PATH` and
+/// `TYPST_PACKAGE_CACHE_PATH` override them, like the CLI options of the same names.
+pub fn typst_package_dirs() -> Vec<PathBuf> {
+    let package_dir = env::var_os("TYPST_PACKAGE_PATH")
+        .map(PathBuf::from)
+        .or_else(|| Some(dirs::data_dir()?.join("typst/packages")));
+    package_dir
+        .into_iter()
+        .chain(typst_package_cache_dir())
+        .collect()
+}
+
+/// Returns the directory that the Typst CLI downloads packages to.
+pub fn typst_package_cache_dir() -> Option<PathBuf> {
+    env::var_os("TYPST_PACKAGE_CACHE_PATH")
+        .map(PathBuf::from)
+        .or_else(|| Some(dirs::cache_dir()?.join("typst/packages")))
+}

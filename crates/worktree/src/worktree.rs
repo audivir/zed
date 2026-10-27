@@ -1172,8 +1172,6 @@ impl Worktree {
         request: proto::LoadBinaryFileChunk,
         cx: AsyncApp,
     ) -> Result<proto::LoadBinaryFileChunkResponse> {
-        const CHUNK_SIZE: u64 = 1024 * 1024;
-
         let path: Arc<RelPath> = RelPath::from_unix_str(&request.path)
             .with_context(|| format!("received invalid relative path {:?}", request.path))?
             .into();
@@ -1189,26 +1187,72 @@ impl Worktree {
         })?;
 
         cx.background_spawn(async move {
-            let metadata = fs
-                .metadata(&abs_path)
-                .await?
-                .with_context(|| format!("{abs_path:?} does not exist"))?;
-            anyhow::ensure!(!metadata.is_dir, "{abs_path:?} is a directory");
-
-            let mut data = Vec::new();
-            // An offset at or past the end asks for the metadata alone.
-            if request.offset < metadata.len {
-                let mut reader = fs.open_sync(&abs_path).await?;
-                reader.seek(SeekFrom::Start(request.offset))?;
-                reader
-                    .take(CHUNK_SIZE.min(metadata.len - request.offset))
-                    .read_to_end(&mut data)?;
-            }
-
+            let (metadata, data) = read_file_chunk(fs.as_ref(), &abs_path, request.offset).await?;
             Ok(proto::LoadBinaryFileChunkResponse {
                 file: Some(proto::File {
                     worktree_id: worktree_id.to_proto(),
                     entry_id: entry_id.map(|id| id.to_proto()),
+                    path: path.as_unix_str().to_owned(),
+                    mtime: Some(metadata.mtime.into()),
+                    is_deleted: false,
+                    is_historic: false,
+                }),
+                total_size: metadata.len,
+                data,
+            })
+        })
+        .await
+    }
+
+    /// Reads a chunk of a file of a Typst package installed on this host, so that previews of
+    /// remote projects can use packages that only exist next to the project.
+    pub async fn handle_load_typst_package_file_chunk(
+        this: Entity<Self>,
+        request: proto::LoadTypstPackageFileChunk,
+        cx: AsyncApp,
+    ) -> Result<proto::LoadBinaryFileChunkResponse> {
+        let path: Arc<RelPath> = RelPath::from_unix_str(&request.path)
+            .with_context(|| format!("received invalid relative path {:?}", request.path))?
+            .into();
+        for component in [&request.namespace, &request.name, &request.version] {
+            anyhow::ensure!(
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && !component.contains(['/', '\\']),
+                "invalid package component {component:?}"
+            );
+        }
+        let (fs, worktree_id) = this.read_with(&cx, |this, _| {
+            let this = this.as_local().context("worktree is not local")?;
+            anyhow::Ok((this.fs.clone(), this.id()))
+        })?;
+
+        cx.background_spawn(async move {
+            let package_subdir = Path::new(&request.namespace)
+                .join(&request.name)
+                .join(&request.version);
+            let mut package_dir = None;
+            for packages_dir in paths::typst_package_dirs() {
+                let candidate = packages_dir.join(&package_subdir);
+                if fs.is_dir(&candidate).await {
+                    package_dir = Some(candidate);
+                    break;
+                }
+            }
+            let package_dir = package_dir.with_context(|| {
+                format!(
+                    "package @{}/{}:{} is not installed",
+                    request.namespace, request.name, request.version
+                )
+            })?;
+
+            let abs_path = package_dir.join(path.as_std_path());
+            let (metadata, data) = read_file_chunk(fs.as_ref(), &abs_path, request.offset).await?;
+            Ok(proto::LoadBinaryFileChunkResponse {
+                file: Some(proto::File {
+                    worktree_id: worktree_id.to_proto(),
+                    entry_id: None,
                     path: path.as_unix_str().to_owned(),
                     mtime: Some(metadata.mtime.into()),
                     is_deleted: false,
@@ -2318,6 +2362,33 @@ impl LocalWorktree {
     }
 }
 
+/// Reads up to a megabyte of the file at `abs_path`, starting at `offset`.
+///
+/// An offset at or past the end reads nothing, which asks for the metadata alone.
+async fn read_file_chunk(
+    fs: &dyn Fs,
+    abs_path: &Path,
+    offset: u64,
+) -> Result<(fs::Metadata, Vec<u8>)> {
+    const CHUNK_SIZE: u64 = 1024 * 1024;
+
+    let metadata = fs
+        .metadata(abs_path)
+        .await?
+        .with_context(|| format!("{abs_path:?} does not exist"))?;
+    anyhow::ensure!(!metadata.is_dir, "{abs_path:?} is a directory");
+
+    let mut data = Vec::new();
+    if offset < metadata.len {
+        let mut reader = fs.open_sync(abs_path).await?;
+        reader.seek(SeekFrom::Start(offset))?;
+        reader
+            .take(CHUNK_SIZE.min(metadata.len - offset))
+            .read_to_end(&mut data)?;
+    }
+    Ok((metadata, data))
+}
+
 /// Loads files of a remote worktree without a `Worktree` entity, so it can be used from any thread.
 #[derive(Clone)]
 pub struct RemoteFileLoader {
@@ -2348,28 +2419,79 @@ impl RemoteFileLoader {
     }
 
     async fn load_with_file(&self, path: &RelPath) -> Result<(proto::File, u64, Vec<u8>)> {
-        download_binary_file(
-            &self.client,
-            proto::LoadBinaryFileChunk {
-                project_id: self.project_id,
-                worktree_id: self.worktree_id,
-                path: path.as_unix_str().to_owned(),
-                offset: 0,
-            },
-        )
+        download_binary_file(&self.client, |offset| proto::LoadBinaryFileChunk {
+            project_id: self.project_id,
+            worktree_id: self.worktree_id,
+            path: path.as_unix_str().to_owned(),
+            offset,
+        })
         .await
+    }
+
+    /// Loads `path` from the Typst package `namespace/name/version` installed on the remote host.
+    pub async fn load_typst_package_file(
+        &self,
+        package: &TypstPackage<'_>,
+        path: &RelPath,
+    ) -> Result<Vec<u8>> {
+        let (_, _, content) = download_binary_file(&self.client, |offset| {
+            self.typst_package_request(package, path, offset)
+        })
+        .await?;
+        Ok(content)
+    }
+
+    /// Returns the modification time and size of `path` in a Typst package installed on the
+    /// remote host, failing if the host does not have the package.
+    pub async fn typst_package_file_metadata(
+        &self,
+        package: &TypstPackage<'_>,
+        path: &RelPath,
+    ) -> Result<(Option<MTime>, u64)> {
+        let response = self
+            .client
+            .request(self.typst_package_request(package, path, u64::MAX))
+            .await?;
+        let file = response.file.context("missing file in binary file chunk")?;
+        Ok((file.mtime.map(MTime::from), response.total_size))
+    }
+
+    fn typst_package_request(
+        &self,
+        package: &TypstPackage<'_>,
+        path: &RelPath,
+        offset: u64,
+    ) -> proto::LoadTypstPackageFileChunk {
+        proto::LoadTypstPackageFileChunk {
+            project_id: self.project_id,
+            worktree_id: self.worktree_id,
+            namespace: package.namespace.to_owned(),
+            name: package.name.to_owned(),
+            version: package.version.to_owned(),
+            path: path.as_unix_str().to_owned(),
+            offset,
+        }
     }
 }
 
-async fn download_binary_file(
+/// Identifies a Typst package as `@namespace/name:version`.
+pub struct TypstPackage<'a> {
+    pub namespace: &'a str,
+    pub name: &'a str,
+    pub version: &'a str,
+}
+
+async fn download_binary_file<Request>(
     client: &AnyProtoClient,
-    mut request: proto::LoadBinaryFileChunk,
-) -> Result<(proto::File, u64, Vec<u8>)> {
+    request_at: impl Fn(u64) -> Request,
+) -> Result<(proto::File, u64, Vec<u8>)>
+where
+    Request: proto::RequestMessage<Response = proto::LoadBinaryFileChunkResponse>,
+{
     const MAX_ATTEMPTS: usize = 3;
 
     'attempts: for _ in 0..MAX_ATTEMPTS {
-        request.offset = 0;
-        let first_chunk = client.request(request.clone()).await?;
+        let first_chunk = client.request(request_at(0)).await?;
         let file = first_chunk
             .file
             .context("missing file in binary file chunk")?;
@@ -2378,8 +2500,7 @@ async fn download_binary_file(
         content.extend_from_slice(&first_chunk.data);
 
         while (content.len() as u64) < total_size {
-            request.offset = content.len() as u64;
-            let chunk = client.request(request.clone()).await?;
+            let chunk = client.request(request_at(content.len() as u64)).await?;
             // The file was modified on the remote while it was being read, so the chunks
             // already received belong to a different version of it.
             if chunk.file.as_ref().map(|chunk_file| &chunk_file.mtime) != Some(&file.mtime)

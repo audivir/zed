@@ -23,6 +23,7 @@ text.workspace = true
 log.workspace = true
 lsp.workspace = true
 parking_lot.workspace = true
+paths.workspace = true
 project.workspace = true
 settings.workspace = true
 theme.workspace = true

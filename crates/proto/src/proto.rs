@@ -89,6 +89,7 @@ messages!(
     (DownloadFileResponse, Background),
     (LoadBinaryFileChunk, Background),
     (LoadBinaryFileChunkResponse, Background),
+    (LoadTypstPackageFileChunk, Background),
     (EndStream, Foreground),
     (Error, Foreground),
     (ExpandProjectEntry, Foreground),
@@ -453,6 +454,7 @@ request_messages!(
     (RestoreProjectEntry, RestoreProjectEntryResponse),
     (DownloadFileByPath, DownloadFileResponse),
     (LoadBinaryFileChunk, LoadBinaryFileChunkResponse),
+    (LoadTypstPackageFileChunk, LoadBinaryFileChunkResponse),
     (ExpandProjectEntry, ExpandProjectEntryResponse),
     (ExpandAllForProjectEntry, ExpandAllForProjectEntryResponse),
     (Follow, FollowResponse),
@@ -897,6 +899,7 @@ entity_messages!(
     FindSearchCandidatesCancelled,
     DownloadFileByPath,
     LoadBinaryFileChunk,
+    LoadTypstPackageFileChunk,
     GetRemoteProfilingData
 );
 
