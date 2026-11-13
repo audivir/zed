@@ -37,7 +37,7 @@ workspace.workspace = true
 worktree.workspace = true
 zed_actions.workspace = true
 
-pdfium-render = { version = "0.9", features = ["thread_safe"] }
+pdfium-render = { version = "0.9.5", features = ["thread_safe"] }
 once_cell = "1.21"
 
 [dev-dependencies]
