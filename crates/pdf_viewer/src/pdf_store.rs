@@ -184,9 +184,12 @@ impl ProjectItem for PdfItem {
                 let project = project.clone();
                 async move |cx| {
                     // a failed install surfaces as the bind error of the opened document.
-                    crate::pdf_renderer::ensure_pdfium_installed(http_client)
-                        .await
-                        .log_err();
+                    crate::pdf_renderer::ensure_pdfium_installed(
+                        cx.background_executor(),
+                        http_client,
+                    )
+                    .await
+                    .log_err();
                     cx.update(|cx| open_pdf(project, path, cx)).await
                 }
             }))

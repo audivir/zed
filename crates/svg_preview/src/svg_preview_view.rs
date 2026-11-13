@@ -745,14 +745,6 @@ struct SvgContentElement {
     view: Entity<SvgPreviewView>,
 }
 
-impl IntoElement for SvgContentElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for SvgContentElement {
     type RequestLayoutState = ();
     type PrepaintState = Option<(AnyElement, bool)>;

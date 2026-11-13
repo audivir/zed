@@ -1062,9 +1062,12 @@ impl TypstPreviewView {
 
         let http_client = cx.http_client();
         cx.spawn(async move |view, cx| {
-            pdf_viewer::pdf_renderer::ensure_pdfium_installed(http_client)
-                .await
-                .log_err();
+            pdf_viewer::pdf_renderer::ensure_pdfium_installed(
+                cx.background_executor(),
+                http_client,
+            )
+            .await
+            .log_err();
             let pdf = Arc::new(Pdf::from_bytes(bytes, Some((pages, max_width)), None).await);
             view.update(cx, |view, cx| {
                 let previous_pdf = view.pdf_view.read(cx).pdf(cx);
@@ -1533,7 +1536,13 @@ impl TypstPreviewView {
             for package in &packages {
                 let result = match crate::typst_world::package_download_dir(package) {
                     Some(destination) => {
-                        download_package(http_client.as_ref(), package, &destination).await
+                        download_package(
+                            cx.background_executor(),
+                            http_client.clone(),
+                            package,
+                            &destination,
+                        )
+                        .await
                     }
                     None => Err(anyhow::anyhow!("no Typst package cache directory")),
                 };
@@ -2028,7 +2037,8 @@ fn export_bytes(document: &PagedDocument, now: chrono::DateTime<chrono::Local>) 
 /// Downloads and unpacks an `@preview` package from the Typst package registry into
 /// `destination`.
 async fn download_package(
-    http_client: &dyn http_client::HttpClient,
+    executor: &gpui::BackgroundExecutor,
+    http_client: Arc<dyn http_client::HttpClient>,
     package: &PackageSpec,
     destination: &Path,
 ) -> Result<()> {
@@ -2037,12 +2047,13 @@ async fn download_package(
         .context("package directory has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
     let url = crate::typst_world::package_download_url(package);
-    http_client::github_download::download_server_binary(
+    github_releases::download_server_binary(
+        executor,
         http_client,
         &url,
         None,
         destination,
-        http_client::github::AssetKind::TarGz,
+        github_releases::AssetKind::TarGz,
     )
     .await
 }
@@ -2413,9 +2424,14 @@ mod tests {
         let destination = root.join("preview/demo/1.0.0");
 
         cx.background_executor.allow_parking();
-        download_package(http_client.as_ref(), &package, &destination)
-            .await
-            .unwrap();
+        download_package(
+            &cx.background_executor,
+            http_client.clone(),
+            &package,
+            &destination,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(destination.join("lib.typ")).unwrap(),

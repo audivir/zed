@@ -1995,14 +1995,6 @@ impl PdfContentElement {
     }
 }
 
-impl IntoElement for PdfContentElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for PdfContentElement {
     type RequestLayoutState = ();
     type PrepaintState = Option<AnyElement>;

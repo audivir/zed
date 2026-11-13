@@ -1,9 +1,8 @@
 use anyhow::{Result, anyhow};
 use futures::lock::Mutex;
+use github_releases::{AssetKind, download_server_binary};
 use gpui::{Bounds, Point, RenderImage, Size};
 use http_client::HttpClient;
-use http_client::github::AssetKind;
-use http_client::github_download::download_server_binary;
 use image::{Frame, RgbaImage};
 use once_cell::sync::OnceCell;
 use pdfium_render::prelude::{
@@ -536,7 +535,10 @@ static PDFIUM_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// Returns `Err` if no prebuilt release exists for this platform, or the download, checksum, or
 /// extraction fails.
-pub async fn ensure_pdfium_installed(http_client: Arc<dyn HttpClient>) -> Result<()> {
+pub async fn ensure_pdfium_installed(
+    executor: &gpui::BackgroundExecutor,
+    http_client: Arc<dyn HttpClient>,
+) -> Result<()> {
     if PDFIUM.get().is_some() {
         return Ok(());
     }
@@ -561,7 +563,8 @@ pub async fn ensure_pdfium_installed(http_client: Arc<dyn HttpClient>) -> Result
     );
     log::info!("PDFium not found, installing {url} into {destination:?}");
     download_server_binary(
-        http_client.as_ref(),
+        executor,
+        http_client,
         &url,
         Some(sha256),
         &destination,
