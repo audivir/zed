@@ -1677,6 +1677,14 @@ impl GhosttyTerminal {
                 }
             };
 
+            let (image_width, image_height) = match (image.width(), image.height()) {
+                (Ok(width), Ok(height)) => (width, height),
+                (Err(error), _) | (_, Err(error)) => {
+                    log::debug!("failed to read kitty image {image_id} size: {error}");
+                    continue;
+                }
+            };
+
             // decoding copies or inflates the whole image, so it is only redone on new pixels.
             let data = match self.decoded_images.get(&image_id) {
                 Some((decoded_generation, data)) if *decoded_generation == generation => {
@@ -1705,6 +1713,12 @@ impl GhosttyTerminal {
                 grid_rows: info.grid_rows,
                 pixel_width: info.pixel_width,
                 pixel_height: info.pixel_height,
+                image_width,
+                image_height,
+                source: gpui::Bounds {
+                    origin: gpui::point(info.source_x, info.source_y),
+                    size: gpui::size(info.source_width, info.source_height),
+                },
                 data,
             });
         }

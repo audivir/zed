@@ -632,8 +632,15 @@ pub struct ImagePlacement {
     /// the following text.
     pub grid_columns: u32,
     pub grid_rows: u32,
+    /// Rendered size, which differs from the image size when the program scales the placement
+    /// with `c=` or `r=` or crops it with a source rectangle.
     pub pixel_width: u32,
     pub pixel_height: u32,
+    /// Size of the decoded image in `data`.
+    pub image_width: u32,
+    pub image_height: u32,
+    /// Part of the image shown by the placement, in image pixels.
+    pub source: Bounds<u32>,
     pub data: Arc<[u8]>,
 }
 
@@ -1912,7 +1919,8 @@ impl Terminal {
     /// Large outputs, such as a linter reporting tens of thousands of lines, otherwise keep
     /// their full uncompressed scrollback in memory for as long as the terminal lives.
     fn schedule_idle_compression(&mut self) {
-        self.idle_compression_task = self.compress_scrollback_after(ghostty::IDLE_COMPRESSION_DELAY);
+        self.idle_compression_task =
+            self.compress_scrollback_after(ghostty::IDLE_COMPRESSION_DELAY);
     }
 
     /// Compresses the scrollback right away, for output that is known to be final.
@@ -5201,6 +5209,13 @@ mod tests {
         assert_eq!(placements.len(), 1, "expected one image placement");
         assert_eq!(placements[0].pixel_width, 50);
         assert_eq!(placements[0].pixel_height, 20);
+        assert_eq!(
+            (placements[0].image_width, placements[0].image_height),
+            (1, 1),
+            "a scaled placement keeps the size of its image"
+        );
+        assert_eq!(placements[0].source.size, gpui::size(1, 1));
+        assert_eq!(placements[0].data.len(), 4);
     }
 
     // text written after an image must land below it.

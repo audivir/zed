@@ -617,12 +617,24 @@ impl TerminalElement {
                 pixel_height = pixel_height.min(max_height);
             }
 
-            let image_bounds = Bounds {
+            let placement_bounds = Bounds {
                 origin: image_origin,
                 size: size(px(pixel_width), px(pixel_height)),
             };
+            let Some(image_bounds) = scaled_image_bounds(placement, image_origin) else {
+                continue;
+            };
+            // the image is drawn whole and clipped, so that cropped and capped placements only show
+            // their own part of it.
             window
-                .paint_image(bounds, image_bounds, Corners::default(), image, 0, false)
+                .paint_image(
+                    bounds.intersect(&placement_bounds),
+                    image_bounds,
+                    Corners::default(),
+                    image,
+                    0,
+                    false,
+                )
                 .log_err();
         }
     }
@@ -2167,9 +2179,12 @@ pub fn is_blank(cell: &Cell) -> bool {
 /// Converts a decoded RGBA8 Kitty graphics placement into a `RenderImage`.
 ///
 /// `RenderImage` expects BGRA8 byte order, so the red and blue channels are swapped.
+///
+/// The image keeps its own size; programs scale placements with `c=`/`r=`, so the rendered size
+/// differs from it.
 fn render_image_from_placement(placement: &ImagePlacement) -> Option<RenderImage> {
-    let width = placement.pixel_width;
-    let height = placement.pixel_height;
+    let width = placement.image_width;
+    let height = placement.image_height;
     if width == 0 || height == 0 {
         return None;
     }
@@ -2184,6 +2199,31 @@ fn render_image_from_placement(placement: &ImagePlacement) -> Option<RenderImage
         image::Frame::new(buffer),
         1,
     )))
+}
+
+/// Returns where the whole image goes so that its source rectangle fills the placement's rendered
+/// size at `placement_origin`.
+fn scaled_image_bounds(
+    placement: &ImagePlacement,
+    placement_origin: GpuiPoint<Pixels>,
+) -> Option<Bounds<Pixels>> {
+    let source = placement.source;
+    if source.size.width == 0 || source.size.height == 0 {
+        return None;
+    }
+    let scale_x = placement.pixel_width as f32 / source.size.width as f32;
+    let scale_y = placement.pixel_height as f32 / source.size.height as f32;
+    Some(Bounds {
+        origin: placement_origin
+            - point(
+                px(source.origin.x as f32 * scale_x),
+                px(source.origin.y as f32 * scale_y),
+            ),
+        size: size(
+            px(placement.image_width as f32 * scale_x),
+            px(placement.image_height as f32 * scale_y),
+        ),
+    })
 }
 
 fn to_highlighted_range_lines(
@@ -2322,7 +2362,7 @@ fn convert_color_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AbsoluteLength, Hsla, TestAppContext, font};
+    use gpui::{AbsoluteLength, DevicePixels, Hsla, TestAppContext, font};
     use ui::utils::apca_contrast;
 
     #[gpui::test]
@@ -2505,6 +2545,59 @@ mod tests {
         assert!(!TerminalElement::is_decorative_character('\u{1FB3C}')); // Just after
     }
 
+    // `kv` and `icat` pass `r=`/`c=`, which scales placements to sizes other than the image's.
+    #[test]
+    fn scaled_placements_keep_the_image_size_and_fill_their_cells() {
+        let placement = |pixel_width, pixel_height, source: Bounds<u32>| ImagePlacement {
+            image_id: 1,
+            generation: 1,
+            viewport_column: 0,
+            viewport_row: 0,
+            grid_columns: 10,
+            grid_rows: 10,
+            pixel_width,
+            pixel_height,
+            image_width: 4,
+            image_height: 2,
+            source,
+            data: std::sync::Arc::from([255u8; 4 * 2 * 4]),
+        };
+        let whole = Bounds {
+            origin: point(0, 0),
+            size: size(4, 2),
+        };
+        let origin = point(px(10.), px(20.));
+
+        for (pixel_width, pixel_height) in [(8, 4), (2, 1)] {
+            let scaled = placement(pixel_width, pixel_height, whole);
+            let image = render_image_from_placement(&scaled).expect("scaled image renders");
+            assert_eq!(image.size(0), size(DevicePixels(4), DevicePixels(2)));
+            assert_eq!(
+                scaled_image_bounds(&scaled, origin),
+                Some(Bounds {
+                    origin,
+                    size: size(px(pixel_width as f32), px(pixel_height as f32)),
+                })
+            );
+        }
+
+        let cropped = placement(
+            4,
+            2,
+            Bounds {
+                origin: point(2, 1),
+                size: size(2, 1),
+            },
+        );
+        assert_eq!(
+            scaled_image_bounds(&cropped, origin),
+            Some(Bounds {
+                origin: point(px(6.), px(18.)),
+                size: size(px(8.), px(4.)),
+            })
+        );
+    }
+
     // checks that images keep their exact pixel height, stay above the next text row, and leave
     // less than one line of gap below them.
     #[test]
@@ -2530,6 +2623,12 @@ mod tests {
                 grid_rows,
                 pixel_width: pixel_height,
                 pixel_height,
+                image_width: pixel_height,
+                image_height: pixel_height,
+                source: Bounds {
+                    origin: point(0, 0),
+                    size: size(pixel_height, pixel_height),
+                },
                 data: std::sync::Arc::new([]),
             };
 
